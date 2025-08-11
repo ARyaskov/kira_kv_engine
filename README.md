@@ -1,8 +1,9 @@
 # ⚡ Kira KV Engine
 
-KV-storage engine based on **Minimal perfect hash functions** with hybrid indexing (+PGM Index) for Rust.
+[![Crates.io](https://img.shields.io/crates/v/kira_kv_engine.svg)](https://crates.io/crates/kira_kv_engine)
 
-Zero collisions. Pure `O(1)` performance.
+> KV-storage engine based on **Minimal perfect hash functions** with hybrid indexing (+PGM Index) for Rust. \
+> Zero collisions. Pure `O(1)` performance.
 
 ## 🧠 Algorithm
 
