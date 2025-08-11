@@ -1,0 +1,55 @@
+[package]
+name = "kira_kv_engine"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "KV-storage engine based on minimal perfect hash functions with hybrid indexing (+PGM Index) for Rust"
+repository = "https://github.com/ARyaskov/kira_kv_engine"
+homepage = "https://github.com/ARyaskov/kira_kv_engine"
+documentation = "https://docs.rs/kira_kv_engine"
+readme = "README.md"
+keywords = ["hashing", "perfect-hash", "key-value", "storage", "pgm"]
+categories = ["data-structures", "database"]
+
+
+[features]
+default = ["serde", "simd", "parallel", "pgm"]
+serde = ["dep:serde", "dep:bincode"]
+simd = []
+parallel = ["dep:rayon"]
+pgm = []
+avx512 = ["simd"]
+unsafe_optimizations = []
+
+[dependencies]
+thiserror = "1"
+serde = { version = "1", features = ["derive"], optional = true }
+bincode = { version = "1", optional = true }
+rayon = { version = "1.8", optional = true }
+wyhash = { version = "0.6"}
+hashbrown = "0.14"
+rand = "0.8"
+
+[dev-dependencies]
+rand = "0.8"
+criterion = "0.5"
+
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+overflow-checks = false
+debug-assertions = false
+
+[profile.bench]
+inherits = "release"
+debug = true
+
+[profile.release-extreme]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+strip = true
+overflow-checks = false
