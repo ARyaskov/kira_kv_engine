@@ -5,9 +5,8 @@
 //! - Robust: if a build attempt finds a cycle, we rehash with another salt.
 
 mod bdz;
-pub use bdz::{BuildConfig, Builder, MphError, Mphf};
-
+mod cpu;
 pub mod hybrid;
-pub mod pgm;
-pub use hybrid::{HybridBuilder, HybridConfig};
-pub use pgm::PgmBuilder;
+mod pgm;
+mod xor_filter;
+pub use hybrid::{HybridBuilder, HybridConfig, HybridError, HybridIndex, HybridStats};

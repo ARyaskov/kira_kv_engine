@@ -19,6 +19,7 @@ pub struct Mphf {
     pub g: Vec<u32>, // length == m, values in [0..n)
 }
 
+#[allow(dead_code)]
 impl Mphf {
     #[inline]
     pub fn index(&self, key: &[u8]) -> u64 {
@@ -30,15 +31,18 @@ impl Mphf {
         ((ga + gb + gc) % (self.n as u32)) as u64
     }
     #[inline]
+    #[allow(dead_code)]
     pub fn index_str(&self, s: &str) -> u64 {
         self.index(s.as_bytes())
     }
 
     #[cfg(feature = "serde")]
+    #[allow(dead_code)]
     pub fn to_bytes(&self) -> Result<Vec<u8>, MphError> {
         Ok(bincode::serialize(self)?)
     }
     #[cfg(feature = "serde")]
+    #[allow(dead_code)]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, MphError> {
         Ok(bincode::deserialize(bytes)?)
     }
@@ -58,11 +62,7 @@ pub struct BuildConfig {
 
 impl Default for BuildConfig {
     fn default() -> Self {
-        Self {
-            gamma: 1.27,                // Good default; for 100M use 1.27
-            rehash_limit: 16,           // plenty; on good salts often 0-1
-            salt: 0xC0FF_EE00_D15E_A5E, // arbitrary base
-        }
+        crate::cpu::detect_features().optimal_config()
     }
 }
 
@@ -320,9 +320,9 @@ fn dec_deg(deg: &mut [u32], v: u32, q: &mut Vec<u32>) {
     }
 }
 
-/// Derive 3 vertices for each key (possibly in parallel if the "rayon" feature is enabled).
+/// Derive 3 vertices for each key (possibly in parallel if the "parallel" feature is enabled).
 fn derive_vertices(keys: &[Vec<u8>], salt: u64, m: u64) -> (Vec<u32>, Vec<u32>, Vec<u32>) {
-    #[cfg(feature = "rayon")]
+    #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
         let verts: Vec<(u32, u32, u32)> = keys.par_iter().map(|k| vertices(k, salt, m)).collect();
@@ -337,7 +337,7 @@ fn derive_vertices(keys: &[Vec<u8>], salt: u64, m: u64) -> (Vec<u32>, Vec<u32>, 
         }
         (v0, v1, v2)
     }
-    #[cfg(not(feature = "rayon"))]
+    #[cfg(not(feature = "parallel"))]
     {
         let n = keys.len();
         let mut v0 = Vec::with_capacity(n);

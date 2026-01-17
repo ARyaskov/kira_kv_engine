@@ -1,6 +1,6 @@
 [package]
 name = "kira_kv_engine"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "KV-storage engine based on minimal perfect hash functions with hybrid indexing (+PGM Index) for Rust"

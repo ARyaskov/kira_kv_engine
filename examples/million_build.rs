@@ -1,515 +1,1243 @@
-use kira_kv_engine::{Builder, MphError};
-
 use kira_kv_engine::hybrid::{HybridBuilder, HybridConfig};
-#[cfg(feature = "pgm")]
-use kira_kv_engine::pgm::PgmBuilder;
 
 use rand::rngs::StdRng;
-use rand::{RngCore, SeedableRng};
+use rand::seq::SliceRandom;
+use rand::{Rng, RngCore, SeedableRng};
 use std::collections::HashSet;
+use std::thread;
 use std::time::Instant;
 
 const N_KEYS: usize = 1_000_000;
 const GEN_SEED: u64 = 42;
+const QUERY_SEED: u64 = 1337;
+const MISSING_POOL_FRACTION: f64 = 0.01;
+const QUERY_OPS: usize = 50_000;
+const USE_PARALLEL: bool = true;
 
-fn main() -> Result<(), MphError> {
-    println!("=== kira_kv_engine :: Hybrid MPH+PGM Benchmark ===");
+#[derive(Clone)]
+struct QueryBytes {
+    key: Vec<u8>,
+    is_hit: bool,
+}
+
+#[derive(Clone, Copy)]
+struct QueryU64 {
+    key: u64,
+    is_hit: bool,
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    println!("kira_kv_engine benchmark");
     println!("n = {} keys", N_KEYS);
-    println!("{}", "=".repeat(50));
+    println!("{}", "=".repeat(60));
 
-    if let Err(e) = run_traditional_mph_benchmark() {
-        eprintln!("[traditional] error: {e}");
-    }
+    run_mph_bench()?;
 
-    #[cfg(feature = "pgm")]
-    {
-        if let Err(e) = run_hybrid_benchmark() {
-            eprintln!("[hybrid] error: {e}");
-        }
-        if let Err(e) = run_pgm_only_benchmark() {
-            eprintln!("[pgm-only] error: {e}");
-        }
-        if let Err(e) = run_comparison_benchmark() {
-            eprintln!("[comparison] error: {e}");
-        }
-    }
+    run_pgm_bench()?;
+    run_hybrid_bench()?;
 
     Ok(())
 }
 
-fn run_traditional_mph_benchmark() -> Result<(), MphError> {
-    println!("🔥 TRADITIONAL MPH BENCHMARK");
-    println!("{}", "=".repeat(50));
+fn run_mph_bench() -> Result<(), Box<dyn std::error::Error>> {
+    let n_random = N_KEYS / 2;
+    let n_shared = N_KEYS - n_random;
+    let random_keys = gen_random_strings(n_random, GEN_SEED);
+    let shared_keys = gen_shared_prefix_strings(n_shared, GEN_SEED ^ 0x9e3779b97f4a7c15);
 
-    // -------------------------
-    // 1) Key Generation (optimized)
-    // -------------------------
-    let t0 = Instant::now();
-    let keys = gen_string_keys_optimized(N_KEYS, GEN_SEED);
-    let gen_s = t0.elapsed().as_secs_f64();
-    println!(
-        "gen:    {:>8.3} s   ({:.1} M keys/s)",
-        gen_s,
-        N_KEYS as f64 / gen_s / 1e6
-    );
+    let mut keys = Vec::with_capacity(N_KEYS);
+    keys.extend(random_keys);
+    keys.extend(shared_keys);
 
-    // -------------------------
-    // 2) Build MPH (with all optimizations)
-    // -------------------------
-    let t1 = Instant::now();
-    let mph = Builder::new().build(keys.iter().map(|v| v.as_slice()))?;
-    let build_s = t1.elapsed().as_secs_f64();
-    println!(
-        "build:  {:>8.3} s   ({:.1} M keys/s)",
+    let mut rng = StdRng::seed_from_u64(QUERY_SEED ^ 0x1111_1111_1111_1111);
+    keys.shuffle(&mut rng);
+
+    let mut key_set = HashSet::with_capacity(N_KEYS * 2);
+    for k in &keys {
+        key_set.insert(k.clone());
+    }
+
+    let t_build = Instant::now();
+    let mph = HybridBuilder::new()
+        .with_config(HybridConfig::default())
+        .build_index(keys.clone())?;
+    let build_s = t_build.elapsed().as_secs_f64();
+
+    let bytes_per_key = mph.stats().total_memory as f64 / N_KEYS as f64;
+
+    let mut rng_queries = StdRng::seed_from_u64(QUERY_SEED ^ 0x2222_2222_2222_2222);
+    let positive_queries = make_positive_queries_bytes(&keys[..QUERY_OPS.min(keys.len())]);
+
+    let missing_total = (QUERY_OPS as f64 * MISSING_POOL_FRACTION).ceil() as usize;
+    let miss_random = missing_total / 2;
+    let miss_shared = missing_total - miss_random;
+
+    let missing_random = gen_random_strings_missing(miss_random, &mut rng_queries, &key_set, 8, 64);
+    let missing_shared =
+        gen_shared_prefix_strings_missing(miss_shared, &mut rng_queries, &key_set, 8, 64);
+
+    let mut missing_keys = Vec::with_capacity(missing_total);
+    missing_keys.extend(missing_random);
+    missing_keys.extend(missing_shared);
+
+    let negative_queries =
+        make_negative_queries_bytes(&keys, &missing_keys, QUERY_OPS, 0.70, &mut rng_queries);
+
+    let zipf_queries = make_zipfian_queries_bytes(&keys, QUERY_OPS, &mut rng_queries);
+
+    print_table_header();
+
+    run_lookup_bytes_mph(
+        "MPH",
+        "positive",
+        &mph,
         build_s,
-        N_KEYS as f64 / build_s / 1e6
+        bytes_per_key,
+        positive_queries,
     );
 
-    // -------------------------
-    // 3) Warm-up runs to stabilize performance
-    // -------------------------
-    println!("Warming up caches...");
-    for _ in 0..3 {
-        let mut acc: u64 = 0;
-        for chunk in keys.chunks(32_768) {
-            for k in chunk {
-                acc ^= mph.index(k);
-            }
-        }
-        std::hint::black_box(acc);
-    }
-
-    // -------------------------
-    // 4) Single-threaded lookups
-    // -------------------------
-    let t2 = Instant::now();
-    let mut acc: u64 = 0;
-
-    // Optimized loop with unrolling
-    let mut i = 0;
-    while i + 8 <= keys.len() {
-        acc ^= mph.index(&keys[i]);
-        acc ^= mph.index(&keys[i + 1]);
-        acc ^= mph.index(&keys[i + 2]);
-        acc ^= mph.index(&keys[i + 3]);
-        acc ^= mph.index(&keys[i + 4]);
-        acc ^= mph.index(&keys[i + 5]);
-        acc ^= mph.index(&keys[i + 6]);
-        acc ^= mph.index(&keys[i + 7]);
-        i += 8;
-    }
-    while i < keys.len() {
-        acc ^= mph.index(&keys[i]);
-        i += 1;
-    }
-
-    let lookup_s = t2.elapsed().as_secs_f64();
-    println!(
-        "lookup: {:>8.3} s   ({:.1} M lookups/s)   (acc={})",
-        lookup_s,
-        N_KEYS as f64 / lookup_s / 1e6,
-        acc
+    run_lookup_bytes_mph(
+        "MPH",
+        "negative",
+        &mph,
+        build_s,
+        bytes_per_key,
+        negative_queries,
     );
 
-    // -------------------------
-    // 5) Memory usage analysis
-    // -------------------------
-    let mph_size = std::mem::size_of_val(&mph) + mph.g.len() * std::mem::size_of::<u32>();
-    let bytes_per_key = mph_size as f64 / N_KEYS as f64;
-    let total_mb = mph_size as f64 / 1_048_576.0;
-
-    println!();
-    println!("Memory Analysis:");
-    println!("  Total MPH size: {:.2} MB", total_mb);
-    println!("  Bytes per key:  {:.2} B", bytes_per_key);
-    println!("  Compression:    {:.1}x vs HashMap", 120.0 / bytes_per_key);
-
-    let total_time = gen_s + build_s + lookup_s;
-    println!();
-    println!("Performance Summary:");
-    println!("  Total time:     {:.3} s", total_time);
-    println!(
-        "  Build rate:     {:.1} M keys/s",
-        N_KEYS as f64 / build_s / 1e6
-    );
-    println!(
-        "  Lookup rate:    {:.1} M lookups/s",
-        N_KEYS as f64 / lookup_s / 1e6
-    );
-    println!();
+    run_lookup_bytes_mph("MPH", "zipf", &mph, build_s, bytes_per_key, zipf_queries);
 
     Ok(())
 }
 
-#[cfg(feature = "pgm")]
-fn run_hybrid_benchmark() -> Result<(), Box<dyn std::error::Error>> {
-    println!("🚀 HYBRID MPH+PGM BENCHMARK");
-    println!("{}", "=".repeat(50));
+fn run_pgm_bench() -> Result<(), Box<dyn std::error::Error>> {
+    print_table_header();
 
-    let t0 = Instant::now();
-    let mixed_keys = gen_mixed_keys(N_KEYS, GEN_SEED);
-    let gen_s = t0.elapsed().as_secs_f64();
-    println!(
-        "gen:    {:>8.3} s   ({:.1} M keys/s)",
-        gen_s,
-        N_KEYS as f64 / gen_s / 1e6
+    let mut keys = gen_numeric_keys(N_KEYS, GEN_SEED ^ 0x3333_3333_3333_3333);
+    let mut rng = StdRng::seed_from_u64(QUERY_SEED ^ 0x4444_4444_4444_4444);
+    keys.shuffle(&mut rng);
+
+    let mut key_set = HashSet::with_capacity(N_KEYS * 2);
+    for &k in &keys {
+        key_set.insert(k);
+    }
+
+    let t_build = Instant::now();
+    let key_bytes: Vec<Vec<u8>> = keys.iter().map(|k| k.to_le_bytes().to_vec()).collect();
+    let pgm = HybridBuilder::new()
+        .with_config(HybridConfig::default())
+        .build_index(key_bytes)?;
+    let build_s = t_build.elapsed().as_secs_f64();
+
+    let bytes_per_key = pgm.stats().total_memory as f64 / N_KEYS as f64;
+
+    let positive_queries = make_positive_queries_u64(&keys[..QUERY_OPS.min(keys.len())]);
+
+    let missing_total = (QUERY_OPS as f64 * MISSING_POOL_FRACTION).ceil() as usize;
+    let missing_keys = gen_numeric_keys_missing(
+        missing_total,
+        &mut rng,
+        &key_set,
+        GEN_SEED ^ 0x5555_5555_5555_5555,
     );
 
-    let t1 = Instant::now();
+    let negative_queries =
+        make_negative_queries_u64(&keys, &missing_keys, QUERY_OPS, 0.70, &mut rng);
+
+    let zipf_queries = make_zipfian_queries_u64(&keys, QUERY_OPS, &mut rng);
+
+    run_lookup_u64(
+        "PGM",
+        "positive",
+        &pgm,
+        build_s,
+        bytes_per_key,
+        positive_queries,
+    );
+
+    run_lookup_u64(
+        "PGM",
+        "negative",
+        &pgm,
+        build_s,
+        bytes_per_key,
+        negative_queries,
+    );
+
+    run_lookup_u64("PGM", "zipf", &pgm, build_s, bytes_per_key, zipf_queries);
+
+    Ok(())
+}
+
+fn run_hybrid_bench() -> Result<(), Box<dyn std::error::Error>> {
+    print_table_header();
+
+    let mixed_keys = gen_mixed_keys(N_KEYS, GEN_SEED ^ 0x6666_6666_6666_6666);
+    let mut rng = StdRng::seed_from_u64(QUERY_SEED ^ 0x7777_7777_7777_7777);
+
+    let mut key_set = HashSet::with_capacity(N_KEYS * 2);
+    for k in &mixed_keys {
+        key_set.insert(k.clone());
+    }
+
+    let t_build = Instant::now();
     let hybrid = HybridBuilder::new()
         .with_config(HybridConfig::default())
-        .build(mixed_keys.clone())?;
-    let build_s = t1.elapsed().as_secs_f64();
-    println!(
-        "build:  {:>8.3} s   ({:.1} M keys/s)",
-        build_s,
-        N_KEYS as f64 / build_s / 1e6
-    );
+        .build_index(mixed_keys.clone())?;
+    let build_s = t_build.elapsed().as_secs_f64();
 
-    // Warm-up
-    println!("Warming up hybrid caches...");
-    for _ in 0..3 {
-        let mut acc: u64 = 0;
-        for chunk in mixed_keys.chunks(32_768) {
-            for k in chunk {
-                if let Ok(idx) = hybrid.index(k) {
-                    acc ^= idx as u64;
-                }
-            }
-        }
-        std::hint::black_box(acc);
-    }
+    let stats = hybrid.stats();
+    let bytes_per_key = stats.total_memory as f64 / N_KEYS as f64;
 
-    // Benchmark lookups
-    let t2 = Instant::now();
-    let mut acc: u64 = 0;
-    let mut found = 0;
+    let positive_queries =
+        make_positive_queries_bytes(&mixed_keys[..QUERY_OPS.min(mixed_keys.len())]);
 
-    for key in &mixed_keys {
-        if let Ok(idx) = hybrid.index(key) {
-            acc ^= idx as u64;
-            found += 1;
-        }
-    }
+    let missing_total = (QUERY_OPS as f64 * MISSING_POOL_FRACTION).ceil() as usize;
+    let missing_keys = gen_mixed_keys_missing(missing_total, &mut rng, &key_set);
+    let negative_queries =
+        make_negative_queries_bytes(&mixed_keys, &missing_keys, QUERY_OPS, 0.70, &mut rng);
 
-    let lookup_s = t2.elapsed().as_secs_f64();
-    println!(
-        "lookup: {:>8.3} s   ({:.1} M lookups/s)   (found={}, acc={})",
-        lookup_s,
-        found as f64 / lookup_s / 1e6,
-        found,
-        acc
-    );
+    let zipf_queries = make_zipfian_queries_bytes(&mixed_keys, QUERY_OPS, &mut rng);
 
-    println!();
-    Ok(())
-}
-
-#[cfg(feature = "pgm")]
-fn run_pgm_only_benchmark() -> Result<(), Box<dyn std::error::Error>> {
-    println!("📊 PGM-ONLY BENCHMARK (Numeric Keys)");
-    println!("{}", "=".repeat(50));
-
-    let t0 = Instant::now();
-    let numeric_keys = gen_numeric_keys(N_KEYS, GEN_SEED);
-    let gen_s = t0.elapsed().as_secs_f64();
-    println!(
-        "gen:    {:>8.3} s   ({:.1} M keys/s)",
-        gen_s,
-        N_KEYS as f64 / gen_s / 1e6
-    );
-
-    let t1 = Instant::now();
-    let pgm = PgmBuilder::new()
-        .with_epsilon(32)
-        .build(numeric_keys.clone())?;
-    let build_s = t1.elapsed().as_secs_f64();
-    println!(
-        "build:  {:>8.3} s   ({:.1} M keys/s)",
-        build_s,
-        N_KEYS as f64 / build_s / 1e6
-    );
-
-    // Warm-up
-    for _ in 0..3 {
-        let mut acc: u64 = 0;
-        for &key in numeric_keys.iter().take(10000) {
-            if let Ok(idx) = pgm.index(key) {
-                acc ^= idx as u64;
-            }
-        }
-        std::hint::black_box(acc);
-    }
-
-    // Point lookups
-    let t2 = Instant::now();
-    let mut acc: u64 = 0;
-    let mut found = 0;
-
-    for &key in &numeric_keys {
-        if let Ok(idx) = pgm.index(key) {
-            acc ^= idx as u64;
-            found += 1;
-        }
-    }
-
-    let lookup_s = t2.elapsed().as_secs_f64();
-    println!(
-        "lookup: {:>8.3} s   ({:.1} M lookups/s)   (found={}, acc={})",
-        lookup_s,
-        found as f64 / lookup_s / 1e6,
-        found,
-        acc
-    );
-
-    // Range queries benchmark
-    let t3 = Instant::now();
-    let mut total_results = 0;
-
-    // 1000 range queries
-    for i in 0..1000 {
-        let base = numeric_keys[i * (numeric_keys.len() / 1000)];
-        let results = pgm.range(base, base + 1000);
-        total_results += results.len();
-    }
-
-    let range_s = t3.elapsed().as_secs_f64();
-    println!(
-        "range:  {:>8.3} s   ({:.1} queries/s)   (total_results={})",
-        range_s,
-        1000.0 / range_s,
-        total_results
-    );
-
-    println!();
-    Ok(())
-}
-
-#[cfg(feature = "pgm")]
-fn run_comparison_benchmark() -> Result<(), Box<dyn std::error::Error>> {
-    println!("⚔️  COMPARISON BENCHMARK");
-    println!("{}", "=".repeat(50));
-
-    let n_test = N_KEYS / 2; // Smaller set for faster comparison
-
-    // Test data
-    let string_keys = gen_string_keys_optimized(n_test, GEN_SEED);
-    let numeric_keys = gen_numeric_keys(n_test, GEN_SEED);
-    let mixed_keys = gen_mixed_keys(n_test, GEN_SEED);
-
-    println!("Testing with {} keys each...\n", n_test);
-
-    // ===== MPH vs PGM vs Hybrid =====
-    println!("📊 Build Performance:");
-    println!(
-        "{:<20} {:>10} {:>15}",
-        "Method", "Time (ms)", "Rate (M keys/s)"
-    );
-    println!("{}", "-".repeat(50));
-
-    // MPH build
-    let t_start = Instant::now();
-    let mph = Builder::new().build(string_keys.iter().map(|k| k.as_slice()))?;
-    let mph_build_ms = t_start.elapsed().as_millis();
-    println!(
-        "{:<20} {:>10} {:>15.1}",
-        "MPH (strings)",
-        mph_build_ms,
-        n_test as f64 / t_start.elapsed().as_secs_f64() / 1e6
-    );
-
-    // PGM build
-    let t_start = Instant::now();
-    let pgm = PgmBuilder::new().build(numeric_keys.clone())?;
-    let pgm_build_ms = t_start.elapsed().as_millis();
-    println!(
-        "{:<20} {:>10} {:>15.1}",
-        "PGM (numbers)",
-        pgm_build_ms,
-        n_test as f64 / t_start.elapsed().as_secs_f64() / 1e6
-    );
-
-    // Hybrid build
-    let t_start = Instant::now();
-    let hybrid = HybridBuilder::new().build(mixed_keys.clone())?;
-    let hybrid_build_ms = t_start.elapsed().as_millis();
-    println!(
-        "{:<20} {:>10} {:>15.1}",
-        "Hybrid (mixed)",
-        hybrid_build_ms,
-        n_test as f64 / t_start.elapsed().as_secs_f64() / 1e6
-    );
-
-    println!();
-
-    // ===== Lookup Performance =====
-    println!("🔍 Lookup Performance (1M operations):");
-    println!(
-        "{:<20} {:>10} {:>15} {:>10}",
-        "Method", "Time (ms)", "Rate (M ops/s)", "Hit Rate"
-    );
-    println!("{}", "-".repeat(60));
-
-    // MPH lookups
-    let t_start = Instant::now();
-    let mut acc = 0u64;
-    for _ in 0..1000 {
-        for key in string_keys.iter().take(1000) {
-            acc ^= mph.index(key);
-        }
-    }
-    let mph_lookup_ms = t_start.elapsed().as_millis();
-    std::hint::black_box(acc);
-    println!(
-        "{:<20} {:>10} {:>15.1} {:>10}",
-        "MPH",
-        mph_lookup_ms,
-        1_000_000.0 / t_start.elapsed().as_secs_f64() / 1e6,
-        "100%"
-    );
-
-    // PGM lookups
-    let t_start = Instant::now();
-    let mut acc = 0u64;
-    let mut hits = 0;
-    for _ in 0..1000 {
-        for &key in numeric_keys.iter().take(1000) {
-            if let Ok(idx) = pgm.index(key) {
-                acc ^= idx as u64;
-                hits += 1;
-            }
-        }
-    }
-    let pgm_lookup_ms = t_start.elapsed().as_millis();
-    std::hint::black_box(acc);
-    println!(
-        "{:<20} {:>10} {:>15.1} {:>9.1}%",
-        "PGM",
-        pgm_lookup_ms,
-        hits as f64 / t_start.elapsed().as_secs_f64() / 1e6,
-        hits as f64 / 1_000_000.0 * 100.0
-    );
-
-    // Hybrid lookups
-    let t_start = Instant::now();
-    let mut acc = 0u64;
-    let mut hits = 0;
-    for _ in 0..1000 {
-        for key in mixed_keys.iter().take(1000) {
-            if let Ok(idx) = hybrid.index(key) {
-                acc ^= idx as u64;
-                hits += 1;
-            }
-        }
-    }
-    let hybrid_lookup_ms = t_start.elapsed().as_millis();
-    std::hint::black_box(acc);
-    println!(
-        "{:<20} {:>10} {:>15.1} {:>9.1}%",
+    run_lookup_bytes_hybrid(
         "Hybrid",
-        hybrid_lookup_ms,
-        hits as f64 / t_start.elapsed().as_secs_f64() / 1e6,
-        hits as f64 / 1_000.0,
+        "positive",
+        &hybrid,
+        build_s,
+        bytes_per_key,
+        positive_queries,
     );
 
-    println!("\n🏆 Performance Winner Summary:");
-    println!(
-        "  Build Speed: {} (PGM usually wins for numbers)",
-        if pgm_build_ms < mph_build_ms.min(hybrid_build_ms) {
-            "PGM 🥇"
-        } else if mph_build_ms < hybrid_build_ms {
-            "MPH 🥈"
-        } else {
-            "Hybrid 🥉"
-        }
+    run_lookup_bytes_hybrid(
+        "Hybrid",
+        "negative",
+        &hybrid,
+        build_s,
+        bytes_per_key,
+        negative_queries,
     );
 
-    println!(
-        "  Lookup Speed: {} (MPH usually wins)",
-        if mph_lookup_ms < pgm_lookup_ms.min(hybrid_lookup_ms) {
-            "MPH 🥇"
-        } else if pgm_lookup_ms < hybrid_lookup_ms {
-            "PGM 🥈"
-        } else {
-            "Hybrid 🥉"
-        }
+    run_lookup_bytes_hybrid(
+        "Hybrid",
+        "zipf",
+        &hybrid,
+        build_s,
+        bytes_per_key,
+        zipf_queries,
     );
 
     Ok(())
 }
 
-fn gen_string_keys_optimized(n: usize, seed: u64) -> Vec<Vec<u8>> {
-    let mut rng = StdRng::seed_from_u64(seed);
-    let mut keys = Vec::with_capacity(n);
-    let mut seen = HashSet::with_capacity(n * 2);
-
-    const KEY_SIZE: usize = 20;
-    const BATCH_SIZE: usize = 10000;
-    let mut batch_buffer = vec![0u8; BATCH_SIZE * KEY_SIZE];
-
-    while keys.len() < n {
-        let remaining = n - keys.len();
-        let this_batch = remaining.min(BATCH_SIZE);
-
-        rng.fill_bytes(&mut batch_buffer[..this_batch * KEY_SIZE]);
-
-        for i in 0..this_batch {
-            let start = i * KEY_SIZE;
-            let end = start + KEY_SIZE;
-            let mut key = batch_buffer[start..end].to_vec();
-
-            let counter = keys.len() as u64;
-            key[0..8].copy_from_slice(&counter.to_le_bytes());
-
-            if seen.insert(key.clone()) {
-                keys.push(key);
-            }
-        }
-    }
-
-    keys.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
-    keys
+fn print_table_header() {
+    println!(
+        "{:<7} {:<9} {:<5} {:>10} {:>12} {:>12} {:>14} {:>8} {:>8} {:>12}",
+        "Struct",
+        "Workload",
+        "Cache",
+        "Build ms",
+        "Build rate",
+        "Lookup ns",
+        "Throughput",
+        "Hit %",
+        "Miss %",
+        "B/key"
+    );
+    println!("{}", "-".repeat(110));
 }
 
-#[cfg(feature = "pgm")]
+fn run_lookup_bytes_mph(
+    structure: &str,
+    workload: &str,
+    mph: &kira_kv_engine::hybrid::HybridIndex,
+    build_s: f64,
+    bytes_per_key: f64,
+    mut queries: Vec<QueryBytes>,
+) {
+    let (hits, misses) = count_hits_bytes(&queries);
+    let mut rng = StdRng::seed_from_u64(QUERY_SEED ^ 0x8888_8888_8888_8888);
+
+    let (cold_s, cold_acc) = measure_bytes_queries_batch(&mut queries, &mut rng, false, mph);
+    std::hint::black_box(cold_acc);
+    print_row(
+        structure,
+        workload,
+        "cold",
+        build_s,
+        N_KEYS,
+        cold_s,
+        queries.len(),
+        hits,
+        misses,
+        bytes_per_key,
+    );
+
+    let (warm_s, warm_acc) = measure_bytes_queries_batch(&mut queries, &mut rng, true, mph);
+    std::hint::black_box(warm_acc);
+    print_row(
+        structure,
+        workload,
+        "warm",
+        build_s,
+        N_KEYS,
+        warm_s,
+        queries.len(),
+        hits,
+        misses,
+        bytes_per_key,
+    );
+}
+
+fn run_lookup_u64(
+    structure: &str,
+    workload: &str,
+    pgm: &kira_kv_engine::hybrid::HybridIndex,
+    build_s: f64,
+    bytes_per_key: f64,
+    mut queries: Vec<QueryU64>,
+) {
+    let (hits, misses) = count_hits_u64(&queries);
+    let mut rng = StdRng::seed_from_u64(QUERY_SEED ^ 0x9999_9999_9999_9999);
+
+    let (cold_s, cold_acc) = measure_u64_queries(&mut queries, &mut rng, false, |k| {
+        if let Ok(idx) = pgm.lookup_u64(k) {
+            idx as u64
+        } else {
+            0
+        }
+    });
+    std::hint::black_box(cold_acc);
+    print_row(
+        structure,
+        workload,
+        "cold",
+        build_s,
+        N_KEYS,
+        cold_s,
+        queries.len(),
+        hits,
+        misses,
+        bytes_per_key,
+    );
+
+    let (warm_s, warm_acc) = measure_u64_queries(&mut queries, &mut rng, true, |k| {
+        if let Ok(idx) = pgm.lookup_u64(k) {
+            idx as u64
+        } else {
+            0
+        }
+    });
+    std::hint::black_box(warm_acc);
+    print_row(
+        structure,
+        workload,
+        "warm",
+        build_s,
+        N_KEYS,
+        warm_s,
+        queries.len(),
+        hits,
+        misses,
+        bytes_per_key,
+    );
+}
+
+fn run_lookup_bytes_hybrid(
+    structure: &str,
+    workload: &str,
+    hybrid: &kira_kv_engine::hybrid::HybridIndex,
+    build_s: f64,
+    bytes_per_key: f64,
+    mut queries: Vec<QueryBytes>,
+) {
+    let (hits, misses) = count_hits_bytes(&queries);
+    let mut rng = StdRng::seed_from_u64(QUERY_SEED ^ 0xaaaa_aaaa_aaaa_aaaa);
+
+    let (cold_s, cold_acc) = measure_bytes_queries_batch(&mut queries, &mut rng, false, hybrid);
+    std::hint::black_box(cold_acc);
+    print_row(
+        structure,
+        workload,
+        "cold",
+        build_s,
+        N_KEYS,
+        cold_s,
+        queries.len(),
+        hits,
+        misses,
+        bytes_per_key,
+    );
+
+    let (warm_s, warm_acc) = measure_bytes_queries_batch(&mut queries, &mut rng, true, hybrid);
+    std::hint::black_box(warm_acc);
+    print_row(
+        structure,
+        workload,
+        "warm",
+        build_s,
+        N_KEYS,
+        warm_s,
+        queries.len(),
+        hits,
+        misses,
+        bytes_per_key,
+    );
+}
+
+fn print_row(
+    structure: &str,
+    workload: &str,
+    cache: &str,
+    build_s: f64,
+    n_keys: usize,
+    lookup_s: f64,
+    ops: usize,
+    hits: usize,
+    misses: usize,
+    bytes_per_key: f64,
+) {
+    let build_ms = build_s * 1000.0;
+    let build_rate = n_keys as f64 / build_s;
+    let lookup_ns = (lookup_s * 1e9) / ops as f64;
+    let throughput = ops as f64 / lookup_s;
+    let hit_rate = hits as f64 / ops as f64 * 100.0;
+    let miss_rate = misses as f64 / ops as f64 * 100.0;
+
+    println!(
+        "{:<7} {:<9} {:<5} {:>10.2} {:>12.0} {:>12.2} {:>14.0} {:>8.1} {:>8.1} {:>12.2}",
+        structure,
+        workload,
+        cache,
+        build_ms,
+        build_rate,
+        lookup_ns,
+        throughput,
+        hit_rate,
+        miss_rate,
+        bytes_per_key
+    );
+}
+
+fn measure_bytes_queries<F>(
+    queries: &mut [QueryBytes],
+    rng: &mut StdRng,
+    warm: bool,
+    mut f: F,
+) -> (f64, u64)
+where
+    F: FnMut(&[u8]) -> u64,
+{
+    if warm {
+        queries.shuffle(rng);
+        let mut warm_acc = 0u64;
+        for q in queries.iter() {
+            let key = std::hint::black_box(q.key.as_slice());
+            warm_acc ^= f(key);
+        }
+        std::hint::black_box(warm_acc);
+    }
+
+    queries.shuffle(rng);
+    let t0 = Instant::now();
+    let mut acc = 0u64;
+    for q in queries.iter() {
+        let key = std::hint::black_box(q.key.as_slice());
+        acc ^= f(key);
+    }
+    let elapsed = t0.elapsed().as_secs_f64();
+
+    (elapsed, acc)
+}
+
+fn measure_bytes_queries_batch(
+    queries: &mut [QueryBytes],
+    rng: &mut StdRng,
+    warm: bool,
+    index: &kira_kv_engine::hybrid::HybridIndex,
+) -> (f64, u64) {
+    if warm {
+        queries.shuffle(rng);
+        let warm_acc = if USE_PARALLEL {
+            parallel_batch_lookup(index, queries)
+        } else {
+            batch_lookup(index, queries)
+        };
+        std::hint::black_box(warm_acc);
+    }
+
+    queries.shuffle(rng);
+    let t0 = Instant::now();
+    let acc = if USE_PARALLEL {
+        parallel_batch_lookup(index, queries)
+    } else {
+        batch_lookup(index, queries)
+    };
+    let elapsed = t0.elapsed().as_secs_f64();
+
+    (elapsed, acc)
+}
+
+fn batch_lookup(index: &kira_kv_engine::hybrid::HybridIndex, queries: &[QueryBytes]) -> u64 {
+    let refs: Vec<&[u8]> = queries.iter().map(|q| q.key.as_slice()).collect();
+    let mut acc = 0u64;
+    for opt in index.lookup_batch(&refs) {
+        if let Some(idx) = opt {
+            acc ^= idx as u64;
+        }
+    }
+    acc
+}
+
+fn parallel_batch_lookup(
+    index: &kira_kv_engine::hybrid::HybridIndex,
+    queries: &[QueryBytes],
+) -> u64 {
+    let threads = thread_count();
+    let per = (queries.len() + threads - 1) / threads;
+    let mut accs = Vec::new();
+    thread::scope(|s| {
+        let mut handles = Vec::new();
+        for t in 0..threads {
+            let start = t * per;
+            if start >= queries.len() {
+                continue;
+            }
+            let end = (start + per).min(queries.len());
+            let slice = &queries[start..end];
+            let idx_ref = index;
+            handles.push(s.spawn(move || {
+                let refs: Vec<&[u8]> = slice.iter().map(|q| q.key.as_slice()).collect();
+                let mut local = 0u64;
+                for opt in idx_ref.lookup_batch(&refs) {
+                    if let Some(idx) = opt {
+                        local ^= idx as u64;
+                    }
+                }
+                local
+            }));
+        }
+        for h in handles {
+            if let Ok(v) = h.join() {
+                accs.push(v);
+            }
+        }
+    });
+    accs.into_iter().fold(0u64, |a, b| a ^ b)
+}
+
+fn measure_u64_queries<F>(
+    queries: &mut [QueryU64],
+    rng: &mut StdRng,
+    warm: bool,
+    mut f: F,
+) -> (f64, u64)
+where
+    F: FnMut(u64) -> u64,
+{
+    if warm {
+        queries.shuffle(rng);
+        let mut warm_acc = 0u64;
+        for q in queries.iter() {
+            let key = std::hint::black_box(q.key);
+            warm_acc ^= f(key);
+        }
+        std::hint::black_box(warm_acc);
+    }
+
+    queries.shuffle(rng);
+    let t0 = Instant::now();
+    let mut acc = 0u64;
+    for q in queries.iter() {
+        let key = std::hint::black_box(q.key);
+        acc ^= f(key);
+    }
+    let elapsed = t0.elapsed().as_secs_f64();
+
+    (elapsed, acc)
+}
+
+fn count_hits_bytes(queries: &[QueryBytes]) -> (usize, usize) {
+    let hits = queries.iter().filter(|q| q.is_hit).count();
+    (hits, queries.len() - hits)
+}
+
+fn count_hits_u64(queries: &[QueryU64]) -> (usize, usize) {
+    let hits = queries.iter().filter(|q| q.is_hit).count();
+    (hits, queries.len() - hits)
+}
+
+fn make_positive_queries_bytes(keys: &[Vec<u8>]) -> Vec<QueryBytes> {
+    keys.iter()
+        .map(|k| QueryBytes {
+            key: k.clone(),
+            is_hit: true,
+        })
+        .collect()
+}
+
+fn make_positive_queries_u64(keys: &[u64]) -> Vec<QueryU64> {
+    keys.iter()
+        .map(|&k| QueryU64 {
+            key: k,
+            is_hit: true,
+        })
+        .collect()
+}
+
+fn make_negative_queries_bytes(
+    keys: &[Vec<u8>],
+    missing: &[Vec<u8>],
+    total: usize,
+    hit_ratio: f64,
+    rng: &mut StdRng,
+) -> Vec<QueryBytes> {
+    let mut queries = Vec::with_capacity(total);
+    let hit_count = (total as f64 * hit_ratio) as usize;
+    let miss_count = total - hit_count;
+
+    for _ in 0..hit_count {
+        let idx = rng.gen_range(0..keys.len());
+        queries.push(QueryBytes {
+            key: keys[idx].clone(),
+            is_hit: true,
+        });
+    }
+    for _ in 0..miss_count {
+        let idx = rng.gen_range(0..missing.len());
+        queries.push(QueryBytes {
+            key: missing[idx].clone(),
+            is_hit: false,
+        });
+    }
+
+    queries
+}
+
+fn make_negative_queries_u64(
+    keys: &[u64],
+    missing: &[u64],
+    total: usize,
+    hit_ratio: f64,
+    rng: &mut StdRng,
+) -> Vec<QueryU64> {
+    let mut queries = Vec::with_capacity(total);
+    let hit_count = (total as f64 * hit_ratio) as usize;
+    let miss_count = total - hit_count;
+
+    for _ in 0..hit_count {
+        let idx = rng.gen_range(0..keys.len());
+        queries.push(QueryU64 {
+            key: keys[idx],
+            is_hit: true,
+        });
+    }
+    for _ in 0..miss_count {
+        let idx = rng.gen_range(0..missing.len());
+        queries.push(QueryU64 {
+            key: missing[idx],
+            is_hit: false,
+        });
+    }
+
+    queries
+}
+
+fn make_zipfian_queries_bytes(keys: &[Vec<u8>], total: usize, rng: &mut StdRng) -> Vec<QueryBytes> {
+    let hot_count = (keys.len() / 5).max(1);
+    let mut indices: Vec<usize> = (0..keys.len()).collect();
+    indices.shuffle(rng);
+    let hot_indices = &indices[..hot_count];
+
+    let mut queries = Vec::with_capacity(total);
+    for _ in 0..total {
+        let use_hot = rng.gen_bool(0.80);
+        let idx = if use_hot {
+            let h = rng.gen_range(0..hot_indices.len());
+            hot_indices[h]
+        } else {
+            rng.gen_range(0..keys.len())
+        };
+        queries.push(QueryBytes {
+            key: keys[idx].clone(),
+            is_hit: true,
+        });
+    }
+
+    queries
+}
+
+fn make_zipfian_queries_u64(keys: &[u64], total: usize, rng: &mut StdRng) -> Vec<QueryU64> {
+    let hot_count = (keys.len() / 5).max(1);
+    let mut indices: Vec<usize> = (0..keys.len()).collect();
+    indices.shuffle(rng);
+    let hot_indices = &indices[..hot_count];
+
+    let mut queries = Vec::with_capacity(total);
+    for _ in 0..total {
+        let use_hot = rng.gen_bool(0.80);
+        let idx = if use_hot {
+            let h = rng.gen_range(0..hot_indices.len());
+            hot_indices[h]
+        } else {
+            rng.gen_range(0..keys.len())
+        };
+        queries.push(QueryU64 {
+            key: keys[idx],
+            is_hit: true,
+        });
+    }
+
+    queries
+}
+
+fn gen_random_strings(n: usize, seed: u64) -> Vec<Vec<u8>> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut seen = HashSet::with_capacity(n * 2);
+    if USE_PARALLEL {
+        gen_random_strings_parallel(n, &mut rng, &mut seen, 8, 64)
+    } else {
+        gen_random_strings_with_range(n, &mut rng, &mut seen, 8, 64)
+    }
+}
+
+fn gen_shared_prefix_strings(n: usize, seed: u64) -> Vec<Vec<u8>> {
+    let mut rng = StdRng::seed_from_u64(seed);
+    let mut seen = HashSet::with_capacity(n * 2);
+    if USE_PARALLEL {
+        gen_shared_prefix_strings_parallel(n, &mut rng, &mut seen, 8, 64)
+    } else {
+        gen_shared_prefix_strings_with_range(n, &mut rng, &mut seen, 8, 64)
+    }
+}
+
 fn gen_numeric_keys(n: usize, seed: u64) -> Vec<u64> {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut keys = Vec::with_capacity(n);
 
-    for i in 0..n {
-        let key = match i % 4 {
-            0 => i as u64 * 2,                  // Linear pattern
-            1 => (i as u64).pow(2) % 1_000_000, // Quadratic pattern
-            2 => rng.next_u64() % 1_000_000,    // Random pattern
-            _ => 1_000_000 + i as u64,          // Dense pattern
-        };
-        keys.push(key);
+    let n_uniform = n * 50 / 100;
+    let n_zipf = n * 30 / 100;
+    let n_cluster = n - n_uniform - n_zipf;
+
+    if USE_PARALLEL {
+        keys.extend(gen_numeric_uniform_parallel(n_uniform, rng.next_u64()));
+        keys.extend(gen_numeric_zipf_parallel(n_zipf, rng.next_u64()));
+        keys.extend(gen_numeric_cluster_parallel(n_cluster, &mut rng));
+    } else {
+        for _ in 0..n_uniform {
+            keys.push(rng.next_u64());
+        }
+        let zipf_domain = (n_zipf / 4).max(5_000).min(50_000) as u64;
+        let zipf_seed = rng.next_u64();
+        for _ in 0..n_zipf {
+            let rank = sample_zipf_fast(&mut rng, zipf_domain, 1.07);
+            let v = splitmix64(rank ^ zipf_seed);
+            keys.push(v);
+        }
+        let cluster_count = (n_cluster / 32_768).max(4);
+        let clusters = build_clusters(cluster_count, &mut rng);
+        for _ in 0..n_cluster {
+            let (start, len) = clusters[rng.gen_range(0..clusters.len())];
+            let offset = rng.gen_range(0..len);
+            let v = start.wrapping_add(offset);
+            keys.push(v);
+        }
     }
 
     keys.sort_unstable();
     keys.dedup();
+    if keys.len() < n {
+        let extra = n - keys.len();
+        for _ in 0..extra {
+            keys.push(rng.next_u64());
+        }
+        keys.sort_unstable();
+        keys.dedup();
+    }
     keys.truncate(n);
     keys
 }
 
-#[cfg(feature = "pgm")]
 fn gen_mixed_keys(n: usize, seed: u64) -> Vec<Vec<u8>> {
-    let mut rng = StdRng::seed_from_u64(seed);
+    let n_numeric = n * 40 / 100;
+    let n_random = n * 40 / 100;
+    let n_shared = n - n_numeric - n_random;
+
+    let numeric_keys = gen_numeric_keys(n_numeric, seed ^ 0xdead_beef_cafe_babe);
     let mut keys = Vec::with_capacity(n);
 
-    let numeric_count = n / 2;
-    for i in 0..numeric_count {
-        let num = (i as u64 * 1000 + rng.next_u64() % 1000) as u64;
+    for num in numeric_keys {
         keys.push(num.to_le_bytes().to_vec());
     }
 
-    let string_count = n - numeric_count;
-    for i in 0..string_count {
-        let mut key = vec![0u8; 16];
+    let mut rng = StdRng::seed_from_u64(seed ^ 0x1234_5678_9abc_def0);
+    let mut seen_strings = HashSet::with_capacity((n_random + n_shared) * 2);
+
+    let random_strings = if USE_PARALLEL {
+        gen_random_strings_parallel(n_random, &mut rng, &mut seen_strings, 9, 64)
+    } else {
+        gen_random_strings_with_range(n_random, &mut rng, &mut seen_strings, 9, 64)
+    };
+    let shared_strings = if USE_PARALLEL {
+        gen_shared_prefix_strings_parallel(n_shared, &mut rng, &mut seen_strings, 9, 64)
+    } else {
+        gen_shared_prefix_strings_with_range(n_shared, &mut rng, &mut seen_strings, 9, 64)
+    };
+
+    keys.extend(random_strings);
+    keys.extend(shared_strings);
+
+    keys.shuffle(&mut rng);
+    keys
+}
+
+fn gen_random_strings_with_range(
+    n: usize,
+    rng: &mut StdRng,
+    seen: &mut HashSet<Vec<u8>>,
+    min_len: usize,
+    max_len: usize,
+) -> Vec<Vec<u8>> {
+    let mut keys = Vec::with_capacity(n);
+    while keys.len() < n {
+        let len = rng.gen_range(min_len..=max_len);
+        let mut key = vec![0u8; len];
         rng.fill_bytes(&mut key);
-        key[0..8].copy_from_slice(&(i as u64 + 1_000_000).to_le_bytes());
-        keys.push(key);
+        if seen.insert(key.clone()) {
+            keys.push(key);
+        }
+    }
+    keys
+}
+
+fn gen_shared_prefix_strings_with_range(
+    n: usize,
+    rng: &mut StdRng,
+    seen: &mut HashSet<Vec<u8>>,
+    min_len: usize,
+    max_len: usize,
+) -> Vec<Vec<u8>> {
+    let mut keys = Vec::with_capacity(n);
+    let prefix_len = rng.gen_range(16..=32);
+    let mut prefix = vec![0u8; prefix_len];
+    rng.fill_bytes(&mut prefix);
+
+    let shared_count = rng.gen_range((n as f64 * 0.60) as usize..=(n as f64 * 0.80) as usize);
+    let mut shared_done = 0;
+
+    while shared_done < shared_count {
+        let len = rng.gen_range(prefix_len.max(min_len)..=max_len);
+        let mut key = vec![0u8; len];
+        key[..prefix_len].copy_from_slice(&prefix);
+        rng.fill_bytes(&mut key[prefix_len..]);
+        if seen.insert(key.clone()) {
+            keys.push(key);
+            shared_done += 1;
+        }
+    }
+
+    while keys.len() < n {
+        let len = rng.gen_range(min_len..=max_len);
+        let mut key = vec![0u8; len];
+        rng.fill_bytes(&mut key);
+        if seen.insert(key.clone()) {
+            keys.push(key);
+        }
     }
 
     keys
+}
+
+fn gen_random_strings_parallel(
+    n: usize,
+    rng: &mut StdRng,
+    seen: &mut HashSet<Vec<u8>>,
+    min_len: usize,
+    max_len: usize,
+) -> Vec<Vec<u8>> {
+    let threads = thread_count();
+    let per = (n + threads - 1) / threads;
+    let mut handles = Vec::new();
+    for t in 0..threads {
+        let count = per.min(n.saturating_sub(t * per));
+        if count == 0 {
+            continue;
+        }
+        let seed = rng.next_u64() ^ ((t as u64) << 32);
+        handles.push(thread::spawn(move || {
+            let mut local_rng = StdRng::seed_from_u64(seed);
+            let mut out = Vec::with_capacity(count);
+            for _ in 0..count {
+                let len = local_rng.gen_range(min_len..=max_len);
+                let mut key = vec![0u8; len];
+                local_rng.fill_bytes(&mut key);
+                out.push(key);
+            }
+            out
+        }));
+    }
+
+    let mut keys = Vec::with_capacity(n);
+    for h in handles {
+        if let Ok(part) = h.join() {
+            for key in part {
+                if seen.insert(key.clone()) {
+                    keys.push(key);
+                }
+            }
+        }
+    }
+
+    if keys.len() < n {
+        let missing = n - keys.len();
+        keys.extend(gen_random_strings_with_range(
+            missing, rng, seen, min_len, max_len,
+        ));
+    }
+
+    keys
+}
+
+fn gen_shared_prefix_strings_parallel(
+    n: usize,
+    rng: &mut StdRng,
+    seen: &mut HashSet<Vec<u8>>,
+    min_len: usize,
+    max_len: usize,
+) -> Vec<Vec<u8>> {
+    let prefix_len = rng.gen_range(16..=32);
+    let mut prefix = vec![0u8; prefix_len];
+    rng.fill_bytes(&mut prefix);
+
+    let shared_count = rng.gen_range((n as f64 * 0.60) as usize..=(n as f64 * 0.80) as usize);
+    let threads = thread_count();
+    let per = (shared_count + threads - 1) / threads;
+    let mut handles = Vec::new();
+    for t in 0..threads {
+        let count = per.min(shared_count.saturating_sub(t * per));
+        if count == 0 {
+            continue;
+        }
+        let seed = rng.next_u64() ^ (0x9E37_79B9_7F4A_7C15 ^ (t as u64));
+        let prefix_clone = prefix.clone();
+        handles.push(thread::spawn(move || {
+            let mut local_rng = StdRng::seed_from_u64(seed);
+            let mut out = Vec::with_capacity(count);
+            for _ in 0..count {
+                let len = local_rng.gen_range(prefix_clone.len().max(min_len)..=max_len);
+                let mut key = vec![0u8; len];
+                key[..prefix_clone.len()].copy_from_slice(&prefix_clone);
+                local_rng.fill_bytes(&mut key[prefix_clone.len()..]);
+                out.push(key);
+            }
+            out
+        }));
+    }
+
+    let mut keys = Vec::with_capacity(n);
+    for h in handles {
+        if let Ok(part) = h.join() {
+            for key in part {
+                if seen.insert(key.clone()) {
+                    keys.push(key);
+                }
+            }
+        }
+    }
+
+    let mut shared_done = keys.len();
+    while shared_done < shared_count {
+        let len = rng.gen_range(prefix_len.max(min_len)..=max_len);
+        let mut key = vec![0u8; len];
+        key[..prefix_len].copy_from_slice(&prefix);
+        rng.fill_bytes(&mut key[prefix_len..]);
+        if seen.insert(key.clone()) {
+            keys.push(key);
+            shared_done += 1;
+        }
+    }
+
+    while keys.len() < n {
+        let len = rng.gen_range(min_len..=max_len);
+        let mut key = vec![0u8; len];
+        rng.fill_bytes(&mut key);
+        if seen.insert(key.clone()) {
+            keys.push(key);
+        }
+    }
+
+    keys
+}
+
+fn gen_random_strings_missing(
+    n: usize,
+    rng: &mut StdRng,
+    existing: &HashSet<Vec<u8>>,
+    min_len: usize,
+    max_len: usize,
+) -> Vec<Vec<u8>> {
+    let mut keys = Vec::with_capacity(n);
+    while keys.len() < n {
+        let len = rng.gen_range(min_len..=max_len);
+        let mut key = vec![0u8; len];
+        rng.fill_bytes(&mut key);
+        if !existing.contains(&key) {
+            keys.push(key);
+        }
+    }
+    keys
+}
+
+fn gen_shared_prefix_strings_missing(
+    n: usize,
+    rng: &mut StdRng,
+    existing: &HashSet<Vec<u8>>,
+    min_len: usize,
+    max_len: usize,
+) -> Vec<Vec<u8>> {
+    let mut keys = Vec::with_capacity(n);
+    let prefix_len = rng.gen_range(16..=32);
+    let mut prefix = vec![0u8; prefix_len];
+    rng.fill_bytes(&mut prefix);
+
+    let shared_count = rng.gen_range((n as f64 * 0.60) as usize..=(n as f64 * 0.80) as usize);
+    let mut shared_done = 0;
+
+    while shared_done < shared_count {
+        let len = rng.gen_range(prefix_len.max(min_len)..=max_len);
+        let mut key = vec![0u8; len];
+        key[..prefix_len].copy_from_slice(&prefix);
+        rng.fill_bytes(&mut key[prefix_len..]);
+        if !existing.contains(&key) {
+            keys.push(key);
+            shared_done += 1;
+        }
+    }
+
+    while keys.len() < n {
+        let len = rng.gen_range(min_len..=max_len);
+        let mut key = vec![0u8; len];
+        rng.fill_bytes(&mut key);
+        if !existing.contains(&key) {
+            keys.push(key);
+        }
+    }
+
+    keys
+}
+
+fn gen_numeric_keys_missing(
+    n: usize,
+    rng: &mut StdRng,
+    existing: &HashSet<u64>,
+    seed: u64,
+) -> Vec<u64> {
+    let mut keys = Vec::with_capacity(n);
+
+    let n_uniform = n * 50 / 100;
+    let n_zipf = n * 30 / 100;
+    let n_cluster = n - n_uniform - n_zipf;
+
+    let mut local_rng = StdRng::seed_from_u64(seed);
+
+    let mut count = 0;
+    while count < n_uniform {
+        let v = local_rng.next_u64();
+        if !existing.contains(&v) {
+            keys.push(v);
+            count += 1;
+        }
+    }
+
+    let zipf_domain = (n_zipf / 4).max(5_000).min(50_000) as u64;
+    let zipf_seed = local_rng.next_u64();
+    count = 0;
+    while count < n_zipf {
+        let rank = sample_zipf_fast(rng, zipf_domain, 1.07);
+        let v = splitmix64(rank ^ zipf_seed);
+        if !existing.contains(&v) {
+            keys.push(v);
+            count += 1;
+        }
+    }
+
+    let cluster_count = (n_cluster / 32_768).max(4);
+    let clusters = build_clusters(cluster_count, rng);
+    count = 0;
+    while count < n_cluster {
+        let (start, len) = clusters[rng.gen_range(0..clusters.len())];
+        let offset = rng.gen_range(0..len);
+        let v = start.wrapping_add(offset);
+        if !existing.contains(&v) {
+            keys.push(v);
+            count += 1;
+        }
+    }
+
+    keys
+}
+
+fn gen_mixed_keys_missing(n: usize, rng: &mut StdRng, existing: &HashSet<Vec<u8>>) -> Vec<Vec<u8>> {
+    let n_numeric = n * 40 / 100;
+    let n_random = n * 40 / 100;
+    let n_shared = n - n_numeric - n_random;
+
+    let mut missing = Vec::with_capacity(n);
+
+    let mut numeric_existing = HashSet::new();
+    for key in existing {
+        if key.len() == 8 {
+            let mut arr = [0u8; 8];
+            arr.copy_from_slice(key);
+            numeric_existing.insert(u64::from_le_bytes(arr));
+        }
+    }
+
+    let numeric_seed = rng.next_u64() ^ 0xface_cafe_dead_beef;
+    let numeric_missing = gen_numeric_keys_missing(n_numeric, rng, &numeric_existing, numeric_seed);
+    for num in numeric_missing {
+        let key = num.to_le_bytes().to_vec();
+        if !existing.contains(&key) {
+            missing.push(key);
+        }
+    }
+
+    let random_missing = gen_random_strings_missing(n_random, rng, existing, 9, 64);
+    let shared_missing = gen_shared_prefix_strings_missing(n_shared, rng, existing, 9, 64);
+
+    for k in random_missing {
+        missing.push(k);
+    }
+    for k in shared_missing {
+        missing.push(k);
+    }
+
+    missing
+}
+
+fn sample_zipf_fast(rng: &mut StdRng, max_rank: u64, s: f64) -> u64 {
+    let u = rng.r#gen::<f64>().max(f64::MIN_POSITIVE);
+    let inv = u.powf(-1.0 / (s - 1.0));
+    let rank = inv as u64;
+    rank.clamp(1, max_rank)
+}
+
+fn build_clusters(n: usize, rng: &mut StdRng) -> Vec<(u64, u64)> {
+    let mut clusters = Vec::with_capacity(n);
+    let mut base = rng.next_u64();
+    for _ in 0..n {
+        let len = rng.gen_range(256..=4096) as u64;
+        clusters.push((base, len));
+        let gap = rng.gen_range(1_000_000..=10_000_000) as u64;
+        base = base.wrapping_add(len + gap);
+    }
+    clusters
+}
+
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9e3779b97f4a7c15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+    z ^ (z >> 31)
+}
+
+fn gen_numeric_uniform_parallel(n: usize, seed: u64) -> Vec<u64> {
+    let threads = thread_count();
+    let per = (n + threads - 1) / threads;
+    let mut handles = Vec::new();
+    for t in 0..threads {
+        let count = per.min(n.saturating_sub(t * per));
+        if count == 0 {
+            continue;
+        }
+        let seed_t = seed ^ (0xA24B_1F6F_1234_5678 ^ (t as u64));
+        handles.push(thread::spawn(move || {
+            let mut rng = StdRng::seed_from_u64(seed_t);
+            let mut out = Vec::with_capacity(count);
+            for _ in 0..count {
+                out.push(rng.next_u64());
+            }
+            out
+        }));
+    }
+
+    let mut keys = Vec::with_capacity(n);
+    for h in handles {
+        if let Ok(part) = h.join() {
+            keys.extend(part);
+        }
+    }
+    keys
+}
+
+fn gen_numeric_zipf_parallel(n: usize, seed: u64) -> Vec<u64> {
+    let threads = thread_count();
+    let per = (n + threads - 1) / threads;
+    let mut handles = Vec::new();
+    let zipf_domain = (n / 4).max(5_000).min(50_000) as u64;
+    for t in 0..threads {
+        let count = per.min(n.saturating_sub(t * per));
+        if count == 0 {
+            continue;
+        }
+        let seed_t = seed ^ (0x9E37_79B9_7F4A_7C15 ^ (t as u64));
+        handles.push(thread::spawn(move || {
+            let mut rng = StdRng::seed_from_u64(seed_t);
+            let zipf_seed = rng.next_u64();
+            let mut out = Vec::with_capacity(count);
+            for _ in 0..count {
+                let rank = sample_zipf_fast(&mut rng, zipf_domain, 1.07);
+                out.push(splitmix64(rank ^ zipf_seed));
+            }
+            out
+        }));
+    }
+
+    let mut keys = Vec::with_capacity(n);
+    for h in handles {
+        if let Ok(part) = h.join() {
+            keys.extend(part);
+        }
+    }
+    keys
+}
+
+fn gen_numeric_cluster_parallel(n: usize, rng: &mut StdRng) -> Vec<u64> {
+    let threads = thread_count();
+    let per = (n + threads - 1) / threads;
+    let cluster_count = (n / 32_768).max(4);
+    let clusters = build_clusters(cluster_count, rng);
+    let mut handles = Vec::new();
+    for t in 0..threads {
+        let count = per.min(n.saturating_sub(t * per));
+        if count == 0 {
+            continue;
+        }
+        let seed_t = rng.next_u64() ^ (0xD1B5_4A32_D192_ED03 ^ (t as u64));
+        let clusters_clone = clusters.clone();
+        handles.push(thread::spawn(move || {
+            let mut local_rng = StdRng::seed_from_u64(seed_t);
+            let mut out = Vec::with_capacity(count);
+            for _ in 0..count {
+                let (start, len) = clusters_clone[local_rng.gen_range(0..clusters_clone.len())];
+                let offset = local_rng.gen_range(0..len);
+                out.push(start.wrapping_add(offset));
+            }
+            out
+        }));
+    }
+
+    let mut keys = Vec::with_capacity(n);
+    for h in handles {
+        if let Ok(part) = h.join() {
+            keys.extend(part);
+        }
+    }
+    keys
+}
+
+fn thread_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|v| v.get())
+        .unwrap_or(1)
 }
