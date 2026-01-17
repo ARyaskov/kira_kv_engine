@@ -6,8 +6,8 @@ use std::arch::aarch64::{vceqq_u64, vcgeq_u64, vdupq_n_u64, vgetq_lane_u64, vld1
 use std::arch::is_aarch64_feature_detected;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
-    __m256i, _mm256_cmpeq_epi64, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_or_si256,
-    _mm256_set1_epi64x, _mm256_xor_si256,
+    __m256i, _mm256_cmpeq_epi64, _mm256_cmpgt_epi64, _mm256_loadu_si256, _mm256_movemask_epi8,
+    _mm256_or_si256, _mm256_set1_epi64x, _mm256_xor_si256,
 };
 use thiserror::Error;
 
