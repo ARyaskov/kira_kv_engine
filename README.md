@@ -25,94 +25,24 @@ For numeric data, we layer in **PGM (Piecewise Geometric Model)** indexing:
 ## 🚀 Quick Start
 
 ```rust
-use kira_kv_engine::Builder;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Build perfect hash for string keys
-    let keys = ["rust", "zig", "go", "swift", "kotlin"];
-    let mph = Builder::new().build(keys.iter().map(|s| s.as_bytes()))?;
-    
-    // O(1) lookups, guaranteed unique indices
-    for key in &keys {
-        println!("{} → {}", key, mph.index(key.as_bytes()));
-    }
-    
-    Ok(())
-}
-```
-
-## 🎯 Hybrid Indexing
-
-For mixed workloads, use the hybrid index that automatically partitions keys:
-
-```rust
 use kira_kv_engine::HybridBuilder;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mixed_keys = vec![
-        1000u64.to_le_bytes().to_vec(),  // numeric key
-        2000u64.to_le_bytes().to_vec(),  // numeric key  
-        b"user:123".to_vec(),            // string key
-        b"session:abc".to_vec(),         // string key
+    let keys = vec![
+        1000u64.to_le_bytes().to_vec(),
+        b"user:123".to_vec(),
+        b"session:abc".to_vec(),
     ];
-    
-    let hybrid = HybridBuilder::new().build(mixed_keys)?;
-    
-    // Query by original key format
-    println!("Numeric: {}", hybrid.index_u64(1000)?);
-    println!("String: {}", hybrid.index_str("user:123")?);
-    
-    // Range queries for numeric keys
-    let range_results = hybrid.range_u64(1000, 3000);
-    println!("Range [1000,3000]: {:?}", range_results);
-    
+
+    let index = HybridBuilder::new().build_index(keys)?;
+    println!("{:?}", index.lookup_u64(1000));
+    println!("{:?}", index.lookup_str("user:123"));
+
     Ok(())
 }
 ```
 
-## 📊 Performance Comparison *
-
-Performance benchmarks on **1M keys** (Intel Core i7-12700, Windows 11):
-
-| **Solution**       | **Build Time** | **Build Rate** | **Lookup Time** | **Lookup Rate** | **Memory** | **Use Case** |
-|--------------------|----------------|----------------|-----------------|-----------------|------------|--------------|
-| **Kira (MPH+PGM)** | **395ms** ⚡ | **2.5M/s** ⚡ | **26ns** ⚡ | **37.9M/s** ⚡ | **4.2MB** ⚡ | Mixed data |
-| **Kira (MPH)**     | **977ms** | **1.0M/s** | **47ns** ⚡ | **21.4M/s** ⚡ | **5.0MB** ⚡ | String keys |
-| Redis Hash         | 2,100ms | 0.48M/s | 180ns | 5.6M/s | 90MB | General KV |
-| LevelDB            | 3,400ms | 0.29M/s | 250ns | 4.0M/s | 120MB | Persistent |
-| RocksDB            | 2,800ms | 0.36M/s | 200ns | 5.0M/s | 110MB | LSM-tree |
-| std::HashMap       | 850ms | 1.2M/s | 35ns | 28.6M/s | 96MB | In-memory |
-| DashMap            | 920ms | 1.1M/s | 42ns | 23.8M/s | 102MB | Concurrent |
-| BTreeMap           | 1,200ms | 0.83M/s | 65ns | 15.4M/s | 72MB | Sorted |
-
-\* our benchmarks
-
-### 🏆 Performance Highlights *
-
-**Build Speed:**
-- **Kira Hybrid**: **5.3× faster** than Redis, **8.6× faster** than LevelDB
-- **Kira MPH**: Competitive with HashMap, **2.1× faster** than Redis
-
-**Lookup Speed:**
-- **Kira Hybrid**: **6.9× faster** than Redis, **9.6× faster** than LevelDB
-- **Kira MPH**: **3.8× faster** than Redis, **5.3× faster** than LevelDB
-
-**Memory Efficiency:**
-- **Kira**: **18-50× smaller** than traditional databases
-- **Kira**: **19-24× smaller** than HashMap/concurrent structures
-- **Zero fragmentation** - exact memory requirements known
-
-\* our benchmarks
-
-### ⚡ Speed Comparison Matrix *
-
-| Metric | vs Redis | vs LevelDB | vs RocksDB | vs HashMap | vs BTreeMap |
-|--------|----------|------------|------------|------------|-------------|
-| **Build** | 🔥 **5.3×** | 🔥 **8.6×** | 🔥 **7.1×** | 🔥 **2.2×** | 🔥 **3.0×** |
-| **Lookup** | 🔥 **6.9×** | 🔥 **9.6×** | 🔥 **7.7×** | ⚡ **1.3×** | 🔥 **2.5×** |
-| **Memory** | 🔥 **21×** | 🔥 **29×** | 🔥 **26×** | 🔥 **23×** | 🔥 **17×** |
-
-\* our benchmarks
+Full API reference: `API.md`.
 
 ## 🧪 Benchmarks
 
@@ -122,22 +52,34 @@ Run comprehensive benchmarks across algorithms:
 cargo run --example million_build --release
 ```
 
-Expected output on modern hardware:
 ```
-=== kira_kv_engine :: Hybrid MPH+PGM Benchmark ===
-🔥 TRADITIONAL MPH BENCHMARK
-build:     0.977 s   (1.0 M keys/s)
-lookup:    0.047 s   (21.4 M lookups/s)
-Memory: 5.0 bytes/key, 24x compression vs HashMap
-
-🚀 HYBRID MPH+PGM BENCHMARK  
-build:     0.395 s   (2.5 M keys/s)
-lookup:    0.026 s   (37.9 M lookups/s)
-
-📊 PGM-ONLY BENCHMARK
-build:     0.016 s   (62.7 M keys/s)
-lookup:    0.022 s   (45.5 M lookups/s)
-range:     0.781 s   (1,281 queries/s)
+kira_kv_engine benchmark
+n = 1000000 keys
+============================================================
+Struct  Workload  Cache   Build ms   Build rate    Lookup ns     Throughput    Hit %   Miss %        B/key
+--------------------------------------------------------------------------------------------------------------
+MPH     positive  cold      730.47      1368978        45.68       21890221    100.0      0.0         5.00
+MPH     positive  warm      730.47      1368978        48.63       20564495    100.0      0.0         5.00
+MPH     negative  cold      730.47      1368978        59.90       16693331     70.0     30.0         5.00
+MPH     negative  warm      730.47      1368978        25.44       39308176     70.0     30.0         5.00
+MPH     zipf      cold      730.47      1368978        44.54       22453413    100.0      0.0         5.00
+MPH     zipf      warm      730.47      1368978        32.64       30633332    100.0      0.0         5.00
+Struct  Workload  Cache   Build ms   Build rate    Lookup ns     Throughput    Hit %   Miss %        B/key
+--------------------------------------------------------------------------------------------------------------
+PGM     positive  cold       17.54     57012543       344.91        2899293    100.0      0.0        48.00
+PGM     positive  warm       17.54     57012543       249.22        4012546    100.0      0.0        48.00
+PGM     negative  cold       17.54     57012543       245.52        4072946     70.0     30.0        48.00
+PGM     negative  warm       17.54     57012543       238.69        4189462     70.0     30.0        48.00
+PGM     zipf      cold       17.54     57012543       265.71        3763490    100.0      0.0        48.00
+PGM     zipf      warm       17.54     57012543       262.75        3805851    100.0      0.0        48.00
+Struct  Workload  Cache   Build ms   Build rate    Lookup ns     Throughput    Hit %   Miss %        B/key
+--------------------------------------------------------------------------------------------------------------
+Hybrid  positive  cold      424.66      2354848       159.01        6288715    100.0      0.0        22.20
+Hybrid  positive  warm      424.66      2354848       152.59        6553366    100.0      0.0        22.20
+Hybrid  negative  cold      424.66      2354848       154.28        6481581     70.0     30.0        22.20
+Hybrid  negative  warm      424.66      2354848       119.85        8343820     70.0     30.0        22.20
+Hybrid  zipf      cold      424.66      2354848       149.25        6700093    100.0      0.0        22.20
+Hybrid  zipf      warm      424.66      2354848       125.22        7985839    100.0      0.0        22.20
 ```
 
 ## ⚙️ Features
@@ -156,19 +98,7 @@ kira_kv_engine = { version = "0.1", features = ["serde", "parallel", "pgm", "sim
 
 ## 🎛️ Configuration
 
-Fine-tune for your workload:
-
-```rust
-use kira_kv_engine::{Builder, BuildConfig};
-/// MPH Only (for strings as a key)
-let mph = Builder::new()
-    .with_config(BuildConfig {
-        gamma: 1.25,           // Lower = denser graph, more retries
-        rehash_limit: 16,      // Max attempts before giving up
-        salt: 0xDEADBEEF,     // Custom base salt
-    })
-    .build(keys)?;
-```
+Configuration options are documented in `API.md`.
 
 ## 📊 When to Use
 
