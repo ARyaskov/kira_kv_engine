@@ -24,6 +24,13 @@ For numeric data, we layer in **PGM (Piecewise Geometric Model)** indexing:
 
 ## 🚀 Quick Start
 
+## ⚙️ Install
+
+```toml
+[dependencies]
+kira_kv_engine = "*"
+```
+
 ```rust
 use kira_kv_engine::HybridBuilder;
 
@@ -82,19 +89,6 @@ Hybrid  zipf      cold      424.66      2354848       149.25        6700093    1
 Hybrid  zipf      warm      424.66      2354848       125.22        7985839    100.0      0.0        22.20
 ```
 
-## ⚙️ Features
-
-Enable optional optimizations:
-
-```toml
-[dependencies]
-kira_kv_engine = { version = "0.1", features = ["serde", "parallel", "pgm", "simd"] }
-```
-
-- `serde` — Serialization support for persistence
-- `parallel` — Multi-threaded construction via rayon
-- `pgm` — Learned indexing for numeric keys
-- `simd` — Vectorized operations where available
 
 ## 🎛️ Configuration
 
