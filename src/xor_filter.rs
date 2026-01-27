@@ -69,61 +69,65 @@ impl Xor8 {
         if hashes.is_empty() {
             return Err(());
         }
-        let size = ((hashes.len() as f64) * 1.23).ceil() as usize + 32;
-        let mut counts = vec![0u32; size];
-        let mut xors = vec![0u64; size];
+        let factors = [1.23, 1.35, 1.5, 1.65, 1.8];
+        for factor in factors {
+            let size = ((hashes.len() as f64) * factor).ceil() as usize + 32;
+            let mut counts = vec![0u32; size];
+            let mut xors = vec![0u64; size];
 
-        for &h in hashes {
-            let (i0, i1, i2) = indices(h, size);
-            counts[i0] += 1;
-            counts[i1] += 1;
-            counts[i2] += 1;
-            xors[i0] ^= h;
-            xors[i1] ^= h;
-            xors[i2] ^= h;
-        }
-
-        let mut stack = Vec::with_capacity(hashes.len());
-        let mut queue = Vec::new();
-        for (i, &c) in counts.iter().enumerate() {
-            if c == 1 {
-                queue.push(i);
+            for &h in hashes {
+                let (i0, i1, i2) = indices(h, size);
+                counts[i0] += 1;
+                counts[i1] += 1;
+                counts[i2] += 1;
+                xors[i0] ^= h;
+                xors[i1] ^= h;
+                xors[i2] ^= h;
             }
-        }
 
-        while let Some(i) = queue.pop() {
-            if counts[i] == 0 {
-                continue;
+            let mut stack = Vec::with_capacity(hashes.len());
+            let mut queue = Vec::new();
+            for (i, &c) in counts.iter().enumerate() {
+                if c == 1 {
+                    queue.push(i);
+                }
             }
-            let h = xors[i];
-            stack.push((i, h));
-            let (i0, i1, i2) = indices(h, size);
-            for idx in [i0, i1, i2] {
-                if idx == i {
+
+            while let Some(i) = queue.pop() {
+                if counts[i] == 0 {
                     continue;
                 }
-                counts[idx] -= 1;
-                xors[idx] ^= h;
-                if counts[idx] == 1 {
-                    queue.push(idx);
+                let h = xors[i];
+                stack.push((i, h));
+                let (i0, i1, i2) = indices(h, size);
+                for idx in [i0, i1, i2] {
+                    if idx == i {
+                        continue;
+                    }
+                    counts[idx] -= 1;
+                    xors[idx] ^= h;
+                    if counts[idx] == 1 {
+                        queue.push(idx);
+                    }
                 }
+                counts[i] = 0;
             }
-            counts[i] = 0;
-        }
 
-        if stack.len() != hashes.len() {
-            return Err(());
-        }
+            if stack.len() != hashes.len() {
+                continue;
+            }
 
-        let mut fingerprints = vec![0u8; size];
-        while let Some((i, h)) = stack.pop() {
-            let fp = fingerprint8(h);
-            let (i0, i1, i2) = indices(h, size);
-            let v = fp ^ fingerprints[i0] ^ fingerprints[i1] ^ fingerprints[i2];
-            fingerprints[i] = v;
-        }
+            let mut fingerprints = vec![0u8; size];
+            while let Some((i, h)) = stack.pop() {
+                let fp = fingerprint8(h);
+                let (i0, i1, i2) = indices(h, size);
+                let v = fp ^ fingerprints[i0] ^ fingerprints[i1] ^ fingerprints[i2];
+                fingerprints[i] = v;
+            }
 
-        Ok(Self { seed, fingerprints })
+            return Ok(Self { seed, fingerprints });
+        }
+        Err(())
     }
 }
 
@@ -140,20 +144,25 @@ fn fingerprint8(hash: u64) -> u8 {
 }
 
 fn indices(mut hash: u64, size: usize) -> (usize, usize, usize) {
-    let mut i0 = (hash as usize) % size;
+    let mut i0 = fast_range(hash, size);
     hash = splitmix64(hash);
-    let mut i1 = (hash as usize) % size;
+    let mut i1 = fast_range(hash, size);
     hash = splitmix64(hash);
-    let mut i2 = (hash as usize) % size;
+    let mut i2 = fast_range(hash, size);
     if i0 == i1 || i0 == i2 || i1 == i2 {
         hash = splitmix64(hash ^ 0x9E37_79B9_7F4A_7C15);
-        i0 = (hash as usize) % size;
+        i0 = fast_range(hash, size);
         hash = splitmix64(hash);
-        i1 = (hash as usize) % size;
+        i1 = fast_range(hash, size);
         hash = splitmix64(hash);
-        i2 = (hash as usize) % size;
+        i2 = fast_range(hash, size);
     }
     (i0, i1, i2)
+}
+
+#[inline]
+fn fast_range(hash: u64, size: usize) -> usize {
+    ((hash as u128 * size as u128) >> 64) as usize
 }
 
 fn splitmix64(mut x: u64) -> u64 {

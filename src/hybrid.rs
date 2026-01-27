@@ -4,7 +4,11 @@ use crate::xor_filter::{Cursor as XorCursor, Xor8};
 use thiserror::Error;
 
 #[cfg(target_arch = "aarch64")]
-use std::arch::aarch64::vld1q_u8;
+use std::arch::aarch64::{
+    vaeseq_u8, vdupq_n_u64, vgetq_lane_u64, vld1q_u8, vreinterpretq_u8_u64, vreinterpretq_u64_u8,
+};
+#[cfg(target_arch = "aarch64")]
+use std::arch::is_aarch64_feature_detected;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{__m128i, _MM_HINT_T0, _mm_loadu_si128, _mm_prefetch};
 
@@ -257,6 +261,18 @@ impl HybridIndex {
     pub fn lookup_batch(&self, keys: &[&[u8]]) -> Vec<Option<usize>> {
         let mut out = Vec::with_capacity(keys.len());
         let mut i = 0usize;
+        #[cfg(target_arch = "aarch64")]
+        while i + 8 <= keys.len() {
+            for j in 0..8 {
+                let key = keys[i + j];
+                Self::simd_touch(key);
+            }
+            for j in 0..8 {
+                let key = keys[i + j];
+                out.push(self.lookup(key).ok());
+            }
+            i += 8;
+        }
         while i + 4 <= keys.len() {
             #[cfg(target_arch = "x86_64")]
             unsafe {
@@ -541,10 +557,30 @@ fn build_fingerprints_u64(mph: &Mphf, keys: &[u64]) -> Vec<u16> {
 }
 
 fn hash_bytes(key: &[u8]) -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if is_aarch64_feature_detected!("crc") {
+            let mut h = unsafe { hash_bytes_crc(key, 0xA24B_1F6F_1234_5678) };
+            if is_aarch64_feature_detected!("aes") {
+                h = unsafe { aes_mix_u64(h, 0xA24B_1F6F_1234_5678) };
+            }
+            return h;
+        }
+    }
     wyhash::wyhash(key, 0xA24B_1F6F_1234_5678)
 }
 
 fn hash_u64(key: u64) -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if is_aarch64_feature_detected!("crc") {
+            let mut h = unsafe { hash_u64_crc(key, 0xA24B_1F6F_1234_5678) };
+            if is_aarch64_feature_detected!("aes") {
+                h = unsafe { aes_mix_u64(h, 0xA24B_1F6F_1234_5678) };
+            }
+            return h;
+        }
+    }
     splitmix64(key ^ 0xA24B_1F6F_1234_5678)
 }
 
@@ -558,6 +594,45 @@ fn splitmix64(mut x: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "crc")]
+unsafe fn hash_u64_crc(key: u64, seed: u64) -> u64 {
+    use std::arch::aarch64::__crc32d;
+    let mut crc = seed as u32;
+    crc = __crc32d(crc, key);
+    let mixed = ((crc as u64) << 32) ^ (seed.rotate_left(17) ^ key);
+    splitmix64(mixed)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "crc")]
+unsafe fn hash_bytes_crc(key: &[u8], seed: u64) -> u64 {
+    use std::arch::aarch64::{__crc32b, __crc32d};
+    let mut crc = seed as u32;
+    let mut i = 0usize;
+    while i + 8 <= key.len() {
+        let chunk = u64::from_le_bytes(key[i..i + 8].try_into().unwrap());
+        crc = __crc32d(crc, chunk);
+        i += 8;
+    }
+    while i < key.len() {
+        crc = __crc32b(crc, key[i]);
+        i += 1;
+    }
+    let mixed = ((crc as u64) << 32) ^ seed.wrapping_add(key.len() as u64);
+    splitmix64(mixed)
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "aes")]
+unsafe fn aes_mix_u64(hash: u64, seed: u64) -> u64 {
+    let block = vdupq_n_u64(hash ^ seed);
+    let key = vdupq_n_u64(seed.rotate_left(23) ^ 0xA5A5_A5A5_A5A5_A5A5);
+    let mixed = vaeseq_u8(vreinterpretq_u8_u64(block), vreinterpretq_u8_u64(key));
+    let out = vreinterpretq_u64_u8(mixed);
+    vgetq_lane_u64(out, 0) ^ vgetq_lane_u64(out, 1)
 }
 
 struct Cursor<'a> {

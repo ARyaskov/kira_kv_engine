@@ -487,17 +487,29 @@ fn find_first_ge_simd(keys: &[u64], start: usize, end: usize, target: u64) -> Op
 }
 
 fn find_segment_by_max_key(segments: &[Segment], key: u64) -> usize {
-    let mut lo = 0usize;
-    let mut hi = segments.len();
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        if segments[mid].max_key < key {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
+    let len = segments.len();
+    if len == 0 {
+        return 0;
     }
-    lo
+    let mut idx = 0usize;
+    let msb = (len - 1).leading_zeros();
+    let mut step = if len <= 1 {
+        0usize
+    } else {
+        1usize << (usize::BITS - 1 - msb)
+    };
+    while step > 0 {
+        let next = idx + step;
+        if next < len && segments[next].max_key < key {
+            idx = next;
+        }
+        step >>= 1;
+    }
+    if segments[idx].max_key < key {
+        idx + 1
+    } else {
+        idx
+    }
 }
 
 struct Cursor<'a> {
