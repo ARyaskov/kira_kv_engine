@@ -5,8 +5,12 @@
 //! - Robust: if a build attempt finds a cycle, we rehash with another salt.
 
 mod bdz;
+mod build_hasher;
 mod cpu;
+mod hot_tier;
 pub mod hybrid;
 mod pgm;
+mod remap;
+mod simd_hash;
 mod xor_filter;
 pub use hybrid::{HybridBuilder, HybridConfig, HybridError, HybridIndex, HybridStats};

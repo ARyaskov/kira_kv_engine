@@ -2,7 +2,8 @@ use crate::hash::KeyHash;
 use crate::util::BitSet;
 use serde::{Deserialize, Serialize};
 use std::borrow::Borrow;
-use std::collections::HashSet;
+use hashbrown::HashSet;
+use std::hash::BuildHasherDefault;
 use thiserror::Error;
 
 /// Complete MPH structure: stores size, number of buckets, salt and displacement vector per bucket.
@@ -98,7 +99,8 @@ impl Builder {
     {
         // 0) Collect and verify uniqueness by actual bytes (without probabilistic hashes).
         let mut uniq = Vec::<Vec<u8>>::new();
-        let mut seen = HashSet::<Vec<u8>>::new();
+        let mut seen: HashSet<Vec<u8>, BuildHasherDefault<crate::build_hasher::FastBuildHasher>> =
+            HashSet::default();
         for k in keys {
             let v = k.borrow().to_vec();
             if !seen.insert(v.clone()) {
@@ -106,6 +108,16 @@ impl Builder {
             }
             uniq.push(v);
         }
+        self.build_unique_vec(uniq)
+    }
+
+    /// Build MPH. Assumes **unique** keys (skips duplicate checks).
+    pub fn build_unique_vec(self, uniq: Vec<Vec<u8>>) -> Result<Mphf, MphError> {
+        self.build_unique_ref(&uniq)
+    }
+
+    /// Build MPH. Assumes **unique** keys (skips duplicate checks).
+    pub fn build_unique_ref(self, uniq: &[Vec<u8>]) -> Result<Mphf, MphError> {
         let n = uniq.len();
         assert!(n > 0, "empty key set is not supported");
 

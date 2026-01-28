@@ -16,10 +16,8 @@ impl Xor8 {
     }
 
     pub fn build_from_u64(keys: &[u64], seed: u64) -> Result<Self, ()> {
-        let mut hashes = Vec::with_capacity(keys.len());
-        for &k in keys {
-            hashes.push(hash_u64(k, seed));
-        }
+        let mut hashes = vec![0u64; keys.len()];
+        crate::simd_hash::hash_u64(keys, seed, &mut hashes);
         Self::build_from_hashes(&hashes, seed)
     }
 
@@ -136,7 +134,7 @@ fn hash_bytes(key: &[u8], seed: u64) -> u64 {
 }
 
 fn hash_u64(key: u64, seed: u64) -> u64 {
-    splitmix64(key ^ seed)
+    crate::simd_hash::hash_u64_one(key, seed)
 }
 
 fn fingerprint8(hash: u64) -> u8 {

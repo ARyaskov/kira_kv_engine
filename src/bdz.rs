@@ -1,6 +1,7 @@
+use hashbrown::HashSet;
 use serde::{Deserialize, Serialize};
 use std::borrow::Borrow;
-use std::collections::HashSet;
+use std::hash::BuildHasherDefault;
 use thiserror::Error;
 
 /// Minimal perfect hash by BDZ (3-hypergraph peeling) with:
@@ -101,7 +102,8 @@ impl Builder {
         // Collect and verify true uniqueness (no probabilistic dedup).
         let mut uniq = Vec::<Vec<u8>>::new();
         uniq.reserve(1024);
-        let mut seen = HashSet::<Vec<u8>>::new();
+        let mut seen: HashSet<Vec<u8>, BuildHasherDefault<crate::build_hasher::FastBuildHasher>> =
+            HashSet::default();
         for k in keys {
             let v = k.borrow().to_vec();
             if !seen.insert(v.clone()) {
@@ -109,6 +111,16 @@ impl Builder {
             }
             uniq.push(v);
         }
+        self.build_unique_vec(uniq)
+    }
+
+    /// Build MPH from **unique** keys (skips duplicate checks).
+    pub fn build_unique_vec(self, uniq: Vec<Vec<u8>>) -> Result<Mphf, MphError> {
+        self.build_unique_ref(&uniq)
+    }
+
+    /// Build MPH from **unique** keys by reference (skips duplicate checks).
+    pub fn build_unique_ref(self, uniq: &[Vec<u8>]) -> Result<Mphf, MphError> {
         let n = uniq.len();
         assert!(n > 0, "empty key set is not supported");
 
