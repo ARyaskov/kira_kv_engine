@@ -30,7 +30,7 @@ For numeric data, we layer in **PGM (Piecewise Geometric Model)** indexing:
 
 ```toml
 [dependencies]
-kira_kv_engine = "*"
+kira_kv_engine = ">=0.2.2"
 ```
 
 ```rust
@@ -154,3 +154,7 @@ Configuration options are documented in `API.md`.
 - **PGM Index**: Ferragina, P., Vinciguerra, G. (2020). [The PGM-index: a fully-dynamic compressed learned index](https://www.vldb.org/pvldb/vol13/p1162-ferragina.pdf). *VLDB 2020*
 - **Learned Indexes**: Kraska, T. et al. (2018). [The Case for Learned Index Structures](https://arxiv.org/pdf/1712.01208.pdf). *SIGMOD 2018*
 - **3-Hypergraph Peeling**: [Peeling Random Planar Maps](https://arxiv.org/pdf/1507.06951.pdf) - Theoretical foundations
+
+## 📜 License
+
+MIT
