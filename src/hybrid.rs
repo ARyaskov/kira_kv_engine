@@ -79,7 +79,9 @@ pub struct HybridConfig {
 
 impl Default for HybridConfig {
     fn default() -> Self {
-        crate::cpu::detect_features().optimal_hybrid_config()
+        let mut cfg = crate::cpu::detect_features().optimal_hybrid_config();
+        cfg.auto_detect_numeric = false;
+        cfg
     }
 }
 
@@ -504,12 +506,12 @@ impl HybridIndex {
     }
 
     fn lookup_mph(&self, engine: &MphEngine, key: &[u8]) -> Result<usize, HybridError> {
-        let hash = engine.xor.hash_bytes(key);
-        if !engine.xor.contains_hash(hash) {
+        let xor_hash = engine.xor.hash_bytes(key);
+        if !engine.xor.contains_hash(xor_hash) {
             return Err(HybridError::KeyNotFound);
         }
         let idx = engine.mph.index(key) as usize;
-        let fp = fingerprint16(hash);
+        let fp = fingerprint16(hash_bytes(key));
         // SAFETY: mph index is in [0..n), fingerprints.len() == n
         let ok = unsafe { *engine.fingerprints.get_unchecked(idx) == fp };
         if ok {
