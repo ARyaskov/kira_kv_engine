@@ -13,6 +13,8 @@ Built on the **BDZ algorithm** using 3-hypergraph peeling:
 - Peels vertices of degree 1 iteratively until fully resolved
 - Falls back to rehashing with different salts if cycles occur
 
+PGM provides learned, range-aware routing; MPH provides constant-time exact resolution. Together they form a scalable, cache-efficient, update-friendly hybrid index.
+
 **📖 Research:** [Simple and Space-Efficient Minimal Perfect Hash Functions](https://cmph.sourceforge.net/papers/wads07.pdf) (Botelho, Pagh, Ziviani, 2007)
 
 For numeric data, we layer in **PGM (Piecewise Geometric Model)** indexing:
@@ -28,7 +30,7 @@ For numeric data, we layer in **PGM (Piecewise Geometric Model)** indexing:
 
 ```toml
 [dependencies]
-kira_kv_engine = "*"
+kira_kv_engine = ">=0.2.2"
 ```
 
 ```rust
@@ -59,34 +61,47 @@ Run comprehensive benchmarks across algorithms:
 cargo run --example million_build --release
 ```
 
+Windows 11, Intel Core i7 12700, DDR5 4800MHz, NVMe; SIMD-boosted (AVX2):
 ```
 kira_kv_engine benchmark
-n = 1000000 keys
+n = 1_000_000 keys
 ============================================================
 Struct  Workload  Cache   Build ms   Build rate    Lookup ns     Throughput    Hit %   Miss %        B/key
 --------------------------------------------------------------------------------------------------------------
-MPH     positive  cold      730.47      1368978        45.68       21890221    100.0      0.0         5.00
-MPH     positive  warm      730.47      1368978        48.63       20564495    100.0      0.0         5.00
-MPH     negative  cold      730.47      1368978        59.90       16693331     70.0     30.0         5.00
-MPH     negative  warm      730.47      1368978        25.44       39308176     70.0     30.0         5.00
-MPH     zipf      cold      730.47      1368978        44.54       22453413    100.0      0.0         5.00
-MPH     zipf      warm      730.47      1368978        32.64       30633332    100.0      0.0         5.00
+Hybrid  positive  cold     1224.80       816457        45.23       22110197    100.0      0.0         8.23
+Hybrid  positive  warm     1224.80       816457        24.96       40070524    100.0      0.0         8.23
+Hybrid  negative  cold     1224.80       816457        31.16       32088307     70.0     30.0         8.23
+Hybrid  negative  warm     1224.80       816457        35.65       28052065     70.0     30.0         8.23
+Hybrid  zipf      cold     1224.80       816457        34.68       28831738    100.0      0.0         8.23
+Hybrid  zipf      warm     1224.80       816457        24.98       40032026    100.0      0.0         8.23
+```
+
+```
+kira_kv_engine benchmark
+n = 10_000_000 keys
+============================================================
 Struct  Workload  Cache   Build ms   Build rate    Lookup ns     Throughput    Hit %   Miss %        B/key
 --------------------------------------------------------------------------------------------------------------
-PGM     positive  cold       17.54     57012543       344.91        2899293    100.0      0.0        48.00
-PGM     positive  warm       17.54     57012543       249.22        4012546    100.0      0.0        48.00
-PGM     negative  cold       17.54     57012543       245.52        4072946     70.0     30.0        48.00
-PGM     negative  warm       17.54     57012543       238.69        4189462     70.0     30.0        48.00
-PGM     zipf      cold       17.54     57012543       265.71        3763490    100.0      0.0        48.00
-PGM     zipf      warm       17.54     57012543       262.75        3805851    100.0      0.0        48.00
+Hybrid  positive  cold    16379.82       610507        85.38       11711796    100.0      0.0         8.23
+Hybrid  positive  warm    16379.82       610507        75.33       13275276    100.0      0.0         8.23
+Hybrid  negative  cold    16379.82       610507        62.78       15929147     70.0     30.0         8.23
+Hybrid  negative  warm    16379.82       610507        52.86       18916465     70.0     30.0         8.23
+Hybrid  zipf      cold    16379.82       610507        52.29       19124116    100.0      0.0         8.23
+Hybrid  zipf      warm    16379.82       610507        56.72       17630465    100.0      0.0         8.23
+```
+
+```
+kira_kv_engine benchmark
+n = 100_000_000 keys
+============================================================
 Struct  Workload  Cache   Build ms   Build rate    Lookup ns     Throughput    Hit %   Miss %        B/key
 --------------------------------------------------------------------------------------------------------------
-Hybrid  positive  cold      424.66      2354848       159.01        6288715    100.0      0.0        22.20
-Hybrid  positive  warm      424.66      2354848       152.59        6553366    100.0      0.0        22.20
-Hybrid  negative  cold      424.66      2354848       154.28        6481581     70.0     30.0        22.20
-Hybrid  negative  warm      424.66      2354848       119.85        8343820     70.0     30.0        22.20
-Hybrid  zipf      cold      424.66      2354848       149.25        6700093    100.0      0.0        22.20
-Hybrid  zipf      warm      424.66      2354848       125.22        7985839    100.0      0.0        22.20
+Hybrid  positive  cold   315103.79       317356       239.58        4174041    100.0      0.0         8.23
+Hybrid  positive  warm   315103.79       317356       107.06        9340382    100.0      0.0         8.23
+Hybrid  negative  cold   315103.79       317356       112.90        8857239     70.0     30.0         8.23
+Hybrid  negative  warm   315103.79       317356        99.40       10060160     70.0     30.0         8.23
+Hybrid  zipf      cold   315103.79       317356       117.15        8536211    100.0      0.0         8.23
+Hybrid  zipf      warm   315103.79       317356       107.16        9331666    100.0      0.0         8.23
 ```
 
 
@@ -139,3 +154,7 @@ Configuration options are documented in `API.md`.
 - **PGM Index**: Ferragina, P., Vinciguerra, G. (2020). [The PGM-index: a fully-dynamic compressed learned index](https://www.vldb.org/pvldb/vol13/p1162-ferragina.pdf). *VLDB 2020*
 - **Learned Indexes**: Kraska, T. et al. (2018). [The Case for Learned Index Structures](https://arxiv.org/pdf/1712.01208.pdf). *SIGMOD 2018*
 - **3-Hypergraph Peeling**: [Peeling Random Planar Maps](https://arxiv.org/pdf/1507.06951.pdf) - Theoretical foundations
+
+## 📜 License
+
+MIT
