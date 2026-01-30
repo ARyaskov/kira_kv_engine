@@ -13,7 +13,7 @@ Built on the **BDZ algorithm** using 3-hypergraph peeling:
 - Peels vertices of degree 1 iteratively until fully resolved
 - Falls back to rehashing with different salts if cycles occur
 
-PGM provides learned, range-aware routing; MPH provides constant-time exact resolution. Together they form a scalable, cache-efficient, update-friendly hybrid index.
+PGM provides learned, range-aware routing; MPH provides constant-time exact resolution. Together they form a scalable, cache-efficient, update-friendly hybrid index (PGM is opt-in via `auto_detect_numeric`).
 
 **📖 Research:** [Simple and Space-Efficient Minimal Perfect Hash Functions](https://cmph.sourceforge.net/papers/wads07.pdf) (Botelho, Pagh, Ziviani, 2007)
 
@@ -30,7 +30,7 @@ For numeric data, we layer in **PGM (Piecewise Geometric Model)** indexing:
 
 ```toml
 [dependencies]
-kira_kv_engine = ">=0.2.2"
+kira_kv_engine = ">=0.2.3"
 ```
 
 ```rust
@@ -52,6 +52,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 Full API reference: `API.md`.
+
+To enable PGM for numeric keys:
+
+```rust
+let index = HybridBuilder::new()
+    .auto_detect_numeric(true)
+    .build_index(keys)?;
+```
 
 ## 🧪 Benchmarks
 

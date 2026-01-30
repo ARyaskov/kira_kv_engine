@@ -1,29 +1,20 @@
 # Kira KV Engine API Documentation
 
-**Version:** 0.2.0  
-**License:** MIT
-
 ## Overview
 
 Kira KV Engine exposes a single public index: **HybridIndex**.
 
-- If all keys are 8-byte little-endian integers, it builds a PGM index.
-- Otherwise it builds an MPH index.
+- By default it builds an MPH index.
+- If `auto_detect_numeric` is enabled and all keys are 8-byte little-endian integers, it builds a PGM index.
 
 The internal engines are not part of the public API.
 
-## Add to deps
-
-```toml
-[dependencies]
-kira_kv_engine = "*"
-```
 
 ## API Reference
 
 ### `HybridBuilder`
 
-Constructs a hybrid index and auto-selects the engine based on the input keys.
+Constructs a hybrid index. By default it builds MPH; PGM selection requires enabling `auto_detect_numeric`.
 
 ```rust
 pub struct HybridBuilder {
@@ -122,7 +113,7 @@ pub enum HybridError {
 
 ## Examples
 
-### Numeric keys (PGM auto-selected)
+### Numeric keys (PGM when `auto_detect_numeric` is enabled)
 
 ```rust
 use kira_kv_engine::HybridBuilder;
@@ -131,11 +122,13 @@ let keys: Vec<Vec<u8>> = (0..1_000_000u64)
     .map(|v| v.to_le_bytes().to_vec())
     .collect();
 
-let index = HybridBuilder::new().build_index(keys)?;
+let index = HybridBuilder::new()
+    .auto_detect_numeric(true)
+    .build_index(keys)?;
 let pos = index.lookup_u64(42)?;
 ```
 
-### Mixed keys (MPH auto-selected)
+### Mixed keys (MPH default)
 
 ```rust
 use kira_kv_engine::HybridBuilder;
