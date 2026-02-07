@@ -22,7 +22,7 @@ pub unsafe fn hash_u64_neon(keys: &[u64], seed: u64, out: &mut [u64]) {
     while i + 2 <= keys.len() {
         let ptr = keys.as_ptr().add(i) as *const u32;
         let mut v = vld1q_u32(ptr);
-        let mut tmp = [seed_lo, seed_hi, seed_lo, seed_hi];
+        let tmp = [seed_lo, seed_hi, seed_lo, seed_hi];
         let seedv = vld1q_u32(tmp.as_ptr());
         v = veorq_u32(v, seedv);
         let mixed = mix32_vec(v);

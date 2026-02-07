@@ -1,3 +1,6 @@
+#[cfg(target_arch = "aarch64")]
+use std::arch::is_aarch64_feature_detected;
+
 pub fn hash_u64(keys: &[u64], seed: u64, out: &mut [u64]) {
     assert_eq!(keys.len(), out.len());
     #[cfg(target_arch = "x86_64")]
