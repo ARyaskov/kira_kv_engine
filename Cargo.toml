@@ -16,7 +16,7 @@ categories = ["data-structures", "database"]
 default = ["serde", "simd", "parallel", "pgm"]
 serde = ["dep:serde", "dep:bincode"]
 simd = []
-parallel = ["dep:rayon"]
+parallel = ["dep:rayon", "dep:core_affinity"]
 pgm = []
 avx512 = ["simd"]
 unsafe_optimizations = []
@@ -27,6 +27,7 @@ thiserror = "1"
 serde = { version = "1", features = ["derive"], optional = true }
 bincode = { version = "1", optional = true }
 rayon = { version = "1.8", optional = true }
+core_affinity = { version = "0.8", optional = true }
 wyhash = { version = "0.6"}
 hashbrown = "0.14"
 rand = "0.8"

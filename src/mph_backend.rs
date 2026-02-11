@@ -1502,7 +1502,7 @@ pub fn prehash_unique_u64(keys: &[Vec<u8>], seed: u64) -> Option<(u64, Vec<u64>)
         let mut seen = HashSet::with_capacity(keys.len() * 2);
         let mut ok = true;
         for k in keys {
-            let h = wyhash::wyhash(k, s);
+            let h = canonical_hash_bytes(k, s);
             if !seen.insert(h) {
                 ok = false;
                 break;
@@ -1536,7 +1536,7 @@ pub fn prehash_u64_arena(
             .map(|w| {
                 let start = w[0] as usize;
                 let end = w[1] as usize;
-                wyhash::wyhash(&bytes[start..end], s)
+                canonical_hash_bytes(&bytes[start..end], s)
             })
             .collect();
         #[cfg(not(feature = "parallel"))]
@@ -1545,7 +1545,7 @@ pub fn prehash_u64_arena(
             .map(|w| {
                 let start = w[0] as usize;
                 let end = w[1] as usize;
-                wyhash::wyhash(&bytes[start..end], s)
+                canonical_hash_bytes(&bytes[start..end], s)
             })
             .collect();
 
@@ -1576,4 +1576,16 @@ pub fn prehash_unique_u64_arena(
     seed: u64,
 ) -> Option<(u64, Vec<u64>)> {
     prehash_u64_arena(bytes, offsets, seed, true)
+}
+
+#[inline(always)]
+fn canonical_hash_bytes(key: &[u8], seed: u64) -> u64 {
+    if key.len() == 8 {
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(key);
+        let v = u64::from_le_bytes(arr);
+        crate::simd_hash::hash_u64_one(v, seed)
+    } else {
+        wyhash::wyhash(key, seed)
+    }
 }

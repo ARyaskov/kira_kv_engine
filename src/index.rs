@@ -8,6 +8,8 @@ use crate::ptrhash::{BuildConfig as MphConfig, Builder as MphBuilder, MphError, 
 use crate::remap::{remap_id_from_index, remap_ids_for_pgm};
 use crate::xor_filter::{Cursor as XorCursor, Xor8};
 use hashbrown::HashMap;
+#[cfg(feature = "parallel")]
+use rayon::ThreadPoolBuilder;
 use thiserror::Error;
 
 #[cfg(target_arch = "aarch64")]
@@ -16,6 +18,8 @@ use std::arch::aarch64::{
 };
 #[cfg(target_arch = "aarch64")]
 use std::arch::is_aarch64_feature_detected;
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
 
 #[derive(Debug)]
 struct MphEngine {
@@ -162,41 +166,15 @@ impl Index {
                 key_count,
             })
         } else {
-            let (prehash_seed, canonical) = prehash_u64_arena(
-                arena.bytes.as_slice(),
-                arena.offsets.as_slice(),
-                config.mph_config.salt,
-                !config.build_fast_profile,
-            )
-            .ok_or(IndexError::CorruptData)?;
-            let xor = build_xor_u64(&canonical)?;
-            let backend_cfg = BackendConfig {
-                backend: config.backend,
-                hot_fraction: config.hot_fraction,
-                hot_backend: config.hot_backend,
-                cold_backend: config.cold_backend,
-                enable_parallel_build: config.enable_parallel_build,
-                seed: config.mph_config.salt,
-                gamma: config.mph_config.gamma,
-                rehash_limit: config.mph_config.rehash_limit,
-                max_pilot_attempts: 8_192,
-                build_profile: if config.build_fast_profile {
-                    BuildProfile::Fast
-                } else {
-                    BuildProfile::Balanced
-                },
-                fast_fail_rounds: if config.build_fast_profile { 3 } else { 2 },
-                frequencies: None,
-            };
-            let backend = build_dispatch(&canonical, &backend_cfg);
-            let fingerprints = build_fingerprints_hashed(&backend, &canonical);
+            let (prehash_seed, _canonical, backend, fingerprints, xor) =
+                run_build_pipeline_with_pool(&arena, &config)?;
 
             Ok(Index {
                 engine: Engine::Mph(MphEngine {
                     backend,
                     prehash_seed,
                     xor,
-                    fingerprints: fingerprints.into_boxed_slice(),
+                    fingerprints,
                 }),
                 key_count,
             })
@@ -269,7 +247,7 @@ impl Index {
                 }
             }
             Engine::Mph(engine) => {
-                let canonical = wyhash::wyhash(key, engine.prehash_seed);
+                let canonical = canonical_hash_key(key, engine.prehash_seed);
                 engine.xor.contains_u64(canonical)
             }
         }
@@ -298,7 +276,7 @@ impl Index {
             Engine::Mph(engine) => keys
                 .iter()
                 .map(|&key| {
-                    let canonical = wyhash::wyhash(key, engine.prehash_seed);
+                    let canonical = canonical_hash_key(key, engine.prehash_seed);
                     engine.xor.contains_u64(canonical)
                 })
                 .collect(),
@@ -318,6 +296,32 @@ impl Index {
         match &self.engine {
             Engine::Pgm(engine) => {
                 let mut i = 0usize;
+                #[cfg(target_arch = "x86_64")]
+                while i + 16 <= keys.len() {
+                    prefetch_key_batch(keys, i, 16);
+                    for j in 0..16 {
+                        let key = keys[i + j];
+                        let res = match try_parse_u64(key) {
+                            Some(num) => self.lookup_pgm(engine, num).ok(),
+                            None => None,
+                        };
+                        out.push(res);
+                    }
+                    i += 16;
+                }
+                #[cfg(target_arch = "x86_64")]
+                while i + 8 <= keys.len() {
+                    prefetch_key_batch(keys, i, 8);
+                    for j in 0..8 {
+                        let key = keys[i + j];
+                        let res = match try_parse_u64(key) {
+                            Some(num) => self.lookup_pgm(engine, num).ok(),
+                            None => None,
+                        };
+                        out.push(res);
+                    }
+                    i += 8;
+                }
                 #[cfg(target_arch = "aarch64")]
                 while i + 8 <= keys.len() {
                     for j in 0..8 {
@@ -359,6 +363,22 @@ impl Index {
             }
             Engine::Mph(engine) => {
                 let mut i = 0usize;
+                #[cfg(target_arch = "x86_64")]
+                while i + 16 <= keys.len() {
+                    prefetch_key_batch(keys, i, 16);
+                    for j in 0..16 {
+                        out.push(self.lookup_mph(engine, keys[i + j]).ok());
+                    }
+                    i += 16;
+                }
+                #[cfg(target_arch = "x86_64")]
+                while i + 8 <= keys.len() {
+                    prefetch_key_batch(keys, i, 8);
+                    for j in 0..8 {
+                        out.push(self.lookup_mph(engine, keys[i + j]).ok());
+                    }
+                    i += 8;
+                }
                 #[cfg(target_arch = "aarch64")]
                 while i + 8 <= keys.len() {
                     for j in 0..8 {
@@ -550,7 +570,7 @@ impl Index {
     }
 
     fn lookup_mph(&self, engine: &MphEngine, key: &[u8]) -> Result<usize, IndexError> {
-        let canonical = wyhash::wyhash(key, engine.prehash_seed);
+        let canonical = canonical_hash_key(key, engine.prehash_seed);
         if !engine.xor.contains_u64(canonical) {
             return Err(IndexError::KeyNotFound);
         }
@@ -595,6 +615,161 @@ impl Index {
             Ok(global_idx)
         } else {
             Err(IndexError::KeyNotFound)
+        }
+    }
+}
+
+#[inline(always)]
+fn make_backend_cfg(config: &IndexConfig) -> BackendConfig {
+    BackendConfig {
+        backend: config.backend,
+        hot_fraction: config.hot_fraction,
+        hot_backend: config.hot_backend,
+        cold_backend: config.cold_backend,
+        enable_parallel_build: config.enable_parallel_build,
+        seed: config.mph_config.salt,
+        gamma: config.mph_config.gamma,
+        rehash_limit: config.mph_config.rehash_limit,
+        max_pilot_attempts: 8_192,
+        build_profile: if config.build_fast_profile {
+            BuildProfile::Fast
+        } else {
+            BuildProfile::Balanced
+        },
+        fast_fail_rounds: if config.build_fast_profile { 3 } else { 2 },
+        frequencies: None,
+    }
+}
+
+fn run_build_pipeline(
+    arena: &KeyArena,
+    config: &IndexConfig,
+) -> Result<(u64, Vec<u64>, BackendDispatch, Box<[u16]>, Xor8), IndexError> {
+    let (prehash_seed, canonical) = prehash_u64_arena(
+        arena.bytes.as_slice(),
+        arena.offsets.as_slice(),
+        config.mph_config.salt,
+        !config.build_fast_profile,
+    )
+    .ok_or(IndexError::CorruptData)?;
+
+    let xor = build_xor_u64(&canonical)?;
+    let backend_cfg = make_backend_cfg(config);
+    let backend = build_dispatch(&canonical, &backend_cfg);
+    let fingerprints = build_fingerprints_hashed(&backend, &canonical).into_boxed_slice();
+    Ok((prehash_seed, canonical, backend, fingerprints, xor))
+}
+
+#[cfg(feature = "parallel")]
+fn run_build_pipeline_with_pool(
+    arena: &KeyArena,
+    config: &IndexConfig,
+) -> Result<(u64, Vec<u64>, BackendDispatch, Box<[u16]>, Xor8), IndexError> {
+    if !config.enable_parallel_build {
+        return run_build_pipeline(arena, config);
+    }
+
+    let pool = ThreadPoolBuilder::new()
+        .num_threads(detect_build_threads())
+        .start_handler(|idx| {
+            #[allow(unused_variables)]
+            {
+                #[cfg(feature = "parallel")]
+                if let Some(cores) = select_affinity_cores() {
+                    if !cores.is_empty() {
+                        let core_id = cores[idx % cores.len()];
+                        let _ =
+                            core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
+                    }
+                }
+            }
+        })
+        .build();
+
+    match pool {
+        Ok(pool) => pool.install(|| run_build_pipeline(arena, config)),
+        Err(_) => run_build_pipeline(arena, config),
+    }
+}
+
+#[cfg(not(feature = "parallel"))]
+fn run_build_pipeline_with_pool(
+    arena: &KeyArena,
+    config: &IndexConfig,
+) -> Result<(u64, Vec<u64>, BackendDispatch, Box<[u16]>, Xor8), IndexError> {
+    run_build_pipeline(arena, config)
+}
+
+#[cfg(feature = "parallel")]
+fn detect_build_threads() -> usize {
+    if let Some(v) = std::env::var_os("KIRA_BUILD_THREADS") {
+        if let Ok(parsed) = v.to_string_lossy().parse::<usize>() {
+            return parsed.max(1);
+        }
+    }
+    if let Ok(threads) = std::thread::available_parallelism() {
+        let t = threads.get();
+        #[cfg(target_arch = "x86_64")]
+        {
+            return (t / 2).clamp(4, 8);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            return t.clamp(2, 8);
+        }
+    }
+    4
+}
+
+#[cfg(feature = "parallel")]
+fn select_affinity_cores() -> Option<Vec<usize>> {
+    if let Some(v) = std::env::var_os("KIRA_BUILD_CORE_IDS") {
+        let ids = v
+            .to_string_lossy()
+            .split(',')
+            .filter_map(|s| s.trim().parse::<usize>().ok())
+            .collect::<Vec<_>>();
+        if !ids.is_empty() {
+            return Some(ids);
+        }
+    }
+
+    let core_ids = core_affinity::get_core_ids()?;
+    if core_ids.is_empty() {
+        return None;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        let half = (core_ids.len() / 2).clamp(1, 8);
+        return Some(core_ids.iter().take(half).map(|c| c.id).collect());
+    }
+
+    Some(core_ids.iter().map(|c| c.id).collect())
+}
+
+#[inline(always)]
+fn canonical_hash_key(key: &[u8], seed: u64) -> u64 {
+    if key.len() == 8 {
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(key);
+        let v = u64::from_le_bytes(arr);
+        crate::simd_hash::hash_u64_one(v, seed)
+    } else {
+        wyhash::wyhash(key, seed)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn prefetch_key_batch(keys: &[&[u8]], i: usize, window: usize) {
+    const DIST: usize = 24;
+    let pf = i + DIST;
+    if pf + window <= keys.len() {
+        for j in 0..window {
+            let ptr = keys[pf + j].as_ptr() as *const i8;
+            // SAFETY: prefetch is a hint; pointer is derived from valid slice.
+            unsafe { _mm_prefetch(ptr, _MM_HINT_T0) };
         }
     }
 }

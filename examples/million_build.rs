@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::thread;
 use std::time::Instant;
 
-const N_KEYS: usize = 1_000_0000;
+const N_KEYS: usize = 1_000_000;
 const GEN_SEED: u64 = 42;
 const QUERY_SEED: u64 = 1337;
 const MISSING_POOL_FRACTION: f64 = 0.01;
@@ -59,13 +59,24 @@ fn run_index_bench() -> Result<(), Box<dyn std::error::Error>> {
 
     let zipf_queries = make_zipfian_queries_bytes(&mixed_keys, QUERY_OPS, &mut rng);
 
-    let backends = [
+    #[cfg(feature = "bbhash")]
+    let mut backends = vec![
         (BackendKind::PtrHash2025, "PtrHash25Default"),
         (BackendKind::PTHash, "PTHash"),
         (BackendKind::PtrHash2025, "PtrHash25"),
         (BackendKind::CHD, "CHD"),
         (BackendKind::RecSplit, "RecSplit"),
     ];
+    #[cfg(not(feature = "bbhash"))]
+    let backends = vec![
+        (BackendKind::PtrHash2025, "PtrHash25Default"),
+        (BackendKind::PTHash, "PTHash"),
+        (BackendKind::PtrHash2025, "PtrHash25"),
+        (BackendKind::CHD, "CHD"),
+        (BackendKind::RecSplit, "RecSplit"),
+    ];
+    #[cfg(feature = "bbhash")]
+    backends.push((BackendKind::BBHash, "BBHash"));
 
     for (backend_kind, backend_name) in backends {
         let mut cfg = IndexConfig::default();
