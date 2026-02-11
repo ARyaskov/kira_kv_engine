@@ -1,97 +1,144 @@
-# Kira KV Engine API Documentation
+# Kira KV Engine API
 
-## Overview
+## Public Exports
 
-Kira KV Engine exposes a single public index: **HybridIndex**.
+From crate root:
 
-- By default it builds an MPH index.
-- If `auto_detect_numeric` is enabled and all keys are 8-byte little-endian integers, it builds a PGM index.
+- `IndexBuilder`
+- `IndexConfig`
+- `Index`
+- `IndexStats`
+- `IndexError`
+- `BackendKind`
+- `BackendBuildConfig` (alias of internal MPH backend config)
+- `BuildProfile`
+- `MphBackend` trait
 
-The internal engines are not part of the public API.
+---
 
-
-## API Reference
-
-### `HybridBuilder`
-
-Constructs a hybrid index. By default it builds MPH; PGM selection requires enabling `auto_detect_numeric`.
+## `IndexBuilder`
 
 ```rust
-pub struct HybridBuilder {
-    config: HybridConfig,
-}
+pub struct IndexBuilder { /* opaque */ }
 
-impl HybridBuilder {
-    pub fn new() -> Self
-    pub fn with_config(self, config: HybridConfig) -> Self
-    pub fn with_mph_config(self, mph_config: BuildConfig) -> Self
-    pub fn with_pgm_epsilon(self, epsilon: u32) -> Self
-    pub fn auto_detect_numeric(self, enabled: bool) -> Self
-    pub fn build_index<K>(self, keys: Vec<K>) -> Result<HybridIndex, HybridError>
+impl IndexBuilder {
+    pub fn new() -> Self;
+    pub fn with_config(self, config: IndexConfig) -> Self;
+    pub fn with_mph_config(self, mph_config: /* same type as IndexConfig::mph_config */) -> Self;
+    pub fn with_pgm_epsilon(self, epsilon: u32) -> Self;
+    pub fn with_backend(self, backend: BackendKind) -> Self;
+    pub fn with_hot_fraction(self, hot_fraction: f32) -> Self;
+    pub fn with_hot_backend(self, backend: BackendKind) -> Self;
+    pub fn with_cold_backend(self, backend: BackendKind) -> Self;
+    pub fn with_parallel_build(self, enabled: bool) -> Self;
+    pub fn with_build_fast_profile(self, enabled: bool) -> Self;
+    pub fn auto_detect_numeric(self, enabled: bool) -> Self;
+    pub fn build_index<K>(self, keys: Vec<K>) -> Result<Index, IndexError>
     where
-        K: AsRef<[u8]>
-}
-```
-
-### `HybridConfig`
-
-```rust
-pub struct HybridConfig {
-    pub mph_config: BuildConfig,
-    pub pgm_epsilon: u32,
-    pub auto_detect_numeric: bool,
-}
-```
-
-### `HybridIndex`
-
-```rust
-pub struct HybridIndex { /* opaque */ }
-
-impl HybridIndex {
-    pub fn lookup(&self, key: &[u8]) -> Result<usize, HybridError>
-    pub fn get(&self, key: &[u8]) -> Result<usize, HybridError>
-
-    pub fn lookup_str(&self, key: &str) -> Result<usize, HybridError>
-    pub fn get_str(&self, key: &str) -> Result<usize, HybridError>
-
-    pub fn lookup_u64(&self, key: u64) -> Result<usize, HybridError>
-    pub fn get_u64(&self, key: u64) -> Result<usize, HybridError>
-
-    pub fn lookup_batch(&self, keys: &[&[u8]]) -> Vec<Option<usize>>
-    pub fn get_batch(&self, keys: &[&[u8]]) -> Vec<Option<usize>>
-
-    pub fn contains(&self, key: &[u8]) -> bool
-    pub fn has(&self, key: &[u8]) -> bool
-    pub fn exists(&self, key: &[u8]) -> bool
-
-    pub fn contains_batch(&self, keys: &[&[u8]]) -> Vec<bool>
-    pub fn has_batch(&self, keys: &[&[u8]]) -> Vec<bool>
-    pub fn exists_batch(&self, keys: &[&[u8]]) -> Vec<bool>
-
-    pub fn range(&self, min_key: u64, max_key: u64) -> Vec<usize>
-    pub fn get_all(&self, min_key: u64, max_key: u64) -> Vec<usize>
-
-    pub fn len(&self) -> usize
-    pub fn stats(&self) -> HybridStats
-
-    pub fn to_bytes(&self) -> Result<Vec<u8>, HybridError>
-    pub fn serialize(&self) -> Result<Vec<u8>, HybridError>
-
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, HybridError>
-    pub fn deserialize(bytes: &[u8]) -> Result<Self, HybridError>
+        K: AsRef<[u8]>;
 }
 ```
 
 Notes:
-- `range()` returns results only when the engine is PGM; otherwise it returns an empty vector.
-- `lookup_u64()` works for both engines (numbers are encoded as little-endian bytes for MPH).
 
-### `HybridStats`
+- Default backend is `BackendKind::PtrHash2025`.
+- `with_hot_fraction`/`with_hot_backend`/`with_cold_backend` are compatibility knobs and currently do not change behavior.
+
+---
+
+## `IndexConfig`
 
 ```rust
-pub struct HybridStats {
-    pub engine: &'static str, // "pgm" or "mph"
+pub struct IndexConfig {
+    pub mph_config: /* PtrHash build config: gamma, rehash_limit, salt */,
+    pub pgm_epsilon: u32,
+    pub auto_detect_numeric: bool,
+    pub backend: BackendKind,
+    pub hot_fraction: f32,
+    pub hot_backend: BackendKind,
+    pub cold_backend: BackendKind,
+    pub enable_parallel_build: bool,
+    pub build_fast_profile: bool,
+}
+```
+
+Defaults:
+
+- `backend = BackendKind::PtrHash2025`
+- `auto_detect_numeric = false`
+- `enable_parallel_build = true`
+- `build_fast_profile = true`
+
+---
+
+## `BackendKind`
+
+```rust
+pub enum BackendKind {
+    PTHash,
+    PtrHash2025,
+    CHD,
+    RecSplit,
+    #[cfg(feature = "bbhash")]
+    BBHash,
+}
+```
+
+---
+
+## `Index`
+
+```rust
+pub struct Index { /* opaque */ }
+
+impl Index {
+    pub fn lookup(&self, key: &[u8]) -> Result<usize, IndexError>;
+    pub fn get(&self, key: &[u8]) -> Result<usize, IndexError>;
+
+    pub fn lookup_str(&self, key: &str) -> Result<usize, IndexError>;
+    pub fn get_str(&self, key: &str) -> Result<usize, IndexError>;
+
+    pub fn lookup_u64(&self, key: u64) -> Result<usize, IndexError>;
+    pub fn get_u64(&self, key: u64) -> Result<usize, IndexError>;
+
+    pub fn range(&self, min_key: u64, max_key: u64) -> Vec<usize>;
+    pub fn get_all(&self, min_key: u64, max_key: u64) -> Vec<usize>;
+
+    pub fn contains(&self, key: &[u8]) -> bool;
+    pub fn has(&self, key: &[u8]) -> bool;
+    pub fn exists(&self, key: &[u8]) -> bool;
+
+    pub fn contains_batch(&self, keys: &[&[u8]]) -> Vec<bool>;
+    pub fn has_batch(&self, keys: &[&[u8]]) -> Vec<bool>;
+    pub fn exists_batch(&self, keys: &[&[u8]]) -> Vec<bool>;
+
+    pub fn lookup_batch(&self, keys: &[&[u8]]) -> Vec<Option<usize>>;
+    pub fn get_batch(&self, keys: &[&[u8]]) -> Vec<Option<usize>>;
+
+    pub fn len(&self) -> usize;
+    pub fn stats(&self) -> IndexStats;
+    pub fn print_detailed_stats(&self);
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, IndexError>;
+    pub fn serialize(&self) -> Result<Vec<u8>, IndexError>;
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, IndexError>;
+    pub fn deserialize(bytes: &[u8]) -> Result<Self, IndexError>;
+}
+```
+
+Behavior notes:
+
+- `range/get_all` return results only when engine is numeric PGM mode (`auto_detect_numeric = true` and all input keys are 8-byte LE `u64`).
+- In MPH mode, `range/get_all` return empty vector.
+- `lookup_u64` works in both modes.
+
+---
+
+## `IndexStats`
+
+```rust
+pub struct IndexStats {
+    pub engine: &'static str, // "mph" or "pgm"
     pub total_keys: usize,
     pub mph_memory: usize,
     pub pgm_memory: usize,
@@ -99,10 +146,12 @@ pub struct HybridStats {
 }
 ```
 
-### `HybridError`
+---
+
+## `IndexError`
 
 ```rust
-pub enum HybridError {
+pub enum IndexError {
     Mph(String),
     Pgm(String),
     KeyNotFound,
@@ -111,43 +160,32 @@ pub enum HybridError {
 }
 ```
 
-## Examples
+---
 
-### Numeric keys (PGM when `auto_detect_numeric` is enabled)
+## `BackendBuildConfig` and `BuildProfile`
 
-```rust
-use kira_kv_engine::HybridBuilder;
-
-let keys: Vec<Vec<u8>> = (0..1_000_000u64)
-    .map(|v| v.to_le_bytes().to_vec())
-    .collect();
-
-let index = HybridBuilder::new()
-    .auto_detect_numeric(true)
-    .build_index(keys)?;
-let pos = index.lookup_u64(42)?;
-```
-
-### Mixed keys (MPH default)
+`BackendBuildConfig` configures MPH backend internals exposed from `mph_backend`:
 
 ```rust
-use kira_kv_engine::HybridBuilder;
+pub enum BuildProfile {
+    Balanced,
+    Fast,
+}
 
-let mut keys = Vec::new();
-keys.push(b"alpha".to_vec());
-keys.push(123u64.to_le_bytes().to_vec());
-keys.push(b"beta".to_vec());
-
-let index = HybridBuilder::new().build_index(keys)?;
-let pos = index.lookup(b"alpha")?;
-```
-
-### Batch lookup
-
-```rust
-use kira_kv_engine::HybridIndex;
-
-fn batch_lookup(index: &HybridIndex, keys: &[&[u8]]) -> Vec<Option<usize>> {
-    index.lookup_batch(keys)
+pub struct BackendBuildConfig {
+    pub backend: BackendKind,
+    pub hot_fraction: f32,
+    pub hot_backend: BackendKind,
+    pub cold_backend: BackendKind,
+    pub enable_parallel_build: bool,
+    pub seed: u64,
+    pub gamma: f64,
+    pub rehash_limit: u32,
+    pub max_pilot_attempts: u32,
+    pub build_profile: BuildProfile,
+    pub fast_fail_rounds: u32,
+    pub frequencies: Option<Vec<(u64, u32)>>,
 }
 ```
+
+This is mostly useful for advanced/internal tuning; `IndexBuilder` is the primary user-facing API.

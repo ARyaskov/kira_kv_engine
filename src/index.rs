@@ -1,6 +1,10 @@
-use crate::bdz::{BuildConfig as MphConfig, Builder as MphBuilder, MphError, Mphf};
 use crate::hot_tier::HotTierIndex;
+use crate::mph_backend::{
+    BackendDispatch, BackendKind, BuildConfig as BackendConfig, BuildProfile, build_dispatch,
+    prehash_u64_arena,
+};
 use crate::pgm::{PgmBuilder, PgmError, PgmIndex};
+use crate::ptrhash::{BuildConfig as MphConfig, Builder as MphBuilder, MphError, Mphf};
 use crate::remap::{remap_id_from_index, remap_ids_for_pgm};
 use crate::xor_filter::{Cursor as XorCursor, Xor8};
 use hashbrown::HashMap;
@@ -12,12 +16,11 @@ use std::arch::aarch64::{
 };
 #[cfg(target_arch = "aarch64")]
 use std::arch::is_aarch64_feature_detected;
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::{__m128i, _mm_loadu_si128};
 
 #[derive(Debug)]
 struct MphEngine {
-    mph: Mphf,
+    backend: BackendDispatch,
+    prehash_seed: u64,
     xor: Xor8,
     fingerprints: Box<[u16]>,
 }
@@ -37,14 +40,14 @@ enum Engine {
     Mph(MphEngine),
 }
 
-/// Hybrid index: auto-selects PGM for purely numeric keys, MPH otherwise
-pub struct HybridIndex {
+/// Index: auto-selects PGM for purely numeric keys, MPH otherwise
+pub struct Index {
     engine: Engine,
     key_count: usize,
 }
 
 #[derive(Debug, Error)]
-pub enum HybridError {
+pub enum IndexError {
     #[error("MPH error: {0}")]
     Mph(String),
     #[error("PGM error: {0}")]
@@ -57,36 +60,48 @@ pub enum HybridError {
     CorruptData,
 }
 
-impl From<MphError> for HybridError {
+impl From<MphError> for IndexError {
     fn from(err: MphError) -> Self {
-        HybridError::Mph(err.to_string())
+        IndexError::Mph(err.to_string())
     }
 }
 
-impl From<PgmError> for HybridError {
+impl From<PgmError> for IndexError {
     fn from(err: PgmError) -> Self {
-        HybridError::Pgm(err.to_string())
+        IndexError::Pgm(err.to_string())
     }
 }
 
-/// Configuration for hybrid index
+/// Configuration for index
 #[derive(Debug, Clone)]
-pub struct HybridConfig {
+pub struct IndexConfig {
     pub mph_config: MphConfig,
     pub pgm_epsilon: u32,
     pub auto_detect_numeric: bool,
+    pub backend: BackendKind,
+    pub hot_fraction: f32,
+    pub hot_backend: BackendKind,
+    pub cold_backend: BackendKind,
+    pub enable_parallel_build: bool,
+    pub build_fast_profile: bool,
 }
 
-impl Default for HybridConfig {
+impl Default for IndexConfig {
     fn default() -> Self {
-        let mut cfg = crate::cpu::detect_features().optimal_hybrid_config();
+        let mut cfg = crate::cpu::detect_features().optimal_index_config();
         cfg.auto_detect_numeric = false;
+        cfg.backend = BackendKind::PtrHash2025;
+        cfg.hot_fraction = 0.15;
+        cfg.hot_backend = BackendKind::CHD;
+        cfg.cold_backend = BackendKind::RecSplit;
+        cfg.enable_parallel_build = true;
+        cfg.build_fast_profile = true;
         cfg
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct HybridStats {
+pub struct IndexStats {
     pub engine: &'static str,
     pub total_keys: usize,
     pub mph_memory: usize,
@@ -94,25 +109,23 @@ pub struct HybridStats {
     pub total_memory: usize,
 }
 
-impl HybridIndex {
-    pub fn build_index<K>(keys: Vec<K>, config: HybridConfig) -> Result<Self, HybridError>
+impl Index {
+    pub fn build_index<K>(keys: Vec<K>, config: IndexConfig) -> Result<Self, IndexError>
     where
         K: AsRef<[u8]>,
     {
         if keys.is_empty() {
-            return Err(HybridError::InvalidKey);
+            return Err(IndexError::InvalidKey);
         }
 
-        let byte_keys: Vec<Vec<u8>> = keys.into_iter().map(|k| k.as_ref().to_vec()).collect();
-        let mut byte_keys = dedup_unique_keys(byte_keys)?;
-        permute_keys_for_builder(&mut byte_keys, config.mph_config.salt);
-        let key_count = byte_keys.len();
+        let arena = build_key_arena(keys, config.mph_config.salt)?;
+        let key_count = arena.len();
 
-        let mut numeric_keys = Vec::with_capacity(byte_keys.len());
+        let mut numeric_keys = Vec::with_capacity(key_count);
         let mut all_numeric = false;
         if config.auto_detect_numeric {
             all_numeric = true;
-            for key in &byte_keys {
+            for key in arena.keys() {
                 if let Some(num) = try_parse_u64(key) {
                     numeric_keys.push(num);
                 } else {
@@ -138,7 +151,7 @@ impl HybridIndex {
             let fingerprints = build_fingerprints_u64(&mph, &remap_ids);
             let hot = build_hot_tier(&pgm, &mph_config);
 
-            Ok(HybridIndex {
+            Ok(Index {
                 engine: Engine::Pgm(PgmEngine {
                     pgm,
                     xor,
@@ -149,15 +162,39 @@ impl HybridIndex {
                 key_count,
             })
         } else {
-            let xor = build_xor_bytes(&byte_keys)?;
-            let mph = MphBuilder::new()
-                .with_config(config.mph_config)
-                .build_unique_ref(&byte_keys)?;
-            let fingerprints = build_fingerprints_bytes(&mph, &byte_keys);
+            let (prehash_seed, canonical) = prehash_u64_arena(
+                arena.bytes.as_slice(),
+                arena.offsets.as_slice(),
+                config.mph_config.salt,
+                !config.build_fast_profile,
+            )
+            .ok_or(IndexError::CorruptData)?;
+            let xor = build_xor_u64(&canonical)?;
+            let backend_cfg = BackendConfig {
+                backend: config.backend,
+                hot_fraction: config.hot_fraction,
+                hot_backend: config.hot_backend,
+                cold_backend: config.cold_backend,
+                enable_parallel_build: config.enable_parallel_build,
+                seed: config.mph_config.salt,
+                gamma: config.mph_config.gamma,
+                rehash_limit: config.mph_config.rehash_limit,
+                max_pilot_attempts: 8_192,
+                build_profile: if config.build_fast_profile {
+                    BuildProfile::Fast
+                } else {
+                    BuildProfile::Balanced
+                },
+                fast_fail_rounds: if config.build_fast_profile { 3 } else { 2 },
+                frequencies: None,
+            };
+            let backend = build_dispatch(&canonical, &backend_cfg);
+            let fingerprints = build_fingerprints_hashed(&backend, &canonical);
 
-            Ok(HybridIndex {
+            Ok(Index {
                 engine: Engine::Mph(MphEngine {
-                    mph,
+                    backend,
+                    prehash_seed,
                     xor,
                     fingerprints: fingerprints.into_boxed_slice(),
                 }),
@@ -166,14 +203,10 @@ impl HybridIndex {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn simd_touch(key: &[u8]) {
         #[cfg(target_arch = "x86_64")]
-        unsafe {
-            if key.len() >= 16 {
-                let _ = _mm_loadu_si128(key.as_ptr() as *const __m128i);
-            }
-        }
+        let _ = key;
         #[cfg(target_arch = "aarch64")]
         unsafe {
             if key.len() >= 16 {
@@ -182,36 +215,36 @@ impl HybridIndex {
         }
     }
 
-    pub fn lookup(&self, key: &[u8]) -> Result<usize, HybridError> {
+    pub fn lookup(&self, key: &[u8]) -> Result<usize, IndexError> {
         match &self.engine {
             Engine::Pgm(engine) => {
-                let num = try_parse_u64(key).ok_or(HybridError::InvalidKey)?;
+                let num = try_parse_u64(key).ok_or(IndexError::InvalidKey)?;
                 self.lookup_pgm(engine, num)
             }
             Engine::Mph(engine) => self.lookup_mph(engine, key),
         }
     }
 
-    pub fn get(&self, key: &[u8]) -> Result<usize, HybridError> {
+    pub fn get(&self, key: &[u8]) -> Result<usize, IndexError> {
         self.lookup(key)
     }
 
-    pub fn lookup_str(&self, key: &str) -> Result<usize, HybridError> {
+    pub fn lookup_str(&self, key: &str) -> Result<usize, IndexError> {
         self.lookup(key.as_bytes())
     }
 
-    pub fn get_str(&self, key: &str) -> Result<usize, HybridError> {
+    pub fn get_str(&self, key: &str) -> Result<usize, IndexError> {
         self.lookup_str(key)
     }
 
-    pub fn lookup_u64(&self, key: u64) -> Result<usize, HybridError> {
+    pub fn lookup_u64(&self, key: u64) -> Result<usize, IndexError> {
         match &self.engine {
             Engine::Pgm(engine) => self.lookup_pgm(engine, key),
             Engine::Mph(engine) => self.lookup_mph(engine, &key.to_le_bytes()),
         }
     }
 
-    pub fn get_u64(&self, key: u64) -> Result<usize, HybridError> {
+    pub fn get_u64(&self, key: u64) -> Result<usize, IndexError> {
         self.lookup_u64(key)
     }
 
@@ -235,7 +268,10 @@ impl HybridIndex {
                     false
                 }
             }
-            Engine::Mph(engine) => engine.xor.contains_bytes(key),
+            Engine::Mph(engine) => {
+                let canonical = wyhash::wyhash(key, engine.prehash_seed);
+                engine.xor.contains_u64(canonical)
+            }
         }
     }
 
@@ -261,7 +297,10 @@ impl HybridIndex {
                 .collect(),
             Engine::Mph(engine) => keys
                 .iter()
-                .map(|&key| engine.xor.contains_bytes(key))
+                .map(|&key| {
+                    let canonical = wyhash::wyhash(key, engine.prehash_seed);
+                    engine.xor.contains_u64(canonical)
+                })
                 .collect(),
         }
     }
@@ -359,7 +398,7 @@ impl HybridIndex {
         self.key_count
     }
 
-    pub fn stats(&self) -> HybridStats {
+    pub fn stats(&self) -> IndexStats {
         match &self.engine {
             Engine::Pgm(engine) => {
                 let pgm_memory = engine.pgm.stats().memory_usage;
@@ -368,7 +407,7 @@ impl HybridIndex {
                 let xor_memory = engine.xor.memory_usage();
                 let fp_memory = engine.fingerprints.len() * std::mem::size_of::<u16>();
                 let hot_memory = engine.hot.as_ref().map(|h| h.memory_usage()).unwrap_or(0);
-                HybridStats {
+                IndexStats {
                     engine: "pgm",
                     total_keys: self.key_count,
                     mph_memory,
@@ -377,11 +416,10 @@ impl HybridIndex {
                 }
             }
             Engine::Mph(engine) => {
-                let mph_memory = std::mem::size_of_val(&engine.mph)
-                    + engine.mph.g.len() * std::mem::size_of::<u32>();
+                let mph_memory = engine.backend.memory_usage_bytes();
                 let xor_memory = engine.xor.memory_usage();
                 let fp_memory = engine.fingerprints.len() * std::mem::size_of::<u16>();
-                HybridStats {
+                IndexStats {
                     engine: "mph",
                     total_keys: self.key_count,
                     mph_memory,
@@ -394,7 +432,7 @@ impl HybridIndex {
 
     pub fn print_detailed_stats(&self) {
         let stats = self.stats();
-        println!("Hybrid Index Statistics:");
+        println!("Index Statistics:");
         println!("  Engine: {}", stats.engine);
         println!("  Total keys: {}", stats.total_keys);
         if stats.mph_memory > 0 {
@@ -411,13 +449,14 @@ impl HybridIndex {
         }
     }
 
-    pub fn to_bytes(&self) -> Result<Vec<u8>, HybridError> {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, IndexError> {
         let mut out = Vec::new();
         match &self.engine {
             Engine::Mph(engine) => {
                 write_u8(&mut out, 0);
                 write_u64(&mut out, self.key_count as u64);
-                write_mph(&mut out, &engine.mph);
+                write_u64(&mut out, engine.prehash_seed);
+                engine.backend.write_to(&mut out);
                 engine.xor.write_to(&mut out);
                 write_fingerprints(&mut out, engine.fingerprints.as_ref());
             }
@@ -442,25 +481,30 @@ impl HybridIndex {
         Ok(out)
     }
 
-    pub fn serialize(&self) -> Result<Vec<u8>, HybridError> {
+    pub fn serialize(&self) -> Result<Vec<u8>, IndexError> {
         self.to_bytes()
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, HybridError> {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, IndexError> {
         let mut cursor = Cursor::new(bytes);
-        let tag = cursor.read_u8().ok_or(HybridError::CorruptData)?;
-        let key_count = cursor.read_u64().ok_or(HybridError::CorruptData)? as usize;
+        let tag = cursor.read_u8().ok_or(IndexError::CorruptData)?;
+        let key_count = cursor.read_u64().ok_or(IndexError::CorruptData)? as usize;
         match tag {
             0 => {
-                let mph = read_mph(&mut cursor)?;
+                let prehash_seed = cursor.read_u64().ok_or(IndexError::CorruptData)?;
+                let mut pos = cursor.pos;
+                let backend =
+                    BackendDispatch::read_from(bytes, &mut pos).ok_or(IndexError::CorruptData)?;
+                cursor.pos = pos;
                 let mut xor_cursor = XorCursor::new(bytes);
                 xor_cursor.pos = cursor.pos;
-                let xor = Xor8::read_from(&mut xor_cursor).ok_or(HybridError::CorruptData)?;
+                let xor = Xor8::read_from(&mut xor_cursor).ok_or(IndexError::CorruptData)?;
                 cursor.pos = xor_cursor.pos;
                 let fingerprints = read_fingerprints(&mut cursor)?;
-                Ok(HybridIndex {
+                Ok(Index {
                     engine: Engine::Mph(MphEngine {
-                        mph,
+                        backend,
+                        prehash_seed,
                         xor,
                         fingerprints,
                     }),
@@ -473,20 +517,20 @@ impl HybridIndex {
                 cursor.pos = pos;
                 let mut xor_cursor = XorCursor::new(bytes);
                 xor_cursor.pos = cursor.pos;
-                let xor = Xor8::read_from(&mut xor_cursor).ok_or(HybridError::CorruptData)?;
+                let xor = Xor8::read_from(&mut xor_cursor).ok_or(IndexError::CorruptData)?;
                 cursor.pos = xor_cursor.pos;
                 let mph = read_mph(&mut cursor)?;
                 let fingerprints = read_fingerprints(&mut cursor)?;
-                let hot_flag = cursor.read_u8().ok_or(HybridError::CorruptData)?;
+                let hot_flag = cursor.read_u8().ok_or(IndexError::CorruptData)?;
                 let hot = if hot_flag == 1 {
                     let mut pos = cursor.pos;
                     let hot =
-                        HotTierIndex::read_from(bytes, &mut pos).ok_or(HybridError::CorruptData)?;
+                        HotTierIndex::read_from(bytes, &mut pos).ok_or(IndexError::CorruptData)?;
                     Some(hot)
                 } else {
                     None
                 };
-                Ok(HybridIndex {
+                Ok(Index {
                     engine: Engine::Pgm(PgmEngine {
                         pgm,
                         xor,
@@ -497,48 +541,51 @@ impl HybridIndex {
                     key_count,
                 })
             }
-            _ => Err(HybridError::CorruptData),
+            _ => Err(IndexError::CorruptData),
         }
     }
 
-    pub fn deserialize(bytes: &[u8]) -> Result<Self, HybridError> {
+    pub fn deserialize(bytes: &[u8]) -> Result<Self, IndexError> {
         Self::from_bytes(bytes)
     }
 
-    fn lookup_mph(&self, engine: &MphEngine, key: &[u8]) -> Result<usize, HybridError> {
-        let xor_hash = engine.xor.hash_bytes(key);
-        if !engine.xor.contains_hash(xor_hash) {
-            return Err(HybridError::KeyNotFound);
+    fn lookup_mph(&self, engine: &MphEngine, key: &[u8]) -> Result<usize, IndexError> {
+        let canonical = wyhash::wyhash(key, engine.prehash_seed);
+        if !engine.xor.contains_u64(canonical) {
+            return Err(IndexError::KeyNotFound);
         }
-        let idx = engine.mph.index(key) as usize;
-        let fp = fingerprint16(hash_bytes(key));
+        let idx = engine
+            .backend
+            .lookup(canonical)
+            .ok_or(IndexError::KeyNotFound)? as usize;
+        let fp = fingerprint16(hash_u64_det(canonical));
         // SAFETY: mph index is in [0..n), fingerprints.len() == n
         let ok = unsafe { *engine.fingerprints.get_unchecked(idx) == fp };
         if ok {
             Ok(idx)
         } else {
-            Err(HybridError::KeyNotFound)
+            Err(IndexError::KeyNotFound)
         }
     }
 
-    fn lookup_pgm(&self, engine: &PgmEngine, key: u64) -> Result<usize, HybridError> {
+    fn lookup_pgm(&self, engine: &PgmEngine, key: u64) -> Result<usize, IndexError> {
         if let Some(hot) = engine.hot.as_ref() {
             if let Some(idx) = hot.lookup_u64(key) {
                 return Ok(idx as usize);
             }
         }
         if !engine.pgm.filter_allows(key) {
-            return Err(HybridError::KeyNotFound);
+            return Err(IndexError::KeyNotFound);
         }
         let hash = engine.xor.hash_u64(key);
         if !engine.xor.contains_hash(hash) {
-            return Err(HybridError::KeyNotFound);
+            return Err(IndexError::KeyNotFound);
         }
         let global_idx = engine.pgm.index(key)?;
         let seg_id = engine
             .pgm
             .segment_for_key(key)
-            .ok_or(HybridError::KeyNotFound)?;
+            .ok_or(IndexError::KeyNotFound)?;
         let remap_id = remap_id_from_index(&engine.pgm, seg_id, global_idx);
         let idx = engine.mph.index(&remap_id.to_le_bytes()) as usize;
         let fp = fingerprint16(hash_u64_det(remap_id));
@@ -547,24 +594,24 @@ impl HybridIndex {
         if ok {
             Ok(global_idx)
         } else {
-            Err(HybridError::KeyNotFound)
+            Err(IndexError::KeyNotFound)
         }
     }
 }
 
-/// Builder for hybrid index
-pub struct HybridBuilder {
-    config: HybridConfig,
+/// Builder for index
+pub struct IndexBuilder {
+    config: IndexConfig,
 }
 
-impl HybridBuilder {
+impl IndexBuilder {
     pub fn new() -> Self {
         Self {
-            config: HybridConfig::default(),
+            config: IndexConfig::default(),
         }
     }
 
-    pub fn with_config(mut self, config: HybridConfig) -> Self {
+    pub fn with_config(mut self, config: IndexConfig) -> Self {
         self.config = config;
         self
     }
@@ -579,20 +626,50 @@ impl HybridBuilder {
         self
     }
 
+    pub fn with_backend(mut self, backend: BackendKind) -> Self {
+        self.config.backend = backend;
+        self
+    }
+
+    pub fn with_hot_fraction(mut self, hot_fraction: f32) -> Self {
+        self.config.hot_fraction = hot_fraction;
+        self
+    }
+
+    pub fn with_hot_backend(mut self, backend: BackendKind) -> Self {
+        self.config.hot_backend = backend;
+        self
+    }
+
+    pub fn with_cold_backend(mut self, backend: BackendKind) -> Self {
+        self.config.cold_backend = backend;
+        self
+    }
+
+    pub fn with_parallel_build(mut self, enabled: bool) -> Self {
+        self.config.enable_parallel_build = enabled;
+        self
+    }
+
+    pub fn with_build_fast_profile(mut self, enabled: bool) -> Self {
+        self.config.build_fast_profile = enabled;
+        self
+    }
+
     pub fn auto_detect_numeric(mut self, enabled: bool) -> Self {
         self.config.auto_detect_numeric = enabled;
         self
     }
 
-    pub fn build_index<K>(self, keys: Vec<K>) -> Result<HybridIndex, HybridError>
+    pub fn build_index<K>(self, keys: Vec<K>) -> Result<Index, IndexError>
     where
         K: AsRef<[u8]>,
     {
-        HybridIndex::build_index(keys, self.config)
+        Index::build_index(keys, self.config)
     }
 }
 
-impl Default for HybridBuilder {
+impl Default for IndexBuilder {
     fn default() -> Self {
         Self::new()
     }
@@ -607,40 +684,127 @@ fn try_parse_u64(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(array))
 }
 
-fn dedup_unique_keys(keys: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>, HybridError> {
-    let mut uniq = Vec::with_capacity(keys.len());
-    let mut buckets: HashMap<u64, Vec<usize>> = HashMap::with_capacity(keys.len());
+struct KeyArena {
+    bytes: Vec<u8>,
+    offsets: Vec<u32>,
+}
+
+impl KeyArena {
+    fn len(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    fn key_at(&self, idx: usize) -> &[u8] {
+        let start = self.offsets[idx] as usize;
+        let end = self.offsets[idx + 1] as usize;
+        &self.bytes[start..end]
+    }
+
+    fn keys(&self) -> KeyArenaIter<'_> {
+        KeyArenaIter {
+            arena: self,
+            idx: 0,
+        }
+    }
+}
+
+struct KeyArenaIter<'a> {
+    arena: &'a KeyArena,
+    idx: usize,
+}
+
+impl<'a> Iterator for KeyArenaIter<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.idx >= self.arena.len() {
+            return None;
+        }
+        let out = self.arena.key_at(self.idx);
+        self.idx += 1;
+        Some(out)
+    }
+}
+
+fn build_key_arena<K>(keys: Vec<K>, seed: u64) -> Result<KeyArena, IndexError>
+where
+    K: AsRef<[u8]>,
+{
+    let total_bytes = keys.iter().map(|k| k.as_ref().len()).sum();
+    let mut bytes = Vec::with_capacity(total_bytes);
+    let mut offsets = Vec::with_capacity(keys.len() + 1);
+    offsets.push(0u32);
+    let mut buckets: HashMap<u64, Vec<usize>> = HashMap::with_capacity(keys.len() * 2);
+
     for key in keys {
-        let h = crate::build_hasher::fast_hash_bytes(&key);
+        let k = key.as_ref();
+        let h = crate::build_hasher::fast_hash_bytes(k);
         if let Some(indices) = buckets.get(&h) {
             for &idx in indices {
-                if uniq[idx] == key {
+                let start = offsets[idx] as usize;
+                let end = offsets[idx + 1] as usize;
+                if &bytes[start..end] == k {
                     return Err(MphError::DuplicateKey.into());
                 }
             }
         }
-        let idx = uniq.len();
-        uniq.push(key);
+
+        let idx = offsets.len() - 1;
+        bytes.extend_from_slice(k);
+        offsets.push(bytes.len() as u32);
         buckets.entry(h).or_default().push(idx);
     }
-    Ok(uniq)
+
+    if offsets.len() <= 2 {
+        return Ok(KeyArena { bytes, offsets });
+    }
+
+    let mut order: Vec<usize> = (0..offsets.len() - 1).collect();
+    permute_order_for_builder(&mut order, &bytes, &offsets, seed);
+    compact_arena_by_order(&bytes, &offsets, &order)
 }
 
-fn permute_keys_for_builder(keys: &mut [Vec<u8>], seed: u64) {
-    if keys.len() <= 1 {
+fn permute_order_for_builder(order: &mut [usize], bytes: &[u8], offsets: &[u32], seed: u64) {
+    if order.len() <= 1 {
         return;
     }
-    let mut s = seed ^ (keys.len() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let sample = keys.len().min(8);
+    let mut s = seed ^ (order.len() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let sample = order.len().min(8);
     for i in 0..sample {
-        s ^= crate::build_hasher::fast_hash_bytes(&keys[i]);
+        let idx = order[i];
+        let start = offsets[idx] as usize;
+        let end = offsets[idx + 1] as usize;
+        s ^= crate::build_hasher::fast_hash_bytes(&bytes[start..end]);
         s = xorshift64(s);
     }
-    for i in (1..keys.len()).rev() {
+    for i in (1..order.len()).rev() {
         s = xorshift64(s);
         let j = (s % (i as u64 + 1)) as usize;
-        keys.swap(i, j);
+        order.swap(i, j);
     }
+}
+
+fn compact_arena_by_order(
+    bytes: &[u8],
+    offsets: &[u32],
+    order: &[usize],
+) -> Result<KeyArena, IndexError> {
+    let mut out_offsets = Vec::with_capacity(order.len() + 1);
+    out_offsets.push(0u32);
+    let mut out_bytes = Vec::with_capacity(bytes.len());
+    for &idx in order {
+        let start = offsets[idx] as usize;
+        let end = offsets[idx + 1] as usize;
+        out_bytes.extend_from_slice(&bytes[start..end]);
+        if out_bytes.len() > u32::MAX as usize {
+            return Err(IndexError::CorruptData);
+        }
+        out_offsets.push(out_bytes.len() as u32);
+    }
+    Ok(KeyArena {
+        bytes: out_bytes,
+        offsets: out_offsets,
+    })
 }
 
 #[inline]
@@ -651,18 +815,7 @@ fn xorshift64(mut x: u64) -> u64 {
     x
 }
 
-fn build_xor_bytes(keys: &[Vec<u8>]) -> Result<Xor8, HybridError> {
-    let mut seed = 0xD1B5_4A32_D192_ED03u64;
-    for _ in 0..16 {
-        if let Ok(xor) = Xor8::build_from_bytes(keys, seed) {
-            return Ok(xor);
-        }
-        seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    }
-    Err(HybridError::CorruptData)
-}
-
-fn build_xor_u64(keys: &[u64]) -> Result<Xor8, HybridError> {
+fn build_xor_u64(keys: &[u64]) -> Result<Xor8, IndexError> {
     let mut seed = 0xD1B5_4A32_D192_ED03u64;
     for _ in 0..16 {
         if let Ok(xor) = Xor8::build_from_u64(keys, seed) {
@@ -670,14 +823,14 @@ fn build_xor_u64(keys: &[u64]) -> Result<Xor8, HybridError> {
         }
         seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     }
-    Err(HybridError::CorruptData)
+    Err(IndexError::CorruptData)
 }
 
-fn build_fingerprints_bytes(mph: &Mphf, keys: &[Vec<u8>]) -> Vec<u16> {
+fn build_fingerprints_hashed(backend: &BackendDispatch, keys: &[u64]) -> Vec<u16> {
     let mut fps = vec![0u16; keys.len()];
-    for key in keys {
-        let idx = mph.index(key) as usize;
-        let fp = fingerprint16(hash_bytes(key));
+    for &k in keys {
+        let idx = backend.lookup(k).expect("backend must map training keys") as usize;
+        let fp = fingerprint16(hash_u64_det(k));
         fps[idx] = fp;
     }
     fps
@@ -876,14 +1029,14 @@ fn write_mph(out: &mut Vec<u8>, mph: &Mphf) {
     }
 }
 
-fn read_mph(cursor: &mut Cursor<'_>) -> Result<Mphf, HybridError> {
-    let n = cursor.read_u64().ok_or(HybridError::CorruptData)?;
-    let m = cursor.read_u32().ok_or(HybridError::CorruptData)?;
-    let salt = cursor.read_u64().ok_or(HybridError::CorruptData)?;
-    let g_len = cursor.read_u64().ok_or(HybridError::CorruptData)? as usize;
+fn read_mph(cursor: &mut Cursor<'_>) -> Result<Mphf, IndexError> {
+    let n = cursor.read_u64().ok_or(IndexError::CorruptData)?;
+    let m = cursor.read_u32().ok_or(IndexError::CorruptData)?;
+    let salt = cursor.read_u64().ok_or(IndexError::CorruptData)?;
+    let g_len = cursor.read_u64().ok_or(IndexError::CorruptData)? as usize;
     let mut g = Vec::with_capacity(g_len);
     for _ in 0..g_len {
-        g.push(cursor.read_u32().ok_or(HybridError::CorruptData)?);
+        g.push(cursor.read_u32().ok_or(IndexError::CorruptData)?);
     }
     Ok(Mphf { n, m, salt, g })
 }
@@ -895,11 +1048,11 @@ fn write_fingerprints(out: &mut Vec<u8>, fps: &[u16]) {
     }
 }
 
-fn read_fingerprints(cursor: &mut Cursor<'_>) -> Result<Box<[u16]>, HybridError> {
-    let len = cursor.read_u64().ok_or(HybridError::CorruptData)? as usize;
+fn read_fingerprints(cursor: &mut Cursor<'_>) -> Result<Box<[u16]>, IndexError> {
+    let len = cursor.read_u64().ok_or(IndexError::CorruptData)? as usize;
     let mut fps = Vec::with_capacity(len);
     for _ in 0..len {
-        fps.push(cursor.read_u16().ok_or(HybridError::CorruptData)?);
+        fps.push(cursor.read_u16().ok_or(IndexError::CorruptData)?);
     }
     Ok(fps.into_boxed_slice())
 }

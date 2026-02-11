@@ -1,6 +1,7 @@
 use core::arch::x86_64::{
-    __m256i, _mm256_loadu_si256, _mm256_mullo_epi32, _mm256_set_epi32, _mm256_set1_epi32,
-    _mm256_srli_epi32, _mm256_storeu_si256, _mm256_xor_si256,
+    __m256i, _mm256_loadu_si256, _mm256_mullo_epi32, _mm256_or_si256, _mm256_set_epi32,
+    _mm256_set1_epi32, _mm256_slli_epi64, _mm256_srli_epi32, _mm256_srli_epi64,
+    _mm256_storeu_si256, _mm256_xor_si256,
 };
 
 #[allow(unsafe_op_in_unsafe_fn)]
@@ -30,13 +31,13 @@ pub unsafe fn hash_u64_avx2(keys: &[u64], seed: u64, out: &mut [u64]) {
         let v = _mm256_loadu_si256(ptr);
         let vec = _mm256_xor_si256(v, seed_vec);
         let mixed = mix32_vec(vec);
-        let mut out_u32: [u32; 8] = [0; 8];
-        _mm256_storeu_si256(out_u32.as_mut_ptr() as *mut __m256i, mixed);
-        for j in 0..4 {
-            let lo = out_u32[j * 2] as u64;
-            let hi = out_u32[j * 2 + 1] as u64;
-            out[i + j] = (lo << 32) | hi;
-        }
+        // mixed lanes are [k0_lo, k0_hi, k1_lo, k1_hi, ...] in 32-bit slots.
+        // Build u64 as (lo << 32) | hi per key directly in SIMD registers.
+        let lo = _mm256_slli_epi64(mixed, 32);
+        let hi = _mm256_srli_epi64(mixed, 32);
+        let packed = _mm256_or_si256(lo, hi);
+        let out_ptr = out.as_mut_ptr().add(i) as *mut __m256i;
+        _mm256_storeu_si256(out_ptr, packed);
         i += 4;
     }
 

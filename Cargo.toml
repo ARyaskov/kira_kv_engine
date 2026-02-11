@@ -1,9 +1,9 @@
 [package]
 name = "kira_kv_engine"
-version = "0.2.4"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
-description = "KV-storage engine based on minimal perfect hash functions with hybrid indexing (+PGM Index) for Rust"
+description = "KV-storage engine based on minimal perfect hash functions with optional PGM indexing for Rust"
 repository = "https://github.com/ARyaskov/kira_kv_engine"
 homepage = "https://github.com/ARyaskov/kira_kv_engine"
 documentation = "https://docs.rs/kira_kv_engine"
@@ -20,6 +20,7 @@ parallel = ["dep:rayon"]
 pgm = []
 avx512 = ["simd"]
 unsafe_optimizations = []
+bbhash = []
 
 [dependencies]
 thiserror = "1"
@@ -37,7 +38,7 @@ criterion = "0.5"
 
 [profile.release]
 opt-level = 3
-lto = "fat"
+lto = "thin"
 codegen-units = 1
 panic = "abort"
 overflow-checks = false

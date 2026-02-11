@@ -1,4 +1,5 @@
-use kira_kv_engine::hybrid::{HybridBuilder, HybridConfig};
+use kira_kv_engine::BackendKind;
+use kira_kv_engine::index::{IndexBuilder, IndexConfig};
 
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
@@ -7,12 +8,13 @@ use std::collections::HashSet;
 use std::thread;
 use std::time::Instant;
 
-const N_KEYS: usize = 1_000_000;
+const N_KEYS: usize = 1_000_0000;
 const GEN_SEED: u64 = 42;
 const QUERY_SEED: u64 = 1337;
 const MISSING_POOL_FRACTION: f64 = 0.01;
 const QUERY_OPS: usize = 50_000;
 const USE_PARALLEL: bool = true;
+const BUILD_FAST_PROFILE: bool = true;
 
 #[derive(Clone)]
 struct QueryBytes {
@@ -31,12 +33,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("n = {} keys", N_KEYS);
     println!("{}", "=".repeat(60));
 
-    run_hybrid_bench()?;
+    run_index_bench()?;
 
     Ok(())
 }
 
-fn run_hybrid_bench() -> Result<(), Box<dyn std::error::Error>> {
+fn run_index_bench() -> Result<(), Box<dyn std::error::Error>> {
     print_table_header();
 
     let mixed_keys = gen_mixed_keys(N_KEYS, GEN_SEED ^ 0x6666_6666_6666_6666);
@@ -46,15 +48,6 @@ fn run_hybrid_bench() -> Result<(), Box<dyn std::error::Error>> {
     for k in &mixed_keys {
         key_set.insert(k.clone());
     }
-
-    let t_build = Instant::now();
-    let hybrid = HybridBuilder::new()
-        .with_config(HybridConfig::default())
-        .build_index(mixed_keys.clone())?;
-    let build_s = t_build.elapsed().as_secs_f64();
-
-    let stats = hybrid.stats();
-    let bytes_per_key = stats.total_memory as f64 / N_KEYS as f64;
 
     let positive_queries =
         make_positive_queries_bytes(&mixed_keys[..QUERY_OPS.min(mixed_keys.len())]);
@@ -66,32 +59,60 @@ fn run_hybrid_bench() -> Result<(), Box<dyn std::error::Error>> {
 
     let zipf_queries = make_zipfian_queries_bytes(&mixed_keys, QUERY_OPS, &mut rng);
 
-    run_lookup_bytes_hybrid(
-        "Hybrid",
-        "positive",
-        &hybrid,
-        build_s,
-        bytes_per_key,
-        positive_queries,
-    );
+    let backends = [
+        (BackendKind::PtrHash2025, "PtrHash25Default"),
+        (BackendKind::PTHash, "PTHash"),
+        (BackendKind::PtrHash2025, "PtrHash25"),
+        (BackendKind::CHD, "CHD"),
+        (BackendKind::RecSplit, "RecSplit"),
+    ];
 
-    run_lookup_bytes_hybrid(
-        "Hybrid",
-        "negative",
-        &hybrid,
-        build_s,
-        bytes_per_key,
-        negative_queries,
-    );
+    for (backend_kind, backend_name) in backends {
+        let mut cfg = IndexConfig::default();
+        cfg.auto_detect_numeric = false;
+        cfg.backend = backend_kind;
+        cfg.hot_fraction = 0.15;
+        cfg.hot_backend = BackendKind::CHD;
+        cfg.cold_backend = BackendKind::RecSplit;
+        cfg.enable_parallel_build = true;
+        cfg.build_fast_profile = BUILD_FAST_PROFILE;
 
-    run_lookup_bytes_hybrid(
-        "Hybrid",
-        "zipf",
-        &hybrid,
-        build_s,
-        bytes_per_key,
-        zipf_queries,
-    );
+        let t_build = Instant::now();
+        let index = IndexBuilder::new()
+            .with_config(cfg)
+            .build_index(mixed_keys.clone())?;
+        let build_s = t_build.elapsed().as_secs_f64();
+
+        let stats = index.stats();
+        let bytes_per_key = stats.total_memory as f64 / N_KEYS as f64;
+
+        run_lookup_bytes_index(
+            backend_name,
+            "positive",
+            &index,
+            build_s,
+            bytes_per_key,
+            positive_queries.clone(),
+        );
+
+        run_lookup_bytes_index(
+            backend_name,
+            "negative",
+            &index,
+            build_s,
+            bytes_per_key,
+            negative_queries.clone(),
+        );
+
+        run_lookup_bytes_index(
+            backend_name,
+            "zipf",
+            &index,
+            build_s,
+            bytes_per_key,
+            zipf_queries.clone(),
+        );
+    }
 
     Ok(())
 }
@@ -116,7 +137,7 @@ fn print_table_header() {
 fn run_lookup_bytes_mph(
     structure: &str,
     workload: &str,
-    mph: &kira_kv_engine::hybrid::HybridIndex,
+    mph: &kira_kv_engine::index::Index,
     build_s: f64,
     bytes_per_key: f64,
     mut queries: Vec<QueryBytes>,
@@ -158,7 +179,7 @@ fn run_lookup_bytes_mph(
 fn run_lookup_u64(
     structure: &str,
     workload: &str,
-    pgm: &kira_kv_engine::hybrid::HybridIndex,
+    pgm: &kira_kv_engine::index::Index,
     build_s: f64,
     bytes_per_key: f64,
     mut queries: Vec<QueryU64>,
@@ -209,10 +230,10 @@ fn run_lookup_u64(
     );
 }
 
-fn run_lookup_bytes_hybrid(
+fn run_lookup_bytes_index(
     structure: &str,
     workload: &str,
-    hybrid: &kira_kv_engine::hybrid::HybridIndex,
+    index: &kira_kv_engine::index::Index,
     build_s: f64,
     bytes_per_key: f64,
     mut queries: Vec<QueryBytes>,
@@ -220,7 +241,7 @@ fn run_lookup_bytes_hybrid(
     let (hits, misses) = count_hits_bytes(&queries);
     let mut rng = StdRng::seed_from_u64(QUERY_SEED ^ 0xaaaa_aaaa_aaaa_aaaa);
 
-    let (cold_s, cold_acc) = measure_bytes_queries_batch(&mut queries, &mut rng, false, hybrid);
+    let (cold_s, cold_acc) = measure_bytes_queries_batch(&mut queries, &mut rng, false, index);
     std::hint::black_box(cold_acc);
     print_row(
         structure,
@@ -235,7 +256,7 @@ fn run_lookup_bytes_hybrid(
         bytes_per_key,
     );
 
-    let (warm_s, warm_acc) = measure_bytes_queries_batch(&mut queries, &mut rng, true, hybrid);
+    let (warm_s, warm_acc) = measure_bytes_queries_batch(&mut queries, &mut rng, true, index);
     std::hint::black_box(warm_acc);
     print_row(
         structure,
@@ -320,7 +341,7 @@ fn measure_bytes_queries_batch(
     queries: &mut [QueryBytes],
     rng: &mut StdRng,
     warm: bool,
-    index: &kira_kv_engine::hybrid::HybridIndex,
+    index: &kira_kv_engine::index::Index,
 ) -> (f64, u64) {
     if warm {
         queries.shuffle(rng);
@@ -344,7 +365,7 @@ fn measure_bytes_queries_batch(
     (elapsed, acc)
 }
 
-fn batch_lookup(index: &kira_kv_engine::hybrid::HybridIndex, queries: &[QueryBytes]) -> u64 {
+fn batch_lookup(index: &kira_kv_engine::index::Index, queries: &[QueryBytes]) -> u64 {
     let refs: Vec<&[u8]> = queries.iter().map(|q| q.key.as_slice()).collect();
     let mut acc = 0u64;
     for opt in index.lookup_batch(&refs) {
@@ -355,10 +376,7 @@ fn batch_lookup(index: &kira_kv_engine::hybrid::HybridIndex, queries: &[QueryByt
     acc
 }
 
-fn parallel_batch_lookup(
-    index: &kira_kv_engine::hybrid::HybridIndex,
-    queries: &[QueryBytes],
-) -> u64 {
+fn parallel_batch_lookup(index: &kira_kv_engine::index::Index, queries: &[QueryBytes]) -> u64 {
     let threads = thread_count();
     let per = (queries.len() + threads - 1) / threads;
     let mut accs = Vec::new();

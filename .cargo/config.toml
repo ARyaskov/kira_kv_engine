@@ -22,3 +22,8 @@ rustflags = [
     "-C", "opt-level=3",
     "-C", "link-args=-Wl,--gc-sections",
 ]
+
+[target.aarch64-apple-darwin]
+rustflags = [
+    "-C", "target-cpu=native"
+]

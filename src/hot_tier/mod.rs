@@ -1,4 +1,4 @@
-use crate::bdz::{Builder as MphBuilder, Mphf};
+use crate::ptrhash::{Builder as MphBuilder, Mphf};
 use crate::xor_filter::Xor8;
 
 #[derive(Debug)]
@@ -13,7 +13,7 @@ impl HotTierIndex {
     pub fn build_from_u64(
         keys: &[u64],
         indices: &[u32],
-        mph_config: &crate::bdz::BuildConfig,
+        mph_config: &crate::ptrhash::BuildConfig,
     ) -> Option<Self> {
         if keys.is_empty() {
             return None;
