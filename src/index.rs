@@ -248,7 +248,7 @@ impl Index {
             }
             Engine::Mph(engine) => {
                 let canonical = canonical_hash_key(key, engine.prehash_seed);
-                engine.xor.contains_u64(canonical)
+                engine.xor.contains_hash(canonical)
             }
         }
     }
@@ -277,7 +277,7 @@ impl Index {
                 .iter()
                 .map(|&key| {
                     let canonical = canonical_hash_key(key, engine.prehash_seed);
-                    engine.xor.contains_u64(canonical)
+                    engine.xor.contains_hash(canonical)
                 })
                 .collect(),
         }
@@ -571,14 +571,14 @@ impl Index {
 
     fn lookup_mph(&self, engine: &MphEngine, key: &[u8]) -> Result<usize, IndexError> {
         let canonical = canonical_hash_key(key, engine.prehash_seed);
-        if !engine.xor.contains_u64(canonical) {
+        if !engine.xor.contains_hash(canonical) {
             return Err(IndexError::KeyNotFound);
         }
         let idx = engine
             .backend
             .lookup(canonical)
             .ok_or(IndexError::KeyNotFound)? as usize;
-        let fp = fingerprint16(hash_u64_det(canonical));
+        let fp = fingerprint16_mph(canonical);
         // SAFETY: mph index is in [0..n), fingerprints.len() == n
         let ok = unsafe { *engine.fingerprints.get_unchecked(idx) == fp };
         if ok {
@@ -653,7 +653,7 @@ fn run_build_pipeline(
     )
     .ok_or(IndexError::CorruptData)?;
 
-    let xor = build_xor_u64(&canonical)?;
+    let xor = build_xor_prehashed(&canonical)?;
     let backend_cfg = make_backend_cfg(config);
     let backend = build_dispatch(&canonical, &backend_cfg);
     let fingerprints = build_fingerprints_hashed(&backend, &canonical).into_boxed_slice();
@@ -750,14 +750,7 @@ fn select_affinity_cores() -> Option<Vec<usize>> {
 
 #[inline(always)]
 fn canonical_hash_key(key: &[u8], seed: u64) -> u64 {
-    if key.len() == 8 {
-        let mut arr = [0u8; 8];
-        arr.copy_from_slice(key);
-        let v = u64::from_le_bytes(arr);
-        crate::simd_hash::hash_u64_one(v, seed)
-    } else {
-        wyhash::wyhash(key, seed)
-    }
+    crate::canonical_hash::canonical_hash_bytes(key, seed)
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -909,25 +902,36 @@ where
     let mut bytes = Vec::with_capacity(total_bytes);
     let mut offsets = Vec::with_capacity(keys.len() + 1);
     offsets.push(0u32);
-    let mut buckets: HashMap<u64, Vec<usize>> = HashMap::with_capacity(keys.len() * 2);
+    let mut hashes_with_idx = Vec::with_capacity(keys.len());
 
-    for key in keys {
+    for (i, key) in keys.into_iter().enumerate() {
         let k = key.as_ref();
         let h = crate::build_hasher::fast_hash_bytes(k);
-        if let Some(indices) = buckets.get(&h) {
-            for &idx in indices {
-                let start = offsets[idx] as usize;
-                let end = offsets[idx + 1] as usize;
-                if &bytes[start..end] == k {
-                    return Err(MphError::DuplicateKey.into());
-                }
-            }
-        }
-
-        let idx = offsets.len() - 1;
+        hashes_with_idx.push((h, i as u32));
         bytes.extend_from_slice(k);
         offsets.push(bytes.len() as u32);
-        buckets.entry(h).or_default().push(idx);
+    }
+
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        hashes_with_idx.par_sort_unstable_by_key(|&(h, _)| h);
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        hashes_with_idx.sort_unstable_by_key(|&(h, _)| h);
+    }
+
+    for window in hashes_with_idx.windows(2) {
+        if window[0].0 == window[1].0 {
+            let idx1 = window[0].1 as usize;
+            let idx2 = window[1].1 as usize;
+            let k1 = &bytes[(offsets[idx1] as usize)..(offsets[idx1 + 1] as usize)];
+            let k2 = &bytes[(offsets[idx2] as usize)..(offsets[idx2 + 1] as usize)];
+            if k1 == k2 {
+                return Err(IndexError::Mph("DuplicateKey".to_string()));
+            }
+        }
     }
 
     if offsets.len() <= 2 {
@@ -1001,11 +1005,15 @@ fn build_xor_u64(keys: &[u64]) -> Result<Xor8, IndexError> {
     Err(IndexError::CorruptData)
 }
 
+fn build_xor_prehashed(keys: &[u64]) -> Result<Xor8, IndexError> {
+    Xor8::build_from_prehashed(keys).map_err(|_| IndexError::CorruptData)
+}
+
 fn build_fingerprints_hashed(backend: &BackendDispatch, keys: &[u64]) -> Vec<u16> {
     let mut fps = vec![0u16; keys.len()];
     for &k in keys {
         let idx = backend.lookup(k).expect("backend must map training keys") as usize;
-        let fp = fingerprint16(hash_u64_det(k));
+        let fp = fingerprint16_mph(k);
         fps[idx] = fp;
     }
     fps
@@ -1079,6 +1087,11 @@ fn hash_u64_det(key: u64) -> u64 {
 
 fn fingerprint16(hash: u64) -> u16 {
     (hash & 0xFFFF) as u16
+}
+
+#[inline]
+fn fingerprint16_mph(canonical: u64) -> u16 {
+    (canonical & 0xFFFF) as u16
 }
 
 fn splitmix64(mut x: u64) -> u64 {

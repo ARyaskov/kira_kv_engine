@@ -87,7 +87,11 @@ impl CoreMph {
         for (stage, stage_gamma) in gamma_schedule.into_iter().enumerate() {
             let buckets = ((n as f64 / stage_gamma.max(0.5)).ceil() as usize).max(1);
             let stage_rounds = if matches!(cfg.build_profile, BuildProfile::Fast) {
-                max_rounds.min(2 + stage as u32)
+                if matches!(cfg.backend, BackendKind::RecSplit | BackendKind::PTHash) {
+                    0
+                } else {
+                    max_rounds.min(2 + stage as u32)
+                }
             } else {
                 max_rounds
             };
@@ -113,50 +117,16 @@ impl CoreMph {
                 let s2 = mix64(salt ^ 0xA24B_1F6F_DA39_2B31);
                 let s3 = mix64(salt ^ 0xE703_7ED1_A0B4_28DB);
                 crate::simd_hash::hash_u64(keys, s1, &mut h1);
-                crate::simd_hash::hash_u64(keys, s2, &mut h2);
-                crate::simd_hash::hash_u64(keys, s3, &mut h3);
-                for v in &mut h3 {
-                    *v |= 1;
-                }
-
                 for i in 0..n {
-                    bucket_idx[i] = fast_reduce64(h1[i], buckets);
+                    let x = h1[i];
+                    h2[i] = x.rotate_left(23) ^ s2;
+                    h3[i] = (x.rotate_right(19) ^ s3).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+                    bucket_idx[i] = fast_reduce64(x, buckets);
                 }
 
                 counts.fill(0);
-                if cfg.enable_parallel_build && buckets >= 1024 && n >= (1 << 15) {
-                    #[cfg(feature = "parallel")]
-                    {
-                        let shard_count = core_shard_count(cfg, buckets, n);
-                        let chunk = n.div_ceil(shard_count);
-                        let local_counts: Vec<Vec<u32>> = (0..shard_count)
-                            .into_par_iter()
-                            .map(|shard| {
-                                let start = shard * chunk;
-                                let end = (start + chunk).min(n);
-                                let mut local = vec![0u32; buckets];
-                                for i in start..end {
-                                    local[bucket_idx[i]] += 1;
-                                }
-                                local
-                            })
-                            .collect();
-                        for lc in local_counts {
-                            for (i, &v) in lc.iter().enumerate() {
-                                counts[i] += v;
-                            }
-                        }
-                    }
-                    #[cfg(not(feature = "parallel"))]
-                    {
-                        for &b in &bucket_idx {
-                            counts[b] += 1;
-                        }
-                    }
-                } else {
-                    for &b in &bucket_idx {
-                        counts[b] += 1;
-                    }
+                for &b in &bucket_idx {
+                    counts[b] += 1;
                 }
 
                 offsets[0] = 0;
@@ -269,8 +239,8 @@ impl CoreMph {
             return None;
         }
         let h1 = crate::simd_hash::hash_u64_one(key, self.hash_s1);
-        let h2 = crate::simd_hash::hash_u64_one(key, self.hash_s2);
-        let h3 = crate::simd_hash::hash_u64_one(key, self.hash_s3) | 1;
+        let h2 = h1.rotate_left(23) ^ self.hash_s2;
+        let h3 = (h1.rotate_right(19) ^ self.hash_s3).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
         let b = fast_reduce64(h1, self.m as usize);
         let pilot = unsafe { *self.pilots.get_unchecked(b) } as u64;
         let slot = fast_reduce64(
@@ -308,21 +278,16 @@ impl ChdCore {
         let n = keys.len();
         let fast = matches!(cfg.build_profile, BuildProfile::Fast);
         let gamma_schedule = chd_gamma_schedule(fast, gamma);
-        let rounds = if fast {
-            cfg.rehash_limit.min(2).max(1)
-        } else {
-            cfg.rehash_limit.max(1)
-        };
+        let rounds = if fast { 0 } else { cfg.rehash_limit.max(1) };
 
         for (stage, stage_gamma) in gamma_schedule.into_iter().enumerate() {
             let buckets = ((n as f64 / stage_gamma.max(0.55)).ceil() as usize).max(1);
-            let use_sharded = std::env::var_os("KIRA_CHD_SHARDED").is_some();
+            let use_sharded = cfg.enable_parallel_build;
             let shard_count = if use_sharded {
                 chd_shard_count(cfg, buckets, n)
             } else {
                 1
             };
-            let slot_starts = chd_slot_starts(n, shard_count);
 
             let mut h1 = vec![0u64; n];
             let mut h2 = vec![0u64; n];
@@ -345,52 +310,29 @@ impl ChdCore {
                 let s3 = mix64(seed ^ 0xE703_7ED1_A0B4_28DB);
 
                 crate::simd_hash::hash_u64(keys, s1, &mut h1);
-                crate::simd_hash::hash_u64(keys, s2, &mut h2);
-                crate::simd_hash::hash_u64(keys, s3, &mut h3);
                 for i in 0..n {
+                    let hash1 = unsafe { *h1.get_unchecked(i) };
                     unsafe {
-                        *h3.get_unchecked_mut(i) = *h3.get_unchecked(i) | 1;
+                        *h2.get_unchecked_mut(i) = hash1.rotate_left(23) ^ s2;
+                        *h3.get_unchecked_mut(i) =
+                            (hash1.rotate_right(19) ^ s3).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+                        *bucket_idx.get_unchecked_mut(i) = fast_reduce64(hash1, buckets) as u32;
                     }
-                }
-
-                for i in 0..n {
-                    bucket_idx[i] = fast_reduce64(h1[i], buckets) as u32;
                 }
 
                 counts.fill(0);
-                if cfg.enable_parallel_build && buckets >= 1024 && n >= (1 << 15) {
-                    #[cfg(feature = "parallel")]
-                    {
-                        let count_shards = core_shard_count(cfg, buckets, n);
-                        let chunk = n.div_ceil(count_shards);
-                        let local_counts: Vec<Vec<u32>> = (0..count_shards)
-                            .into_par_iter()
-                            .map(|shard| {
-                                let start = shard * chunk;
-                                let end = (start + chunk).min(n);
-                                let mut local = vec![0u32; buckets];
-                                for i in start..end {
-                                    local[unsafe { *bucket_idx.get_unchecked(i) as usize }] += 1;
-                                }
-                                local
-                            })
-                            .collect();
-                        for lc in local_counts {
-                            for (i, &v) in lc.iter().enumerate() {
-                                counts[i] += v;
-                            }
-                        }
-                    }
-                    #[cfg(not(feature = "parallel"))]
-                    {
-                        for &b in &bucket_idx {
-                            counts[b as usize] += 1;
-                        }
-                    }
-                } else {
-                    for &b in &bucket_idx {
-                        counts[b as usize] += 1;
-                    }
+                for &b in &bucket_idx {
+                    counts[b as usize] += 1;
+                }
+
+                let mut shard_sizes = vec![0u32; shard_count];
+                for b in 0..buckets {
+                    let sid = (b * shard_count) / buckets;
+                    shard_sizes[sid.min(shard_count - 1)] += counts[b];
+                }
+                let mut slot_starts = vec![0u32; shard_count + 1];
+                for sid in 0..shard_count {
+                    slot_starts[sid + 1] = slot_starts[sid] + shard_sizes[sid];
                 }
 
                 offsets[0] = 0;
@@ -549,8 +491,8 @@ impl ChdCore {
             return None;
         }
         let h1 = crate::simd_hash::hash_u64_one(key, self.hash_s1);
-        let h2 = crate::simd_hash::hash_u64_one(key, self.hash_s2);
-        let h3 = crate::simd_hash::hash_u64_one(key, self.hash_s3) | 1;
+        let h2 = h1.rotate_left(23) ^ self.hash_s2;
+        let h3 = (h1.rotate_right(19) ^ self.hash_s3).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
         let b = fast_reduce64(h1, self.m as usize);
         let shard_count = self.slot_starts.len() - 1;
         let sid = (b * shard_count) / (self.m as usize);
@@ -603,7 +545,6 @@ fn solve_chd_shard(
     let mut tmp = vec![0u32; 32];
     let mut failed = 0usize;
     let mut out = Vec::with_capacity(shard_order.len());
-
     for &b_u32 in shard_order {
         let b = b_u32 as usize;
         let start = unsafe { *offsets.get_unchecked(b) as usize };
@@ -628,6 +569,15 @@ fn solve_chd_shard(
                 ^ (shard_id as u64).wrapping_mul(0xA24B_1F6F_DA39_2B31),
         );
 
+        // Pre-mix h23 once per bucket; hot loop only pays for XOR + fast_reduce64.
+        let mut premix = [0u64; 32];
+        for i in 0..len {
+            let idx = unsafe { *items.get_unchecked(start + i) as usize };
+            let h2v = unsafe { *h2.get_unchecked(idx) };
+            let h3v = unsafe { *h3.get_unchecked(idx) };
+            premix[i] = mix64(h2v ^ h3v.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        }
+
         for attempt in 0..cap {
             epoch = epoch.wrapping_add(1);
             if epoch == 0 {
@@ -636,16 +586,11 @@ fn solve_chd_shard(
             }
             let disp = (disp_state as u32).wrapping_add(attempt.wrapping_mul(0x9E37_79B9));
             disp_state = xorshift64(disp_state ^ 0xBF58_476D_1CE4_E5B9);
+            let disp_mix = (disp as u64).wrapping_mul(0xA24B_1F6F_DA39_2B31);
 
             let mut valid = true;
             for i in 0..len {
-                let idx = unsafe { *items.get_unchecked(start + i) as usize };
-                let slot = chd_slot(
-                    unsafe { *h2.get_unchecked(idx) },
-                    unsafe { *h3.get_unchecked(idx) },
-                    disp,
-                    slot_len,
-                );
+                let slot = chd_slot_ultra(premix[i], disp_mix, slot_len);
                 if occupied_test(&occupied, slot)
                     || unsafe { *seen_epoch.get_unchecked(slot) } == epoch
                 {
@@ -721,6 +666,14 @@ fn solve_chd_global(
         let mut placed = false;
         let mut disp_state = mix64(seed ^ (b as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
 
+        let mut premix = [0u64; 32];
+        for i in 0..len {
+            let idx = unsafe { *items.get_unchecked(start + i) as usize };
+            let h2v = unsafe { *h2.get_unchecked(idx) };
+            let h3v = unsafe { *h3.get_unchecked(idx) };
+            premix[i] = mix64(h2v ^ h3v.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        }
+
         for attempt in 0..cap {
             epoch = epoch.wrapping_add(1);
             if epoch == 0 {
@@ -729,16 +682,11 @@ fn solve_chd_global(
             }
             let disp = (disp_state as u32).wrapping_add(attempt.wrapping_mul(0x9E37_79B9));
             disp_state = xorshift64(disp_state ^ 0xBF58_476D_1CE4_E5B9);
+            let disp_mix = (disp as u64).wrapping_mul(0xA24B_1F6F_DA39_2B31);
 
             let mut valid = true;
             for i in 0..len {
-                let idx = unsafe { *items.get_unchecked(start + i) as usize };
-                let slot = chd_slot(
-                    unsafe { *h2.get_unchecked(idx) },
-                    unsafe { *h3.get_unchecked(idx) },
-                    disp,
-                    n,
-                );
+                let slot = chd_slot_ultra(premix[i], disp_mix, n);
                 if occupied_test(&occupied, slot)
                     || unsafe { *seen_epoch.get_unchecked(slot) } == epoch
                 {
@@ -777,9 +725,27 @@ pub struct PTHashBackend {
 
 impl MphBackend for PTHashBackend {
     fn build(keys: &[u64], config: &BuildConfig) -> Self {
-        let gamma = config.gamma.max(1.0);
-        let core = CoreMph::build(keys, config, gamma, config.max_pilot_attempts)
-            .or_else(|| CoreMph::build(keys, config, 0.8, config.max_pilot_attempts * 2))
+        let fast = matches!(config.build_profile, BuildProfile::Fast);
+        let mut tuned = config.clone();
+        if fast {
+            tuned.rehash_limit = tuned.rehash_limit.min(1);
+            tuned.fast_fail_rounds = tuned.fast_fail_rounds.min(1);
+        }
+
+        let gamma = if fast {
+            config.gamma.min(1.0).max(0.9)
+        } else {
+            config.gamma.max(1.0)
+        };
+        let budget = if fast {
+            (config.max_pilot_attempts / 2).max(4_096)
+        } else {
+            config.max_pilot_attempts
+        };
+
+        let core = CoreMph::build(keys, &tuned, gamma, budget)
+            .or_else(|| CoreMph::build(keys, &tuned, 0.9, config.max_pilot_attempts))
+            .or_else(|| CoreMph::build(keys, &tuned, 0.8, config.max_pilot_attempts * 2))
             .map(BackendStorage::Core)
             .unwrap_or_else(|| BackendStorage::Map(build_fallback_map(keys)));
         Self { storage: core }
@@ -858,23 +824,26 @@ impl MphBackend for PtrHash2025Backend {
 
 #[derive(Debug, Clone)]
 pub struct CHDBackend {
-    inner: PTHashBackend,
+    storage: BackendStorage,
 }
 
 impl MphBackend for CHDBackend {
     fn build(keys: &[u64], config: &BuildConfig) -> Self {
-        Self {
-            inner: PTHashBackend::build(keys, config),
-        }
+        let gamma = config.gamma.min(0.62).max(0.56);
+        let core = ChdCore::build(keys, config, gamma, config.max_pilot_attempts)
+            .or_else(|| ChdCore::build(keys, config, 0.54, config.max_pilot_attempts * 2))
+            .map(BackendStorage::Chd)
+            .unwrap_or_else(|| BackendStorage::Map(build_fallback_map(keys)));
+        Self { storage: core }
     }
 
     #[inline]
     fn lookup(&self, key: u64) -> Option<u32> {
-        self.inner.lookup(key)
+        self.storage.lookup(key)
     }
 
     fn memory_usage_bytes(&self) -> usize {
-        self.inner.memory_usage_bytes()
+        self.storage.memory_usage_bytes()
     }
 }
 
@@ -885,11 +854,25 @@ pub struct RecSplitBackend {
 
 impl MphBackend for RecSplitBackend {
     fn build(keys: &[u64], config: &BuildConfig) -> Self {
-        let gamma = (config.gamma * 1.15).max(1.1);
-        let budget = config.max_pilot_attempts / 2;
-        let core = CoreMph::build(keys, config, gamma, budget.max(8_192))
-            .or_else(|| CoreMph::build(keys, config, 1.0, config.max_pilot_attempts))
-            .or_else(|| CoreMph::build(keys, config, 0.8, config.max_pilot_attempts * 2))
+        let fast = matches!(config.build_profile, BuildProfile::Fast);
+        let mut tuned = config.clone();
+        if fast {
+            tuned.rehash_limit = tuned.rehash_limit.min(1);
+            tuned.fast_fail_rounds = tuned.fast_fail_rounds.min(1);
+        }
+        let gamma = if fast {
+            config.gamma.min(1.0).max(0.9)
+        } else {
+            (config.gamma * 1.15).max(1.1)
+        };
+        let budget = if fast {
+            (config.max_pilot_attempts / 2).max(4_096)
+        } else {
+            (config.max_pilot_attempts / 2).max(8_192)
+        };
+        let core = CoreMph::build(keys, &tuned, gamma, budget)
+            .or_else(|| CoreMph::build(keys, &tuned, 1.0, config.max_pilot_attempts))
+            .or_else(|| CoreMph::build(keys, &tuned, 0.85, config.max_pilot_attempts * 2))
             .map(BackendStorage::Core)
             .unwrap_or_else(|| BackendStorage::Map(build_fallback_map(keys)));
         Self { storage: core }
@@ -1022,7 +1005,7 @@ impl BackendDispatch {
             }
             Self::CHD(b) => {
                 out.push(1);
-                write_storage(&b.inner.storage, out);
+                write_storage(&b.storage, out);
             }
             Self::RecSplit(b) => {
                 out.push(2);
@@ -1045,9 +1028,7 @@ impl BackendDispatch {
             }
             1 => {
                 let storage = read_storage(buf, pos)?;
-                Some(Self::CHD(CHDBackend {
-                    inner: PTHashBackend { storage },
-                }))
+                Some(Self::CHD(CHDBackend { storage }))
             }
             2 => {
                 let storage = read_storage(buf, pos)?;
@@ -1343,6 +1324,19 @@ fn chd_slot(h2: u64, h3: u64, disp: u32, n: usize) -> usize {
 }
 
 #[inline]
+fn chd_slot_fast(h23: u64, disp: u32, n: usize) -> usize {
+    fast_reduce64(
+        mix64(h23 ^ (disp as u64).wrapping_mul(0xA24B_1F6F_DA39_2B31)),
+        n,
+    )
+}
+
+#[inline(always)]
+fn chd_slot_ultra(premix: u64, disp_mix: u64, n: usize) -> usize {
+    fast_reduce64(premix ^ disp_mix, n)
+}
+
+#[inline]
 fn mix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
     x ^= x >> 30;
@@ -1403,12 +1397,19 @@ fn chd_shard_count(cfg: &BuildConfig, buckets: usize, n: usize) -> usize {
     #[cfg(feature = "parallel")]
     {
         if let Ok(par) = std::thread::available_parallelism() {
-            let mut s = par.get().min(12).max(1);
-            if matches!(cfg.build_profile, BuildProfile::Balanced) {
-                s = s.min(8);
-            }
-            s = s.min(buckets).min(n).max(1);
-            return s;
+            // Avoid over-sharding: too many tiny shards add heavy scheduling/allocation overhead.
+            // Keep enough shards to load-balance while maintaining larger contiguous slot ranges.
+            let par = par.get().max(1);
+            let target_slots_per_shard = if matches!(cfg.build_profile, BuildProfile::Fast) {
+                16_384usize
+            } else {
+                8_192usize
+            };
+            let by_size = n.div_ceil(target_slots_per_shard).max(1);
+            let by_cpu = (par * 4).max(1);
+            let cap = (par * 8).max(1);
+            let s = by_size.max(by_cpu).min(cap).min(buckets).min(n);
+            return s.max(1);
         }
     }
     1
@@ -1580,12 +1581,5 @@ pub fn prehash_unique_u64_arena(
 
 #[inline(always)]
 fn canonical_hash_bytes(key: &[u8], seed: u64) -> u64 {
-    if key.len() == 8 {
-        let mut arr = [0u8; 8];
-        arr.copy_from_slice(key);
-        let v = u64::from_le_bytes(arr);
-        crate::simd_hash::hash_u64_one(v, seed)
-    } else {
-        wyhash::wyhash(key, seed)
-    }
+    crate::canonical_hash::canonical_hash_bytes(key, seed)
 }

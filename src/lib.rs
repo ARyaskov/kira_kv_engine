@@ -5,6 +5,7 @@
 //! - Robust: if a build attempt finds a cycle, we rehash with another salt.
 
 mod build_hasher;
+mod canonical_hash;
 mod cpu;
 mod hot_tier;
 pub mod index;

@@ -294,12 +294,11 @@ fn try_build_ptrhash(keys: &[Vec<u8>], n: usize, salt: u64, gamma: f64) -> Resul
         }
     }
 
-    let mut order: Vec<u32> = (0..buckets as u32).collect();
-    order.sort_unstable_by(|&a, &b| {
-        let da = offsets[a as usize + 1] - offsets[a as usize];
-        let db = offsets[b as usize + 1] - offsets[b as usize];
-        db.cmp(&da)
-    });
+    let mut counts_usize = vec![0usize; buckets];
+    for b in 0..buckets {
+        counts_usize[b] = offsets[b + 1] - offsets[b];
+    }
+    let order = build_bucket_order_by_counts_usize(&counts_usize);
 
     let entries = assign_pilots_single_domain(&order, &offsets, &items, &hashes, salt, n)?;
     let mut pilots = vec![0u32; buckets];
@@ -395,12 +394,11 @@ fn try_build_ptrhash_sharded(
         }
     }
 
-    let mut order: Vec<u32> = (0..buckets as u32).collect();
-    order.sort_unstable_by(|&a, &b| {
-        let da = offsets[a as usize + 1] - offsets[a as usize];
-        let db = offsets[b as usize + 1] - offsets[b as usize];
-        db.cmp(&da)
-    });
+    let mut counts_usize = vec![0usize; buckets];
+    for b in 0..buckets {
+        counts_usize[b] = offsets[b + 1] - offsets[b];
+    }
+    let order = build_bucket_order_by_counts_usize(&counts_usize);
 
     let mut buckets_by_shard = vec![Vec::<u32>::new(); shard_count];
     let mut keys_per_shard = vec![0usize; shard_count];
