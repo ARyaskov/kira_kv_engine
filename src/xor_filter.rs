@@ -7,6 +7,10 @@ pub struct Xor8 {
 }
 
 impl Xor8 {
+    pub fn build_from_prehashed(hashes: &[u64]) -> Result<Self, ()> {
+        Self::build_from_hashes(hashes, 0)
+    }
+
     pub fn build_from_bytes(keys: &[Vec<u8>], seed: u64) -> Result<Self, ()> {
         let mut hashes = Vec::with_capacity(keys.len());
         for k in keys {

@@ -11,7 +11,8 @@ pub struct CpuFeatures {
     pub has_neon: bool,
 }
 
-use crate::bdz::BuildConfig;
+use crate::BackendKind;
+use crate::ptrhash::BuildConfig;
 #[cfg(target_arch = "aarch64")]
 use std::arch::is_aarch64_feature_detected;
 
@@ -77,20 +78,25 @@ impl CpuFeatures {
     }
 
     pub fn optimal_config(&self) -> BuildConfig {
-        let has_wide_simd = self.has_avx2 || self.has_neon;
         BuildConfig {
-            gamma: if has_wide_simd { 1.25 } else { 1.27 },
-            rehash_limit: 16,
+            gamma: 1.20,
+            rehash_limit: 10,
             salt: 0xC0FF_EE00_D15E_A5E,
         }
     }
 
-    pub fn optimal_hybrid_config(&self) -> crate::HybridConfig {
+    pub fn optimal_index_config(&self) -> crate::IndexConfig {
         let has_wide_simd = self.has_avx2 || self.has_neon;
-        crate::HybridConfig {
+        crate::IndexConfig {
             mph_config: self.optimal_config(),
             pgm_epsilon: if has_wide_simd { 32 } else { 64 },
             auto_detect_numeric: true,
+            backend: BackendKind::PtrHash2025,
+            hot_fraction: 0.15,
+            hot_backend: BackendKind::CHD,
+            cold_backend: BackendKind::RecSplit,
+            enable_parallel_build: has_wide_simd,
+            build_fast_profile: true,
         }
     }
 }
