@@ -5,7 +5,16 @@ use std::hash::BuildHasherDefault;
 use thiserror::Error;
 
 /// Minimal perfect hash using PtrHash-style pilot assignment.
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(
+        Serialize,
+        Deserialize,
+        rkyv::Archive,
+        rkyv::Serialize,
+        rkyv::Deserialize
+    )
+)]
 #[derive(Debug, Clone)]
 pub struct Mphf {
     pub n: u64,
@@ -68,13 +77,16 @@ impl Mphf {
     #[cfg(feature = "serde")]
     #[allow(dead_code)]
     pub fn to_bytes(&self) -> Result<Vec<u8>, MphError> {
-        Ok(bincode::serialize(self)?)
+        let bytes = rkyv::to_bytes::<_, 1024>(self).map_err(|e| MphError::Serde(e.to_string()))?;
+        Ok(bytes.to_vec())
     }
 
     #[cfg(feature = "serde")]
     #[allow(dead_code)]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, MphError> {
-        Ok(bincode::deserialize(bytes)?)
+        let archived = unsafe { rkyv::archived_root::<Self>(bytes) };
+        rkyv::Deserialize::deserialize(archived, &mut rkyv::Infallible)
+            .map_err(|e| MphError::Serde(e.to_string()))
     }
 }
 
@@ -99,7 +111,7 @@ pub enum MphError {
     Unresolvable,
     #[cfg(feature = "serde")]
     #[error("serialization error: {0}")]
-    Serde(#[from] Box<bincode::ErrorKind>),
+    Serde(String),
 }
 
 pub struct Builder {
@@ -587,9 +599,8 @@ fn hash_keys(keys: &[Vec<u8>], salt: u64) -> Vec<KeyHash> {
         let s = salt ^ 0xD6E8_FD9B_D6E8_FD9B;
         let mut words = vec![0u64; keys.len()];
         for (i, key) in keys.iter().enumerate() {
-            let mut arr = [0u8; 8];
-            arr.copy_from_slice(key);
-            words[i] = u64::from_le_bytes(arr);
+            let v = unsafe { std::ptr::read_unaligned(key.as_ptr() as *const u64) };
+            words[i] = u64::from_le(v);
         }
         let mut base = vec![0u64; keys.len()];
         crate::simd_hash::hash_u64(&words, s, &mut base);
@@ -650,13 +661,12 @@ fn hash_u64_keys(keys: &[u64], salt: u64) -> Vec<KeyHash> {
 fn hash_u64_arrays(keys: &[u64], salt: u64, buckets: usize) -> (Vec<u64>, Vec<u64>, Vec<u32>) {
     let n = keys.len();
     let s = salt ^ 0xD6E8_FD9B_D6E8_FD9B;
-    let mut base = vec![0u64; n];
-    crate::simd_hash::hash_u64(keys, s, &mut base);
     let mut h2 = vec![0u64; n];
+    crate::simd_hash::hash_u64(keys, s, &mut h2);
     let mut h3 = vec![0u64; n];
     let mut bucket_idx = vec![0u32; n];
     for i in 0..n {
-        let (h1, h2v, h3v) = derive_hash_triple(unsafe { *base.get_unchecked(i) });
+        let (h1, h2v, h3v) = derive_hash_triple(unsafe { *h2.get_unchecked(i) });
         unsafe {
             *h2.get_unchecked_mut(i) = h2v;
             *h3.get_unchecked_mut(i) = h3v;
@@ -730,9 +740,8 @@ fn build_bucket_order_by_counts_usize(counts: &[usize]) -> Vec<u32> {
 #[inline]
 fn hash_key(key: &[u8], salt: u64) -> KeyHash {
     let base = if key.len() == 8 {
-        let mut arr = [0u8; 8];
-        arr.copy_from_slice(key);
-        let word = u64::from_le_bytes(arr);
+        let word = unsafe { std::ptr::read_unaligned(key.as_ptr() as *const u64) };
+        let word = u64::from_le(word);
         crate::simd_hash::hash_u64_one(word, salt ^ 0xD6E8_FD9B_D6E8_FD9B)
     } else {
         wyhash::wyhash(key, salt ^ 0xA076_1D64_78BD_642F)
@@ -1139,16 +1148,11 @@ fn build_shard_count(buckets: usize, n: usize) -> usize {
         } else if cfg!(target_arch = "x86_64") {
             // On hybrid x86 (like i7-12700), memory-bound build tends to scale
             // better with a subset of cores than with all SMT threads.
-            if let Ok(threads) = std::thread::available_parallelism() {
-                let t = threads.get();
-                shards = (t / 2).clamp(4, 8);
-            } else {
-                shards = 8;
-            }
+            let t = rayon::current_num_threads();
+            shards = (t / 2).clamp(4, 8);
         }
-        if let Ok(threads) = std::thread::available_parallelism() {
-            shards = shards.min(threads.get()).min(MAX_BUILD_SHARDS).max(1);
-        }
+        let threads = rayon::current_num_threads();
+        shards = shards.min(threads).min(MAX_BUILD_SHARDS).max(1);
     }
     shards.min(buckets).min(n).max(1)
 }

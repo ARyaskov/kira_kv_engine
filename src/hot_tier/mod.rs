@@ -18,11 +18,10 @@ impl HotTierIndex {
         if keys.is_empty() {
             return None;
         }
-        let bytes: Vec<Vec<u8>> = keys.iter().map(|k| k.to_le_bytes().to_vec()).collect();
         let xor = Xor8::build_from_u64(keys, 0xC1B5_4A32_D192_ED03).ok()?;
         let mph = MphBuilder::new()
             .with_config(mph_config.clone())
-            .build(bytes.iter().map(|k| k.as_slice()))
+            .build_unique_u64_ref(keys)
             .ok()?;
         let fingerprints = build_fingerprints_u64(&mph, keys).into_boxed_slice();
         let indices = indices.to_vec().into_boxed_slice();
@@ -40,7 +39,7 @@ impl HotTierIndex {
         if !self.xor.contains_hash(hash) {
             return None;
         }
-        let idx = self.mph.index(&key.to_le_bytes()) as usize;
+        let idx = self.mph.index_u64(key) as usize;
         let fp = fingerprint16(hash);
         if unsafe { *self.fingerprints.get_unchecked(idx) == fp } {
             Some(unsafe { *self.indices.get_unchecked(idx) })
@@ -92,7 +91,7 @@ impl HotTierIndex {
 fn build_fingerprints_u64(mph: &Mphf, keys: &[u64]) -> Vec<u16> {
     let mut fps = vec![0u16; keys.len()];
     for &key in keys {
-        let idx = mph.index(&key.to_le_bytes()) as usize;
+        let idx = mph.index_u64(key) as usize;
         let fp = fingerprint16(hash_u64(key));
         fps[idx] = fp;
     }

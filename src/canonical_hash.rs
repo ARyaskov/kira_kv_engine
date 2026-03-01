@@ -42,9 +42,9 @@ fn canonical_hash_small(key: &[u8], seed: u64) -> u64 {
 
 #[inline(always)]
 fn load_u64_le(key: &[u8], offset: usize) -> u64 {
-    let mut arr = [0u8; 8];
-    arr.copy_from_slice(&key[offset..offset + 8]);
-    u64::from_le_bytes(arr)
+    // Bounds are guaranteed by callers based on key length checks.
+    let v = unsafe { std::ptr::read_unaligned(key.as_ptr().add(offset) as *const u64) };
+    u64::from_le(v)
 }
 
 #[inline(always)]

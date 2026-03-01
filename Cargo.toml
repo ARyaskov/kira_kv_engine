@@ -1,6 +1,6 @@
 [package]
 name = "kira_kv_engine"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 license = "MIT"
 description = "KV-storage engine based on minimal perfect hash functions with optional PGM indexing for Rust"
@@ -14,7 +14,7 @@ categories = ["data-structures", "database"]
 
 [features]
 default = ["serde", "simd", "parallel", "pgm"]
-serde = ["dep:serde", "dep:bincode"]
+serde = ["dep:serde", "dep:rkyv"]
 simd = []
 parallel = ["dep:rayon", "dep:core_affinity"]
 pgm = []
@@ -23,18 +23,14 @@ unsafe_optimizations = []
 bbhash = []
 
 [dependencies]
-thiserror = "1"
+thiserror = "2"
 serde = { version = "1", features = ["derive"], optional = true }
-bincode = { version = "1", optional = true }
-rayon = { version = "1.8", optional = true }
+rkyv = { version = "0.7", features = ["validation"], optional = true }
+rayon = { version = "1.11", optional = true }
 core_affinity = { version = "0.8", optional = true }
 wyhash = { version = "0.6"}
-hashbrown = "0.14"
-rand = "0.8"
-
-[dev-dependencies]
-rand = "0.8"
-criterion = "0.5"
+hashbrown = "0.16"
+rand = "0.8.5"
 
 
 [profile.release]
