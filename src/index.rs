@@ -607,7 +607,7 @@ impl Index {
             .segment_for_key(key)
             .ok_or(IndexError::KeyNotFound)?;
         let remap_id = remap_id_from_index(&engine.pgm, seg_id, global_idx);
-        let idx = engine.mph.index(&remap_id.to_le_bytes()) as usize;
+        let idx = engine.mph.index_u64(remap_id) as usize;
         let fp = fingerprint16(hash_u64_det(remap_id));
         // SAFETY: mph index is in [0..n), fingerprints.len() == n
         let ok = unsafe { *engine.fingerprints.get_unchecked(idx) == fp };
@@ -1022,7 +1022,7 @@ fn build_fingerprints_hashed(backend: &BackendDispatch, keys: &[u64]) -> Vec<u16
 fn build_fingerprints_u64(mph: &Mphf, keys: &[u64]) -> Vec<u16> {
     let mut fps = vec![0u16; keys.len()];
     for &key in keys {
-        let idx = mph.index(&key.to_le_bytes()) as usize;
+        let idx = mph.index_u64(key) as usize;
         let fp = fingerprint16(hash_u64_det(key));
         fps[idx] = fp;
     }

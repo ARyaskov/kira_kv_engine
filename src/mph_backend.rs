@@ -280,6 +280,18 @@ impl ChdCore {
         let gamma_schedule = chd_gamma_schedule(fast, gamma);
         let rounds = if fast { 0 } else { cfg.rehash_limit.max(1) };
 
+        let mut h1 = vec![0u64; n];
+        let mut h2 = vec![0u64; n];
+        let mut h3 = vec![0u64; n];
+        let mut bucket_idx = vec![0u32; n];
+        let mut items = vec![0u32; n];
+        let mut counts: Vec<u32> = Vec::new();
+        let mut offsets: Vec<u32> = Vec::new();
+        let mut cur: Vec<u32> = Vec::new();
+        let mut shard_sizes: Vec<u32> = Vec::new();
+        let mut slot_starts: Vec<u32> = Vec::new();
+        let mut shard_orders: Vec<Vec<u32>> = Vec::new();
+
         for (stage, stage_gamma) in gamma_schedule.into_iter().enumerate() {
             let buckets = ((n as f64 / stage_gamma.max(0.55)).ceil() as usize).max(1);
             let use_sharded = cfg.enable_parallel_build;
@@ -288,15 +300,14 @@ impl ChdCore {
             } else {
                 1
             };
-
-            let mut h1 = vec![0u64; n];
-            let mut h2 = vec![0u64; n];
-            let mut h3 = vec![0u64; n];
-            let mut bucket_idx = vec![0u32; n];
-            let mut counts = vec![0u32; buckets];
-            let mut offsets = vec![0u32; buckets + 1];
-            let mut cur = vec![0u32; buckets + 1];
-            let mut items = vec![0u32; n];
+            counts.resize(buckets, 0);
+            offsets.resize(buckets + 1, 0);
+            cur.resize(buckets + 1, 0);
+            shard_sizes.resize(shard_count, 0);
+            slot_starts.resize(shard_count + 1, 0);
+            if shard_orders.len() != shard_count {
+                shard_orders = (0..shard_count).map(|_| Vec::<u32>::new()).collect();
+            }
 
             for round in 0..=rounds {
                 let seed = mix64(
@@ -325,12 +336,12 @@ impl ChdCore {
                     counts[b as usize] += 1;
                 }
 
-                let mut shard_sizes = vec![0u32; shard_count];
+                shard_sizes.fill(0);
                 for b in 0..buckets {
                     let sid = (b * shard_count) / buckets;
                     shard_sizes[sid.min(shard_count - 1)] += counts[b];
                 }
-                let mut slot_starts = vec![0u32; shard_count + 1];
+                slot_starts.fill(0);
                 for sid in 0..shard_count {
                     slot_starts[sid + 1] = slot_starts[sid] + shard_sizes[sid];
                 }
@@ -349,7 +360,9 @@ impl ChdCore {
 
                 let order = build_bucket_order_by_count(&counts);
                 if shard_count > 1 {
-                    let mut shard_orders = vec![Vec::<u32>::new(); shard_count];
+                    for bucket_order in &mut shard_orders {
+                        bucket_order.clear();
+                    }
                     for &b in &order {
                         let sid = ((b as usize) * shard_count) / buckets;
                         shard_orders[sid.min(shard_count - 1)].push(b);
@@ -543,6 +556,7 @@ fn solve_chd_shard(
     let mut seen_epoch = vec![0u32; slot_len];
     let mut epoch = 1u32;
     let mut tmp = vec![0u32; 32];
+    let mut premix = vec![0u64; 32];
     let mut failed = 0usize;
     let mut out = Vec::with_capacity(shard_order.len());
     for &b_u32 in shard_order {
@@ -557,6 +571,9 @@ fn solve_chd_shard(
         if tmp.len() < len {
             tmp.resize(len, 0);
         }
+        if premix.len() < len {
+            premix.resize(len, 0);
+        }
         let mut cap =
             chd_attempt_cap(len, fast).min(attempt_budget.max((len as u32).saturating_mul(8)));
         if cap == 0 {
@@ -570,9 +587,11 @@ fn solve_chd_shard(
         );
 
         // Pre-mix h23 once per bucket; hot loop only pays for XOR + fast_reduce64.
-        let mut premix = [0u64; 32];
         for i in 0..len {
+            prefetch_u32(items, start + i + 4);
             let idx = unsafe { *items.get_unchecked(start + i) as usize };
+            prefetch_u64(h2, idx + 2);
+            prefetch_u64(h3, idx + 2);
             let h2v = unsafe { *h2.get_unchecked(idx) };
             let h3v = unsafe { *h3.get_unchecked(idx) };
             premix[i] = mix64(h2v ^ h3v.wrapping_mul(0x9E37_79B9_7F4A_7C15));
@@ -590,6 +609,7 @@ fn solve_chd_shard(
 
             let mut valid = true;
             for i in 0..len {
+                prefetch_u64(&premix, i + 2);
                 let slot = chd_slot_ultra(premix[i], disp_mix, slot_len);
                 if occupied_test(&occupied, slot)
                     || unsafe { *seen_epoch.get_unchecked(slot) } == epoch
@@ -642,6 +662,7 @@ fn solve_chd_global(
     let mut seen_epoch = vec![0u32; n];
     let mut epoch = 1u32;
     let mut tmp = vec![0u32; 32];
+    let mut premix = vec![0u64; 32];
     let mut disps = vec![0u32; offsets.len().saturating_sub(1)];
     let fail_limit = fast_fail_bucket_limit(profile, disps.len());
     let mut failed = 0usize;
@@ -657,6 +678,9 @@ fn solve_chd_global(
         if tmp.len() < len {
             tmp.resize(len, 0);
         }
+        if premix.len() < len {
+            premix.resize(len, 0);
+        }
         let mut cap =
             chd_attempt_cap(len, fast).min(attempt_budget.max((len as u32).saturating_mul(8)));
         if cap == 0 {
@@ -666,9 +690,11 @@ fn solve_chd_global(
         let mut placed = false;
         let mut disp_state = mix64(seed ^ (b as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
 
-        let mut premix = [0u64; 32];
         for i in 0..len {
+            prefetch_u32(items, start + i + 4);
             let idx = unsafe { *items.get_unchecked(start + i) as usize };
+            prefetch_u64(h2, idx + 2);
+            prefetch_u64(h3, idx + 2);
             let h2v = unsafe { *h2.get_unchecked(idx) };
             let h3v = unsafe { *h3.get_unchecked(idx) };
             premix[i] = mix64(h2v ^ h3v.wrapping_mul(0x9E37_79B9_7F4A_7C15));
@@ -686,6 +712,7 @@ fn solve_chd_global(
 
             let mut valid = true;
             for i in 0..len {
+                prefetch_u64(&premix, i + 2);
                 let slot = chd_slot_ultra(premix[i], disp_mix, n);
                 if occupied_test(&occupied, slot)
                     || unsafe { *seen_epoch.get_unchecked(slot) } == epoch
@@ -1396,18 +1423,20 @@ fn chd_shard_count(cfg: &BuildConfig, buckets: usize, n: usize) -> usize {
     }
     #[cfg(feature = "parallel")]
     {
-        if let Ok(par) = std::thread::available_parallelism() {
-            // Avoid over-sharding: too many tiny shards add heavy scheduling/allocation overhead.
-            // Keep enough shards to load-balance while maintaining larger contiguous slot ranges.
-            let par = par.get().max(1);
+        // Prefer the active rayon pool size to avoid oversharding when build runs
+        // inside a bounded pool (for example, Index::run_build_pipeline_with_pool).
+        let par = rayon::current_num_threads().max(1);
+        if par > 0 {
+            // Keep shards coarse enough to reduce scheduling/allocation overhead
+            // on x86_64 memory-bound builds while still balancing work.
             let target_slots_per_shard = if matches!(cfg.build_profile, BuildProfile::Fast) {
-                16_384usize
+                65_536usize
             } else {
-                8_192usize
+                49_152usize
             };
             let by_size = n.div_ceil(target_slots_per_shard).max(1);
-            let by_cpu = (par * 4).max(1);
-            let cap = (par * 8).max(1);
+            let by_cpu = par;
+            let cap = (par * 2).max(1);
             let s = by_size.max(by_cpu).min(cap).min(buckets).min(n);
             return s.max(1);
         }
@@ -1486,6 +1515,32 @@ fn occupied_test(bits: &[u64], idx: usize) -> bool {
 fn occupied_set(bits: &mut [u64], idx: usize) {
     let word = unsafe { bits.get_unchecked_mut(idx >> 6) };
     *word |= 1u64 << (idx & 63);
+}
+
+#[inline]
+fn prefetch_u32(slice: &[u32], idx: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if idx < slice.len() {
+            unsafe {
+                use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+                _mm_prefetch(slice.as_ptr().add(idx) as *const i8, _MM_HINT_T0);
+            }
+        }
+    }
+}
+
+#[inline]
+fn prefetch_u64(slice: &[u64], idx: usize) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if idx < slice.len() {
+            unsafe {
+                use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+                _mm_prefetch(slice.as_ptr().add(idx) as *const i8, _MM_HINT_T0);
+            }
+        }
+    }
 }
 
 #[inline]

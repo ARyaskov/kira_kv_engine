@@ -7,7 +7,16 @@ use std::hash::BuildHasherDefault;
 use thiserror::Error;
 
 /// Complete MPH structure: stores size, number of buckets, salt and displacement vector per bucket.
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(
+        Serialize,
+        Deserialize,
+        rkyv::Archive,
+        rkyv::Serialize,
+        rkyv::Deserialize
+    )
+)]
 #[derive(Debug, Clone)]
 pub struct Mphf {
     pub n: u64,
@@ -33,12 +42,15 @@ impl Mphf {
 
     #[cfg(feature = "serde")]
     pub fn to_bytes(&self) -> Result<Vec<u8>, MphError> {
-        Ok(bincode::serialize(self)?)
+        let bytes = rkyv::to_bytes::<_, 1024>(self).map_err(|e| MphError::Serde(e.to_string()))?;
+        Ok(bytes.to_vec())
     }
 
     #[cfg(feature = "serde")]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, MphError> {
-        Ok(bincode::deserialize(bytes)?)
+        let archived = unsafe { rkyv::archived_root::<Self>(bytes) };
+        rkyv::Deserialize::deserialize(archived, &mut rkyv::Infallible)
+            .map_err(|e| MphError::Serde(e.to_string()))
     }
 }
 
@@ -74,7 +86,7 @@ pub enum MphError {
     Unresolvable,
     #[cfg(feature = "serde")]
     #[error("serialization error: {0}")]
-    Serde(#[from] Box<bincode::ErrorKind>),
+    Serde(String),
 }
 
 pub struct Builder {

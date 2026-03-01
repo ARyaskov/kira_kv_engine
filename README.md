@@ -12,7 +12,7 @@
 
 ```toml
 [dependencies]
-kira_kv_engine = ">=0.3"
+kira_kv_engine = ">=0.3.2"
 ```
 
 ## Quick Start

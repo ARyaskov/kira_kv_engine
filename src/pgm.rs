@@ -24,7 +24,16 @@ struct SegmentBuild {
 }
 
 #[repr(align(64))]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(
+        Serialize,
+        Deserialize,
+        rkyv::Archive,
+        rkyv::Serialize,
+        rkyv::Deserialize
+    )
+)]
 #[derive(Debug, Clone)]
 struct SegmentsSoA {
     slopes: Vec<f64>,
@@ -38,7 +47,16 @@ struct SegmentsSoA {
 }
 
 /// PGM Index for sorted integer keys with O(1) average lookup
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(
+    feature = "serde",
+    derive(
+        Serialize,
+        Deserialize,
+        rkyv::Archive,
+        rkyv::Serialize,
+        rkyv::Deserialize
+    )
+)]
 #[derive(Debug, Clone)]
 pub struct PgmIndex {
     /// Sorted keys
@@ -61,7 +79,7 @@ pub enum PgmError {
     CorruptData,
     #[cfg(feature = "serde")]
     #[error("serialization error: {0}")]
-    Serde(#[from] Box<bincode::ErrorKind>),
+    Serde(String),
 }
 
 impl PgmIndex {
@@ -311,13 +329,16 @@ impl PgmIndex {
     #[cfg(feature = "serde")]
     #[allow(dead_code)]
     pub fn to_bytes(&self) -> Result<Vec<u8>, PgmError> {
-        Ok(bincode::serialize(self)?)
+        let bytes = rkyv::to_bytes::<_, 1024>(self).map_err(|e| PgmError::Serde(e.to_string()))?;
+        Ok(bytes.to_vec())
     }
 
     #[cfg(feature = "serde")]
     #[allow(dead_code)]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, PgmError> {
-        Ok(bincode::deserialize(bytes)?)
+        let archived = unsafe { rkyv::archived_root::<Self>(bytes) };
+        rkyv::Deserialize::deserialize(archived, &mut rkyv::Infallible)
+            .map_err(|e| PgmError::Serde(e.to_string()))
     }
 
     pub(crate) fn write_to(&self, out: &mut Vec<u8>) {
