@@ -1,3 +1,7 @@
+// This bench keeps a number of helpers around for u64-key variants and string generators
+// that the active code paths don't currently call. They're left as-is so the file remains a
+// useful reference for ad-hoc experiments.
+#![allow(dead_code, unused_imports)]
 use kira_kv_engine::BackendKind;
 use kira_kv_engine::index::{IndexBuilder, IndexConfig};
 
@@ -10,14 +14,17 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
-const N_KEYS: usize = 1_000_000;
+const N_KEYS: usize = 10_000_000;
 const GEN_SEED: u64 = 42;
 const QUERY_SEED: u64 = 1337;
 const MISSING_POOL_FRACTION: f64 = 0.01;
-const QUERY_OPS: usize = 50_000;
+// Scaled with N so per-thread work amortizes thread overhead on Windows (where pthread/scope
+// startup is ~30-100 μs vs ~5-10 μs on macOS). 1M ops × 20 threads = 50k per thread ≈ 1.5 ms
+// of work per thread — enough to drown out spawn cost.
+const QUERY_OPS: usize = 1_000_000;
 const USE_PARALLEL: bool = true;
 const BUILD_FAST_PROFILE: bool = true;
-const DEFAULT_BENCH_RUNS: usize = 7;
+const DEFAULT_BENCH_RUNS: usize = 2;
 
 #[derive(Clone)]
 struct QueryBytes {
@@ -84,26 +91,15 @@ fn run_index_bench(settings: &BenchSettings) -> Result<(), Box<dyn std::error::E
 
     let zipf_queries = make_zipfian_queries_bytes(&mixed_keys, QUERY_OPS, &mut rng);
 
-    #[cfg(feature = "bbhash")]
-    let mut backends = vec![
-        (BackendKind::PtrHash2025, "PtrHash25Default"),
-        (BackendKind::PTHash, "PTHash"),
-        (BackendKind::PtrHash2025, "PtrHash25"),
-        (BackendKind::CHD, "CHD"),
-        (BackendKind::RecSplit, "RecSplit"),
-    ];
-    #[cfg(not(feature = "bbhash"))]
+    // Only one MPH backend exists in v0.5+ (PtrHash25). Loop preserved so the bench
+    // shape stays familiar — future backends would be added here as additional entries.
+    // (kind, name, lean): lean=true skips Bloom + fingerprints for ~50% memory win.
     let backends = vec![
-        (BackendKind::PtrHash2025, "PtrHash25Default"),
-        (BackendKind::PTHash, "PTHash"),
-        (BackendKind::PtrHash2025, "PtrHash25"),
-        (BackendKind::CHD, "CHD"),
-        (BackendKind::RecSplit, "RecSplit"),
+        (BackendKind::PtrHash25, "PtrHash25", false),
+        (BackendKind::PtrHash25, "PtrHash25-lean", true),
     ];
-    #[cfg(feature = "bbhash")]
-    backends.push((BackendKind::BBHash, "BBHash"));
 
-    for (backend_kind, backend_name) in backends {
+    for (backend_kind, backend_name, lean) in backends {
         let mut build_samples = Vec::with_capacity(settings.runs);
         let mut bpk_samples = Vec::with_capacity(settings.runs);
         let mut pos_cold = Vec::with_capacity(settings.runs);
@@ -118,11 +114,9 @@ fn run_index_bench(settings: &BenchSettings) -> Result<(), Box<dyn std::error::E
             cfg.auto_detect_numeric = false;
             cfg.backend = backend_kind;
             cfg.hot_fraction = 0.15;
-            cfg.hot_backend = BackendKind::CHD;
-            cfg.cold_backend = BackendKind::RecSplit;
             cfg.enable_parallel_build = true;
             cfg.build_fast_profile = BUILD_FAST_PROFILE;
-            cfg.mph_config.gamma = 1.2;
+            cfg.lean_mph = lean;
 
             let t_build = Instant::now();
             let index = IndexBuilder::new()
@@ -155,14 +149,7 @@ fn run_index_bench(settings: &BenchSettings) -> Result<(), Box<dyn std::error::E
         }
 
         let build_stats = summarize(&mut build_samples);
-        let build_rate_median = N_KEYS as f64 / build_stats.median;
-        if backend_kind == BackendKind::CHD && build_rate_median < 500_000.0 {
-            eprintln!(
-                "PERFORMANCE REGRESSION: {:.0} keys/s median (< 500k) for {}",
-                build_rate_median, backend_name
-            );
-            std::process::exit(1);
-        }
+        let _build_rate_median = N_KEYS as f64 / build_stats.median;
 
         let bytes_per_key = summarize(&mut bpk_samples).median;
         let (hits_pos, misses_pos) = count_hits_bytes(&positive_queries);
@@ -396,7 +383,10 @@ fn measure_bytes_queries_batch(
 
 fn batch_lookup(index: &kira_kv_engine::index::Index, refs: &[&[u8]]) -> u64 {
     let mut acc = 0u64;
-    for opt in index.lookup_batch(refs) {
+    // Use pipelined path everywhere so single-thread and parallel paths share the
+    // same prefetch wave optimization. lookup_batch falls back internally for tiny
+    // slices.
+    for opt in index.lookup_batch_pipelined(refs) {
         if let Some(idx) = opt {
             acc ^= idx as u64;
         }
@@ -405,39 +395,22 @@ fn batch_lookup(index: &kira_kv_engine::index::Index, refs: &[&[u8]]) -> u64 {
 }
 
 fn parallel_batch_lookup(index: &kira_kv_engine::index::Index, refs: &[&[u8]]) -> u64 {
+    // Use the global rayon pool (created once at process start by `init_rayon_pool`).
+    // Avoids the ~30-100 μs Windows CreateThread cost per measurement.
+    use rayon::prelude::*;
     let threads = thread_count();
     let per = (refs.len() + threads - 1) / threads;
-    let mut accs = Vec::new();
-    let core_ids = Arc::new(configured_core_ids());
-    thread::scope(|s| {
-        let mut handles = Vec::new();
-        for t in 0..threads {
-            let start = t * per;
-            if start >= refs.len() {
-                continue;
-            }
-            let end = (start + per).min(refs.len());
-            let slice = &refs[start..end];
-            let idx_ref = index;
-            let core_ids_cloned = Arc::clone(&core_ids);
-            handles.push(s.spawn(move || {
-                pin_thread_to_core(core_ids_cloned.as_ref(), t);
-                let mut local = 0u64;
-                for opt in idx_ref.lookup_batch(slice) {
-                    if let Some(idx) = opt {
-                        local ^= idx as u64;
-                    }
+    refs.par_chunks(per.max(1))
+        .map(|slice| {
+            let mut local = 0u64;
+            for opt in index.lookup_batch_pipelined(slice) {
+                if let Some(idx) = opt {
+                    local ^= idx as u64;
                 }
-                local
-            }));
-        }
-        for h in handles {
-            if let Ok(v) = h.join() {
-                accs.push(v);
             }
-        }
-    });
-    accs.into_iter().fold(0u64, |a, b| a ^ b)
+            local
+        })
+        .reduce(|| 0u64, |a, b| a ^ b)
 }
 
 fn measure_u64_queries<F>(

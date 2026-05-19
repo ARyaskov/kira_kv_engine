@@ -1,3 +1,6 @@
+// FastBuildHasher is referenced via BuildHasherDefault in ptrhash.rs::Builder::build,
+// which is itself part of the public API but not on the hot bench path.
+#![allow(dead_code)]
 use std::hash::Hasher;
 
 #[derive(Default)]
@@ -19,28 +22,8 @@ impl Hasher for FastBuildHasher {
 
 #[inline]
 pub fn fast_hash_bytes(bytes: &[u8]) -> u64 {
-    let mut h = 0x9E37_79B9_7F4A_7C15u64 ^ (bytes.len() as u64).wrapping_mul(0xA24B_1F6F);
-    let mut i = 0usize;
-    while i + 8 <= bytes.len() {
-        let mut chunk = [0u8; 8];
-        chunk.copy_from_slice(&bytes[i..i + 8]);
-        let v = u64::from_le_bytes(chunk);
-        h ^= splitmix64(v);
-        i += 8;
-    }
-    while i < bytes.len() {
-        h ^= (bytes[i] as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        h = splitmix64(h);
-        i += 1;
-    }
-    splitmix64(h)
-}
-
-#[inline]
-fn splitmix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = x;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
+    // wyhash is well-mixed, branch-light, and on x86_64-v3 vectorizes better than
+    // the splitmix loop it replaced. Same seed across the crate so hashes stay stable
+    // between callers that rely on equal-bytes-equal-hash.
+    wyhash::wyhash(bytes, 0xA076_1D64_78BD_642F)
 }

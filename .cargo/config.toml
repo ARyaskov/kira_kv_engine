@@ -1,2 +1,24 @@
+# x86_64: x86-64-v3 baseline (Haswell, 2013): AVX2 + BMI1/2 + FMA + POPCNT + LZCNT.
+# Safe on every modern desktop/server. Use "avx512" feature + x86-64-v4 for AVX-512 builds.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-cpu=x86-64-v3"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "target-cpu=haswell"]
+
+# Apple Silicon
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "target-cpu=apple-m1"]
+
+# Generic aarch64 Linux/Windows: enable NEON+CRC+AES (ARMv8.0 baseline already has NEON).
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-feature=+neon,+crc,+aes"]
