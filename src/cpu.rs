@@ -12,7 +12,7 @@ pub struct CpuFeatures {
 }
 
 use crate::BackendKind;
-use crate::ptrhash::BuildConfig;
+use crate::ptrhash25::BuildConfig;
 #[cfg(target_arch = "aarch64")]
 use std::arch::is_aarch64_feature_detected;
 
@@ -79,9 +79,11 @@ impl CpuFeatures {
 
     pub fn optimal_config(&self) -> BuildConfig {
         BuildConfig {
-            gamma: 1.20,
-            rehash_limit: 10,
-            salt: 0xC0FF_EE00_D15E_A5E,
+            gamma: 0.5,
+            max_rehash: 16,
+            with_fingerprints: false,
+            seed: 0xC0FF_EE00_D15E_A5E,
+            use_aes_hash: false,
         }
     }
 
@@ -91,12 +93,15 @@ impl CpuFeatures {
             mph_config: self.optimal_config(),
             pgm_epsilon: if has_wide_simd { 32 } else { 64 },
             auto_detect_numeric: true,
-            backend: BackendKind::PtrHash2025,
+            backend: BackendKind::PtrHash25,
             hot_fraction: 0.15,
-            hot_backend: BackendKind::CHD,
-            cold_backend: BackendKind::RecSplit,
-            enable_parallel_build: has_wide_simd,
+            // Parallel build is CPU-bound, not SIMD-bound. Gate only on `parallel` feature.
+            enable_parallel_build: cfg!(feature = "parallel"),
             build_fast_profile: true,
+            pgm_enable_bloom: false,
+            pgm_enable_elias_fano: false,
+            pgm_target_lookup_ns: None,
+            lean_mph: false,
         }
     }
 }

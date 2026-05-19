@@ -2,11 +2,132 @@
 
 ![Crates.io Downloads (recent)](https://img.shields.io/crates/dr/kira_kv_engine)
 
-`kira_kv_engine` builds a static key -> id index for unique keys.
+`kira_kv_engine` is a high-performance key→id index toolkit for Rust.
+**Six engines** under one roof, each tuned for a specific workload shape — static
+MPH (lean & default), dynamic LSM-on-MPH, hybrid byte-key, learned PGM (u64 and
+u128). Edition 2024, Rust 1.95+.
 
-- Default MPH backend: `PtrHash2025` (fast build + fast lookup)
-- Optional numeric mode: `PGM` + MPH remap (`auto_detect_numeric = true`)
-- Stable lookups after build: index in `[0..n)`
+| Engine | Memory | Lookup warm | Insert/Delete | Range | Best for |
+|---|---:|---:|:---:|:---:|---|
+| **PtrHash25-lean** | **0.6 B/key** | **13 ns** | ❌ static | ❌ | Closed-world point lookups (top pick) |
+| **PtrHash25** (default) | 4.5 B/key | 21 ns | ❌ static | ❌ | Open-world point lookups (Bloom-rejected misses) |
+| **DynamicIndex** | ~6 B/key | 25–40 ns | ✅ ~700 ns | ❌ | Mutable byte-key sets (LSM on top of MPH) |
+| **HybridIndex** | 13–16 B/key | 45–60 ns | ❌ static | hash-space | Universal byte keys + batch queries |
+| **PgmIndex** | ~5 B/key | 150–700 ns | ❌ static | ✅ semantic | u64 range queries (timestamps, IDs) |
+| **PgmIndexU128** | ~30 B/key | 80 ns | ❌ static | ✅ semantic | UUID/SHA range queries |
+
+Numbers from 10M-key bench on i7-12700, AVX2 enabled, hugepages off.
+
+---
+
+## Choosing an index
+
+> **The flowchart**: do you need **range queries**? If yes → PgmIndex (u64) or HybridIndex (bytes).
+> Otherwise → PtrHash25 (use `lean_mph` if your queries are always valid keys).
+
+### Decision table
+
+| Question | Yes | No |
+|---|---|---|
+| All queries from the build set? (closed world: dictionary, vocab, deduped IDs) | **PtrHash25-lean** | PtrHash25 |
+| **Need frequent insert/delete?** | **DynamicIndex** (LSM-tree on MPH tiers) | use a static engine |
+| Need `range(min, max)` over byte keys? | HybridIndex (hash-space) | … |
+| Need `range(min, max)` over **u64** with proper ordering? | **PgmIndex** | … |
+| 16-byte keys (UUID, SHA-128, IPv6) + range? | **PgmIndexU128** | use PtrHash25 |
+
+### Use-case recipes
+
+**Bioinformatics: VCF indexer (600M variants, 20K genes, range queries)**
+
+```rust
+use kira_kv_engine::{IndexBuilder, PgmBuilder};
+
+// 600M rsIDs → file offset (closed set after build → lean)
+let rs_index = IndexBuilder::new()
+    .with_lean_mph(true)               // 0.6 B/key, 14 ns warm
+    .build_index(rs_keys)?;
+
+// Variant positions (chrom<<56 | pos) → file offset, with range queries
+let pos_index = PgmBuilder::new()
+    .with_epsilon(64)
+    .with_bloom_filter(true)
+    .build(packed_positions)?;
+
+// 20K gene names → coordinate region (lean, ~12 KB total)
+let gene_index = IndexBuilder::new()
+    .with_lean_mph(true)
+    .build_index(gene_names)?;
+
+// "All variants in chr1:1M-2M" — semantic range over u64 keys.
+let variants_in_region: Vec<usize> = pos_index.range(start, end);
+```
+
+**LLM token vocabulary (closed set, ~100K tokens)**
+
+```rust
+let token_index = IndexBuilder::new()
+    .with_lean_mph(true)        // tokens fixed at training time
+    .build_index(tokens)?;       // ~60 KB, 14 ns lookup
+```
+
+**URL shortener (open world — invalid lookups happen)**
+
+```rust
+let url_index = IndexBuilder::new()
+    // lean_mph=false (default) — returns KeyNotFound for foreign IDs
+    .build_index(short_codes)?;  // 4.5 B/key, 21 ns warm + miss safety
+```
+
+**Real-time analytics with skewed access (Zipfian)**
+
+```rust
+use kira_kv_engine::DynamicHotTier;
+
+let static_index = /* build base index */;
+let dynamic_tier = DynamicHotTier::new(None, 1024 /* hot capacity */, 100_000 /* rebuild every */);
+// Periodically: dynamic_tier.take_top_k() → build new HotTier → dynamic_tier.install()
+```
+
+**Mutable keyset with insert/delete (online dictionary, session table, etc.)**
+
+```rust
+use kira_kv_engine::{DynamicIndex, DynamicConfig};
+
+let mut idx = DynamicIndex::with_config(DynamicConfig {
+    flush_threshold: 64 * 1024,    // batch ~64K inserts before tier-flush
+    max_tiers: 8,                  // compact when >8 tiers accumulate
+    lean_tiers: false,
+    parallel_build: true,
+});
+
+let id_alice = idx.insert(b"alice".to_vec());    // stable u32 id, ~700 ns
+let id_bob   = idx.insert(b"bob".to_vec());
+
+assert_eq!(idx.lookup(b"alice"), Some(id_alice));
+idx.delete(b"alice");
+assert_eq!(idx.lookup(b"alice"), None);
+
+// Explicit compact merges all tiers + buffer into one → restores
+// single-tier lookup latency (~25 ns).
+idx.compact();
+```
+
+Stable IDs **never** change across flush/compact — safe to store as external
+pointers (e.g. file offsets, row indexes).
+
+**General byte/string keys with range queries**
+
+```rust
+use kira_kv_engine::HybridBuilder;
+
+let hybrid = HybridBuilder::new()
+    .with_pgm_epsilon(2048)
+    .with_lean(true)            // 13 B/key
+    .build_from_u64(&u64_keys)?; // SIMD-accelerated build path
+let positions = hybrid.lookup_batch_u64_simd(&query_keys);  // 30-50 ns/key
+```
+
+---
 
 ## Install
 
@@ -24,159 +145,149 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let keys = vec![
         b"user:1".to_vec(),
         b"user:2".to_vec(),
-        42u64.to_le_bytes().to_vec(),
+        b"user:3".to_vec(),
     ];
 
-    // Default backend is PtrHash2025
+    // Default — Bloom + fingerprints, safe for foreign keys.
     let index = IndexBuilder::new().build_index(keys)?;
 
-    let id1 = index.lookup_str("user:1")?;
-    let id2 = index.lookup_u64(42)?;
-
-    println!("{} {}", id1, id2);
+    let id = index.lookup_str("user:1")?;
+    assert_eq!(id, index.lookup(b"user:1")?);
     Ok(())
 }
 ```
 
-## Backends
+## API overview
 
-Selectable via `IndexBuilder::with_backend(...)`:
+All engines are static (built once from a unique key set). Each returns a stable
+`u32`/`usize` id in `[0..n)` (or `[0..1.10·n)` for u8-pilot near-minimal variants).
 
-- `BackendKind::PtrHash2025` (default)
-- `BackendKind::PTHash`
-- `BackendKind::CHD`
-- `BackendKind::RecSplit`
-- `BackendKind::BBHash` (only with `bbhash` feature)
-
-Backends are selected via `BackendKind`; only currently supported variants are available.
-
-## Numeric Auto-Detect (PGM)
-
-If every key is exactly 8 bytes (`u64::to_le_bytes()`), you can enable numeric mode:
+### `IndexBuilder` (PtrHash25 — point lookups, any key type)
 
 ```rust
-use kira_kv_engine::IndexBuilder;
-
-let keys: Vec<Vec<u8>> = (0..100_000u64).map(|v| v.to_le_bytes().to_vec()).collect();
-let index = IndexBuilder::new()
-    .auto_detect_numeric(true)
-    .build_index(keys)?;
-# Ok::<(), Box<dyn std::error::Error>>(())
+IndexBuilder::new()
+    .with_lean_mph(true)               // ★ -87% memory (closed-world only)
+    .with_parallel_build(true)
+    .with_build_fast_profile(true)
+    .build_index(keys)?
 ```
 
-In this mode:
+Lookups: `index.lookup(&[u8])`, `lookup_u64(u64)`, `lookup_batch_pipelined(&[&[u8]])`,
+`lookup_batch_u64_simd(&[u64])`.
 
-- `lookup_u64` is the native path
-- `range(min, max)` returns matching index ids
+### `HybridBuilder` (PGM + per-segment mini-MPH)
 
-## Build/Perf Controls
+```rust
+use kira_kv_engine::HybridBuilder;
 
-`IndexBuilder` supports:
+HybridBuilder::new()
+    .with_pgm_epsilon(2048)
+    .with_lean(true)
+    .with_linear_threshold(64)
+    .build_from_u64(&u64_keys)?        // SIMD-fast path for u64
+    // or .build(&[byte_slices])?
+```
 
-- `.with_parallel_build(bool)`
-- `.with_build_fast_profile(bool)`
-- `.with_mph_config(...)` (`gamma`, `rehash_limit`, `salt`)
-- `.with_backend(...)`
+Lookups: `hybrid.lookup(&[u8])`, `lookup_u64(u64)`, `lookup_batch_u64_simd(&[u64])`,
+`lookup_batch_hashes(&[u64])`.
+
+### `PgmBuilder` (sorted u64 with semantic range queries)
+
+```rust
+use kira_kv_engine::PgmBuilder;
+
+PgmBuilder::new()
+    .with_epsilon(64)
+    .with_bloom_filter(true)           // negative-fast
+    .with_elias_fano(true)             // -40% key memory
+    .with_target_lookup_ns(50)         // auto-tune ε
+    .build(sorted_u64_keys)?
+```
+
+Lookups: `pgm.index(u64)`, `range(min, max)`, `lower_bound`, `upper_bound`.
+
+### `PgmIndexU128` (16-byte keys: UUID/SHA-128/IPv6)
+
+```rust
+use kira_kv_engine::PgmIndexU128;
+
+let idx = PgmIndexU128::build_from_bytes16(&uuids_be, 64)?;
+let pos = idx.index_bytes16(&query_uuid)?;
+let range = idx.range(uuid_a, uuid_b);
+```
 
 ## Serialization
 
 ```rust
+// PtrHash25 (Index): zero-copy mmap or to_bytes/from_bytes
 let bytes = index.to_bytes()?;
 let restored = kira_kv_engine::Index::from_bytes(&bytes)?;
+
+index.save_mmap("path.bin")?;
+let restored = kira_kv_engine::Index::open_mmap("path.bin")?;
+
+// PgmIndex
+let bytes = pgm.to_bytes()?;
+let restored = kira_kv_engine::PgmIndex::from_bytes(&bytes)?;
 ```
 
 ## Benchmarks
 
-Run:
-
 ```bash
-cargo run --release --example million_build
-cargo run --release --example ptrhash_bench
+cargo run --release --example million_build   # PtrHash25 + lean comparison
+cargo run --release --example pgm_bench       # PGM + HybridIndex variants
 ```
 
-The benchmark outputs include:
+### 10M keys on i7-12700 (Alder Lake, AVX2, no hugepages)
 
-- build time / build rate
-- cold & warm lookup latency
-- hit/miss ratios
-- memory usage (bytes per key)
+**`million_build` (mixed byte keys: 40% numeric + 40% random strings + 20% shared-prefix)**
 
-### Benchmark Tables (MacBook Air 2020, M1, 8GB RAM)
+| Variant | Build ms | B/key | Warm ns | Cold ns | Throughput |
+|---|---:|---:|---:|---:|---:|
+| **PtrHash25-lean** ⭐ | **3884** | **0.59** | **13.49** | 15.44 | **74 M/s** |
+| PtrHash25 (default) | 6184 | 4.46 | 21.24 | 19.05 | 47 M/s |
 
-#### Dataset: 1,000,000 keys (`runs=7`, `threads=8`, `core_ids=0..7`)
+PtrHash25-lean approaches paper-PTHash 2025 memory (~4.7 bits/key vs ~2.6 bits/key in
+the paper) while being 1.4× faster than default and 1.6× faster to build.
 
-| Struct | Workload | Cache | Runs | Build m (ms) | Build p95 (ms) | Rate m (keys/s) | Lookup m (ns) | Lookup p95 (ns) | Thr m (ops/s) | Hit % | Miss % | B/key |
-|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| PtrHash25Default | positive | cold | 7 | 867.45 | 920.04 | 1,152,798 | 26.79 | 32.08 | 37,327,361 | 100.0 | 0.0 | 15.23 |
-| PtrHash25Default | positive | warm | 7 | 867.45 | 920.04 | 1,152,798 | 18.76 | 24.21 | 53,309,621 | 100.0 | 0.0 | 15.23 |
-| PtrHash25Default | negative | cold | 7 | 867.45 | 920.04 | 1,152,798 | 23.75 | 28.51 | 42,099,343 | 70.0 | 30.0 | 15.23 |
-| PtrHash25Default | negative | warm | 7 | 867.45 | 920.04 | 1,152,798 | 14.34 | 26.08 | 69,751,253 | 70.0 | 30.0 | 15.23 |
-| PtrHash25Default | zipf | cold | 7 | 867.45 | 920.04 | 1,152,798 | 26.25 | 29.69 | 38,097,676 | 100.0 | 0.0 | 15.23 |
-| PtrHash25Default | zipf | warm | 7 | 867.45 | 920.04 | 1,152,798 | 17.87 | 27.67 | 55,954,449 | 100.0 | 0.0 | 15.23 |
-| PTHash | positive | cold | 7 | 1,256.36 | 1,289.27 | 795,952 | 32.23 | 37.44 | 31,030,190 | 100.0 | 0.0 | 15.23 |
-| PTHash | positive | warm | 7 | 1,256.36 | 1,289.27 | 795,952 | 24.42 | 26.86 | 40,947,224 | 100.0 | 0.0 | 15.23 |
-| PTHash | negative | cold | 7 | 1,256.36 | 1,289.27 | 795,952 | 27.26 | 30.25 | 36,688,254 | 70.0 | 30.0 | 15.23 |
-| PTHash | negative | warm | 7 | 1,256.36 | 1,289.27 | 795,952 | 15.42 | 23.28 | 64,840,331 | 70.0 | 30.0 | 15.23 |
-| PTHash | zipf | cold | 7 | 1,256.36 | 1,289.27 | 795,952 | 25.98 | 31.07 | 38,497,341 | 100.0 | 0.0 | 15.23 |
-| PTHash | zipf | warm | 7 | 1,256.36 | 1,289.27 | 795,952 | 17.72 | 26.01 | 56,446,724 | 100.0 | 0.0 | 15.23 |
-| PtrHash25 | positive | cold | 7 | 843.30 | 849.89 | 1,185,818 | 26.39 | 30.97 | 37,900,322 | 100.0 | 0.0 | 15.23 |
-| PtrHash25 | positive | warm | 7 | 843.30 | 849.89 | 1,185,818 | 18.05 | 24.33 | 55,388,897 | 100.0 | 0.0 | 15.23 |
-| PtrHash25 | negative | cold | 7 | 843.30 | 849.89 | 1,185,818 | 23.05 | 25.54 | 43,379,243 | 70.0 | 30.0 | 15.23 |
-| PtrHash25 | negative | warm | 7 | 843.30 | 849.89 | 1,185,818 | 16.69 | 20.46 | 59,916,117 | 70.0 | 30.0 | 15.23 |
-| PtrHash25 | zipf | cold | 7 | 843.30 | 849.89 | 1,185,818 | 27.43 | 32.84 | 36,454,228 | 100.0 | 0.0 | 15.23 |
-| PtrHash25 | zipf | warm | 7 | 843.30 | 849.89 | 1,185,818 | 18.92 | 23.39 | 52,847,140 | 100.0 | 0.0 | 15.23 |
-| CHD | positive | cold | 7 | 888.05 | 914.11 | 1,126,065 | 27.59 | 44.54 | 36,242,809 | 100.0 | 0.0 | 15.23 |
-| CHD | positive | warm | 7 | 888.05 | 914.11 | 1,126,065 | 18.01 | 36.15 | 55,534,946 | 100.0 | 0.0 | 15.23 |
-| CHD | negative | cold | 7 | 888.05 | 914.11 | 1,126,065 | 24.49 | 32.87 | 40,828,825 | 70.0 | 30.0 | 15.23 |
-| CHD | negative | warm | 7 | 888.05 | 914.11 | 1,126,065 | 15.07 | 19.49 | 66,345,994 | 70.0 | 30.0 | 15.23 |
-| CHD | zipf | cold | 7 | 888.05 | 914.11 | 1,126,065 | 25.94 | 30.87 | 38,548,034 | 100.0 | 0.0 | 15.23 |
-| CHD | zipf | warm | 7 | 888.05 | 914.11 | 1,126,065 | 18.49 | 30.85 | 54,078,375 | 100.0 | 0.0 | 15.23 |
-| RecSplit | positive | cold | 7 | 1,238.34 | 1,281.61 | 807,536 | 27.21 | 35.35 | 36,744,442 | 100.0 | 0.0 | 15.23 |
-| RecSplit | positive | warm | 7 | 1,238.34 | 1,281.61 | 807,536 | 17.66 | 25.53 | 56,609,114 | 100.0 | 0.0 | 15.23 |
-| RecSplit | negative | cold | 7 | 1,238.34 | 1,281.61 | 807,536 | 22.86 | 27.86 | 43,750,924 | 70.0 | 30.0 | 15.23 |
-| RecSplit | negative | warm | 7 | 1,238.34 | 1,281.61 | 807,536 | 15.02 | 18.50 | 66,592,704 | 70.0 | 30.0 | 15.23 |
-| RecSplit | zipf | cold | 7 | 1,238.34 | 1,281.61 | 807,536 | 25.37 | 30.41 | 39,412,750 | 100.0 | 0.0 | 15.23 |
-| RecSplit | zipf | warm | 7 | 1,238.34 | 1,281.61 | 807,536 | 18.41 | 24.00 | 54,310,930 | 100.0 | 0.0 | 15.23 |
+**`pgm_bench` (1M u64 keys, 60% clustered + 30% uniform + 10% sequential)**
 
-#### Dataset: 10,000,000 keys (`runs=7`, `threads=8`, `core_ids=0..7`)
+| Variant | Build ms | B/key | Warm ns | Mix ns |
+|---|---:|---:|---:|---:|
+| Hybrid ε=2048 (u64-build + SIMD batch) | 18300 | 16.32 | **46** | **34** |
+| Hybrid ε=8192 lean (u64+SIMD) | 19900 | 13.12 | 52 | 42 |
+| PGM baseline | 6850 | 27.72 | 947 | 632 |
+| PGM + Bloom | 5010 | 29.40 | 1010 | 648 |
 
-| Struct | Workload | Cache | Runs | Build m (ms) | Build p95 (ms) | Rate m (keys/s) | Lookup m (ns) | Lookup p95 (ns) | Thr m (ops/s) | Hit % | Miss % | B/key |
-|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| PtrHash25Default | positive | cold | 7 | 15,325.54 | 15,999.80 | 652,505 | 98.64 | 128.74 | 10,137,618 | 100.0 | 0.0 | 15.23 |
-| PtrHash25Default | positive | warm | 7 | 15,325.54 | 15,999.80 | 652,505 | 35.40 | 69.97 | 28,247,917 | 100.0 | 0.0 | 15.23 |
-| PtrHash25Default | negative | cold | 7 | 15,325.54 | 15,999.80 | 652,505 | 37.16 | 72.44 | 26,913,670 | 70.0 | 30.0 | 15.23 |
-| PtrHash25Default | negative | warm | 7 | 15,325.54 | 15,999.80 | 652,505 | 29.24 | 68.77 | 34,198,744 | 70.0 | 30.0 | 15.23 |
-| PtrHash25Default | zipf | cold | 7 | 15,325.54 | 15,999.80 | 652,505 | 40.27 | 97.88 | 24,833,923 | 100.0 | 0.0 | 15.23 |
-| PtrHash25Default | zipf | warm | 7 | 15,325.54 | 15,999.80 | 652,505 | 37.98 | 58.30 | 26,329,647 | 100.0 | 0.0 | 15.23 |
-| PTHash | positive | cold | 7 | 23,693.30 | 25,045.76 | 422,060 | 127.64 | 222.49 | 7,834,790 | 100.0 | 0.0 | 15.23 |
-| PTHash | positive | warm | 7 | 23,693.30 | 25,045.76 | 422,060 | 39.00 | 62.08 | 25,638,843 | 100.0 | 0.0 | 15.23 |
-| PTHash | negative | cold | 7 | 23,693.30 | 25,045.76 | 422,060 | 42.25 | 54.97 | 23,670,970 | 70.0 | 30.0 | 15.23 |
-| PTHash | negative | warm | 7 | 23,693.30 | 25,045.76 | 422,060 | 29.82 | 47.36 | 33,532,674 | 70.0 | 30.0 | 15.23 |
-| PTHash | zipf | cold | 7 | 23,693.30 | 25,045.76 | 422,060 | 50.53 | 58.00 | 19,790,545 | 100.0 | 0.0 | 15.23 |
-| PTHash | zipf | warm | 7 | 23,693.30 | 25,045.76 | 422,060 | 37.04 | 48.11 | 26,999,663 | 100.0 | 0.0 | 15.23 |
-| PtrHash25 | positive | cold | 7 | 15,320.16 | 17,225.71 | 652,735 | 105.16 | 307.64 | 9,509,695 | 100.0 | 0.0 | 15.23 |
-| PtrHash25 | positive | warm | 7 | 15,320.16 | 17,225.71 | 652,735 | 38.07 | 55.99 | 26,264,518 | 100.0 | 0.0 | 15.23 |
-| PtrHash25 | negative | cold | 7 | 15,320.16 | 17,225.71 | 652,735 | 36.87 | 43.74 | 27,119,865 | 70.0 | 30.0 | 15.23 |
-| PtrHash25 | negative | warm | 7 | 15,320.16 | 17,225.71 | 652,735 | 32.78 | 60.40 | 30,504,080 | 70.0 | 30.0 | 15.23 |
-| PtrHash25 | zipf | cold | 7 | 15,320.16 | 17,225.71 | 652,735 | 47.87 | 78.33 | 20,889,544 | 100.0 | 0.0 | 15.23 |
-| PtrHash25 | zipf | warm | 7 | 15,320.16 | 17,225.71 | 652,735 | 43.70 | 91.16 | 22,880,677 | 100.0 | 0.0 | 15.23 |
-| CHD | positive | cold | 7 | 16,287.62 | 16,898.75 | 613,963 | 94.35 | 289.34 | 10,598,648 | 100.0 | 0.0 | 15.23 |
-| CHD | positive | warm | 7 | 16,287.62 | 16,898.75 | 613,963 | 39.77 | 50.59 | 25,143,532 | 100.0 | 0.0 | 15.23 |
-| CHD | negative | cold | 7 | 16,287.62 | 16,898.75 | 613,963 | 36.62 | 45.91 | 27,303,754 | 70.0 | 30.0 | 15.23 |
-| CHD | negative | warm | 7 | 16,287.62 | 16,898.75 | 613,963 | 31.16 | 47.01 | 32,087,277 | 70.0 | 30.0 | 15.23 |
-| CHD | zipf | cold | 7 | 16,287.62 | 16,898.75 | 613,963 | 46.71 | 61.58 | 21,407,161 | 100.0 | 0.0 | 15.23 |
-| CHD | zipf | warm | 7 | 16,287.62 | 16,898.75 | 613,963 | 35.94 | 46.37 | 27,827,388 | 100.0 | 0.0 | 15.23 |
-| RecSplit | positive | cold | 7 | 23,565.25 | 24,363.35 | 424,354 | 137.81 | 303.90 | 7,256,499 | 100.0 | 0.0 | 15.23 |
-| RecSplit | positive | warm | 7 | 23,565.25 | 24,363.35 | 424,354 | 43.79 | 49.96 | 22,837,568 | 100.0 | 0.0 | 15.23 |
-| RecSplit | negative | cold | 7 | 23,565.25 | 24,363.35 | 424,354 | 36.48 | 46.12 | 27,414,791 | 70.0 | 30.0 | 15.23 |
-| RecSplit | negative | warm | 7 | 23,565.25 | 24,363.35 | 424,354 | 29.55 | 38.72 | 33,835,222 | 70.0 | 30.0 | 15.23 |
-| RecSplit | zipf | cold | 7 | 23,565.25 | 24,363.35 | 424,354 | 42.32 | 70.12 | 23,629,490 | 100.0 | 0.0 | 15.23 |
-| RecSplit | zipf | warm | 7 | 23,565.25 | 24,363.35 | 424,354 | 38.86 | 47.13 | 25,731,747 | 100.0 | 0.0 | 15.23 |
+## Performance tuning checklist
+
+1. **Closed key set?** Enable `lean_mph(true)` → -87% memory, +10% speed.
+2. **Hugepages on Linux/Windows?** -10–20 ns per lookup at 100M scale. See
+   [Hugepages section](#hugepages-windows-linux) below.
+3. **Read-heavy after build?** Use `save_mmap`/`open_mmap` — ~50 ms load vs
+   ~5 s deserialize on 100M index.
+4. **Batched lookups?** Use `lookup_batch_pipelined` (Mph) or
+   `lookup_batch_u64_simd` (Hybrid) — 3-stream cache prefetch ladder.
+5. **u64 keys to Hybrid?** Use `build_from_u64()` instead of `build()` — SIMD
+   hash path.
+
+## Hugepages (Windows / Linux)
+
+On Linux: `echo always > /sys/kernel/mm/transparent_hugepage/enabled` or use
+`madvise(MADV_HUGEPAGE)` (the engine does this automatically when supported).
+
+On Windows you need explicit privilege:
+1. `Win+R` → `secpol.msc`
+2. *Local Policies* → *User Rights Assignment* → *Lock pages in memory*
+3. Add your user (or `BUILTIN\Administrators`)
+4. **Log out and log back in** — only new sessions inherit the privilege
+
+The engine prints a guidance message at startup if hugepages are unavailable.
 
 ## Notes
 
-- Input keys must be unique.
-- Indexes are static (rebuild on keyset change).
+- Input keys must be **unique**.
+- Indexes are static — modifications require a rebuild.
 - Public API reference: `API.md`.
 
 ## License

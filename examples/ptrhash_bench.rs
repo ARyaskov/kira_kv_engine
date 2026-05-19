@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use kira_kv_engine::BackendKind;
 use kira_kv_engine::index::{IndexBuilder, IndexConfig};
 use rand::rngs::StdRng;
@@ -62,21 +63,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("backend,build_ms,keys_per_sec,bits_per_key,pos_warm_ns,neg_warm_ns,zipf_warm_ns");
 
-    let backends = [
-        BackendKind::PtrHash2025,
-        BackendKind::PTHash,
-        BackendKind::PtrHash2025,
-        BackendKind::CHD,
-        BackendKind::RecSplit,
-    ];
+    let backends = [BackendKind::PtrHash25];
 
     for backend in backends {
         let cfg = IndexConfig {
             auto_detect_numeric: false,
             backend,
             hot_fraction: 0.15,
-            hot_backend: BackendKind::CHD,
-            cold_backend: BackendKind::RecSplit,
             enable_parallel_build: true,
             build_fast_profile: true,
             ..IndexConfig::default()
