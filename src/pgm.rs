@@ -1530,16 +1530,25 @@ impl PgmBuilder {
         self
     }
 
+    /// Build a PGM index over `keys`. Empty input is permitted and yields an
+    /// always-miss instance.
     pub fn build(self, keys: Vec<u64>) -> Result<PgmIndex, PgmError> {
         let mut sorted = keys;
-        if sorted.is_empty() {
-            return Err(PgmError::EmptyKeys);
-        }
         sorted.sort_unstable();
         for w in sorted.windows(2) {
             if w[0] >= w[1] {
                 return Err(PgmError::UnsortedKeys);
             }
+        }
+
+        if sorted.is_empty() {
+            return Ok(PgmIndex {
+                keys: Vec::new(),
+                keys_ef: None,
+                segments: SegmentsSoA::default(),
+                epsilon: self.epsilon,
+                bloom: None,
+            });
         }
 
         let epsilon = match self.target_lookup_ns {

@@ -350,6 +350,13 @@ pub struct PtrHash25Mphf {
 }
 
 impl PtrHash25Mphf {
+    /// Slot-space size. `lookup_u64` returns values in `[0..slot_capacity())`;
+    /// this is `~1.1 * n_input_keys` (over-provisioning by `1/gamma`).
+    #[inline(always)]
+    pub fn slot_capacity(&self) -> usize {
+        self.n as usize
+    }
+
     /// O(1) lookup. Caller must check fingerprint separately for negative-query safety.
     #[inline(always)]
     pub fn index_u64(&self, key: u64) -> u32 {
