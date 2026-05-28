@@ -34,8 +34,11 @@ struct MphEngine {
 
 /// Static MPH-backed key→id index. For semantic range queries on u64 keys
 /// use `PgmBuilder` directly; for byte-key range queries use `HybridBuilder`.
+///
+/// Empty indexes are valid: all lookups return `KeyNotFound`, batch APIs
+/// return all-`None`. Wire tag `3` is reserved for the empty marker.
 pub struct Index {
-    engine: MphEngine,
+    engine: Option<MphEngine>,
     key_count: usize,
 }
 
@@ -179,12 +182,9 @@ impl Index {
         K: AsRef<[u8]>,
     {
         if keys.is_empty() {
-            return Err(IndexError::InvalidKey);
+            return Ok(Self::empty());
         }
 
-        // In lean MPH mode we also disable the inner PtrHash25 fingerprints —
-        // they would otherwise add another 8 bits/key that the engine isn't
-        // checking against anyway.
         let mut config = config;
         if config.lean_mph {
             config.mph_config.with_fingerprints = false;
@@ -197,14 +197,30 @@ impl Index {
             run_build_pipeline_with_pool(&arena, &config)?;
 
         Ok(Index {
-            engine: MphEngine {
-                backend,
-                prehash_seed,
-                filter,
-                fingerprints,
-            },
+            engine: Some(MphEngine { backend, prehash_seed, filter, fingerprints }),
             key_count,
         })
+    }
+
+    #[inline]
+    pub fn empty() -> Self {
+        Self { engine: None, key_count: 0 }
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.key_count == 0
+    }
+
+    /// Upper bound on `lookup`'s return value. For non-empty indexes this is
+    /// `~1.1 * len()` (PtrHash25 over-provisions by `1/gamma`); zero for empty.
+    /// Side arrays indexed by `lookup` results must be sized to this, not `len()`.
+    #[inline]
+    pub fn slot_capacity(&self) -> usize {
+        match &self.engine {
+            Some(engine) => engine.backend.slot_capacity(),
+            None => 0,
+        }
     }
 
     #[inline(always)]
@@ -223,7 +239,10 @@ impl Index {
     }
 
     pub fn lookup(&self, key: &[u8]) -> Result<usize, IndexError> {
-        self.lookup_mph(&self.engine, key)
+        let Some(engine) = self.engine.as_ref() else {
+            return Err(IndexError::KeyNotFound);
+        };
+        self.lookup_mph(engine, key)
     }
 
     pub fn get(&self, key: &[u8]) -> Result<usize, IndexError> {
@@ -239,7 +258,10 @@ impl Index {
     }
 
     pub fn lookup_u64(&self, key: u64) -> Result<usize, IndexError> {
-        self.lookup_mph(&self.engine, &key.to_le_bytes())
+        let Some(engine) = self.engine.as_ref() else {
+            return Err(IndexError::KeyNotFound);
+        };
+        self.lookup_mph(engine, &key.to_le_bytes())
     }
 
     /// AVX2-gather based fingerprint check for 8 indices at a time.
@@ -339,7 +361,7 @@ impl Index {
         for slot in &mut out[..n] {
             *slot = None;
         }
-        let engine = &self.engine;
+        let Some(engine) = self.engine.as_ref() else { return };
 
         // Hash all keys up-front via AVX2 (4-wide).
         crate::simd_hash::hash_u64(keys, engine.prehash_seed, &mut canon[..n]);
@@ -474,35 +496,27 @@ impl Index {
     /// detecting `None` should fall back to `lookup_u64`.
     #[inline]
     pub fn lookup_u64_fast(&self, key: u64) -> Option<Result<usize, IndexError>> {
-        let engine = &self.engine;
-        // Probe BackendDispatch for the PtrHash25 variant; if not, return None
-        // so caller falls back. The match itself is cheap and predictable.
+        let engine = self.engine.as_ref()?;
+        // Explicit destructure: adding another backend variant must break here.
         use crate::mph_backend::BackendDispatch;
-        if let BackendDispatch::PtrHash25(_) = &engine.backend {
-            // Hash key with same canonical path the index was built against.
-            let canonical = canonical_hash_key(&key.to_le_bytes(), engine.prehash_seed);
-            if let Some(bf) = &engine.filter {
-                if !bf.contains_hash(canonical) {
-                    return Some(Err(IndexError::KeyNotFound));
-                }
-            }
-            let idx = match engine.backend.lookup(canonical) {
-                Some(i) => i as usize,
-                None => return Some(Err(IndexError::KeyNotFound)),
-            };
-            if let Some(fps) = &engine.fingerprints {
-                let fp = fingerprint16_mph(canonical);
-                let ok = unsafe { *fps.get_unchecked(idx) == fp };
-                Some(if ok {
-                    Ok(idx)
-                } else {
-                    Err(IndexError::KeyNotFound)
-                })
-            } else {
-                Some(Ok(idx))
-            }
+        let BackendDispatch::PtrHash25(_) = &engine.backend;
+        // Hash key with same canonical path the index was built against.
+        let canonical = canonical_hash_key(&key.to_le_bytes(), engine.prehash_seed);
+        if let Some(bf) = &engine.filter
+            && !bf.contains_hash(canonical)
+        {
+            return Some(Err(IndexError::KeyNotFound));
+        }
+        let idx = match engine.backend.lookup(canonical) {
+            Some(i) => i as usize,
+            None => return Some(Err(IndexError::KeyNotFound)),
+        };
+        if let Some(fps) = &engine.fingerprints {
+            let fp = fingerprint16_mph(canonical);
+            let ok = unsafe { *fps.get_unchecked(idx) == fp };
+            Some(if ok { Ok(idx) } else { Err(IndexError::KeyNotFound) })
         } else {
-            None
+            Some(Ok(idx))
         }
     }
 
@@ -521,16 +535,16 @@ impl Index {
     }
 
     pub fn contains(&self, key: &[u8]) -> bool {
-        let engine = &self.engine;
-        {
-            let canonical = canonical_hash_key(key, engine.prehash_seed);
-            match &engine.filter {
-                Some(bf) => bf.contains_hash(canonical),
-                // Lean mode has no Bloom — fall back to full lookup (slower but
-                // correctness preserved). For high-throughput contains() calls,
-                // disable lean_mph.
-                None => self.lookup_mph(engine, key).is_ok(),
-            }
+        let Some(engine) = self.engine.as_ref() else {
+            return false;
+        };
+        let canonical = canonical_hash_key(key, engine.prehash_seed);
+        match &engine.filter {
+            Some(bf) => bf.contains_hash(canonical),
+            // Lean mode has no Bloom — fall back to full lookup (slower but
+            // correctness preserved). For high-throughput contains() calls,
+            // disable lean_mph.
+            None => self.lookup_mph(engine, key).is_ok(),
         }
     }
 
@@ -543,7 +557,9 @@ impl Index {
     }
 
     pub fn contains_batch(&self, keys: &[&[u8]]) -> Vec<bool> {
-        let engine = &self.engine;
+        let Some(engine) = self.engine.as_ref() else {
+            return vec![false; keys.len()];
+        };
         keys.iter()
             .map(|&key| {
                 let canonical = canonical_hash_key(key, engine.prehash_seed);
@@ -564,8 +580,10 @@ impl Index {
     }
 
     pub fn lookup_batch(&self, keys: &[&[u8]]) -> Vec<Option<usize>> {
+        let Some(engine) = self.engine.as_ref() else {
+            return vec![None; keys.len()];
+        };
         let mut out = Vec::with_capacity(keys.len());
-        let engine = &self.engine;
         let mut i = 0usize;
         #[cfg(target_arch = "x86_64")]
         while i + 16 <= keys.len() {
@@ -625,8 +643,10 @@ impl Index {
     /// Empirically window=32 beats window=8 by 2-3× on 100M-key indexes on Alder Lake
     /// (where each core has ~10 outstanding L1/L2 misses, scaled by 3 prefetch streams).
     pub fn lookup_batch_pipelined(&self, keys: &[&[u8]]) -> Vec<Option<usize>> {
+        let Some(engine) = self.engine.as_ref() else {
+            return vec![None; keys.len()];
+        };
         let mut out = Vec::with_capacity(keys.len());
-        let engine = &self.engine;
         {
             {
                 // Lean-mode fast path: no Bloom, no fingerprints. Strip down to
@@ -731,7 +751,8 @@ impl Index {
     /// (`lean_mph` mode). Used by GPU correctness tests to verify that the
     /// exported `bloom_words` match the engine's actual behavior.
     pub fn debug_bloom_contains_canonical(&self, canonical: u64) -> Option<bool> {
-        self.engine.filter.as_ref().map(|bf| bf.contains_hash(canonical))
+        let engine = self.engine.as_ref()?;
+        engine.filter.as_ref().map(|bf| bf.contains_hash(canonical))
     }
 
     /// Export every constant needed to reproduce `lookup_u64` on an
@@ -752,7 +773,7 @@ impl Index {
     /// requires a separate CUDA implementation.
     pub fn gpu_export(&self) -> Option<GpuExport> {
         use crate::mph_backend::{BackendDispatch, PtrHash25Storage};
-        let engine = &self.engine;
+        let engine = self.engine.as_ref()?;
 
         let BackendDispatch::PtrHash25(ph_backend) = &engine.backend;
         // Hot-tier `Map` variant isn't a true MPH; skip GPU export.
@@ -795,7 +816,15 @@ impl Index {
     }
 
     pub fn stats(&self) -> IndexStats {
-        let engine = &self.engine;
+        let Some(engine) = self.engine.as_ref() else {
+            return IndexStats {
+                engine: "mph-empty",
+                total_keys: 0,
+                mph_memory: 0,
+                pgm_memory: 0,
+                total_memory: 0,
+            };
+        };
         let mph_memory = engine.backend.memory_usage_bytes();
         let filter_memory = engine.filter.as_ref().map(|b| b.memory_usage()).unwrap_or(0);
         let fp_memory = engine
@@ -864,9 +893,14 @@ impl Index {
 
     pub fn to_bytes(&self) -> Result<Vec<u8>, IndexError> {
         let mut out = Vec::new();
-        let engine = &self.engine;
-        // Tag 2 = MPH v2 with optional filter/fingerprints (presence flags).
-        // Tag 0 still readable for legacy v1 indexes (always-present filter/fps).
+        let Some(engine) = self.engine.as_ref() else {
+            // Tag 3: empty index. [tag=3][key_count=0u64].
+            write_u8(&mut out, 3);
+            write_u64(&mut out, 0);
+            return Ok(out);
+        };
+        // Tag 2: MPH v2 (presence flags before filter/fingerprints).
+        // Tag 0 (legacy v1, always-present filter/fps) still readable.
         write_u8(&mut out, 2);
         write_u64(&mut out, self.key_count as u64);
         write_u64(&mut out, engine.prehash_seed);
@@ -910,12 +944,12 @@ impl Index {
                 cursor.pos = bf_pos;
                 let fingerprints = read_fingerprints(&mut cursor)?;
                 Ok(Index {
-                    engine: MphEngine {
+                    engine: Some(MphEngine {
                         backend,
                         prehash_seed,
                         filter: Some(filter),
                         fingerprints: Some(fingerprints),
-                    },
+                    }),
                     key_count,
                 })
             }
@@ -943,17 +977,22 @@ impl Index {
                     None
                 };
                 Ok(Index {
-                    engine: MphEngine {
+                    engine: Some(MphEngine {
                         backend,
                         prehash_seed,
                         filter,
                         fingerprints,
-                    },
+                    }),
                     key_count,
                 })
             }
-            // Tag 1 (legacy PGM engine) was removed in v0.6 — use PgmIndex
-            // directly for range queries on u64 keys.
+            3 => {
+                if key_count != 0 {
+                    return Err(IndexError::CorruptData);
+                }
+                Ok(Index::empty())
+            }
+            // Tag 1 (legacy PGM engine) removed in v0.6.
             _ => Err(IndexError::CorruptData),
         }
     }

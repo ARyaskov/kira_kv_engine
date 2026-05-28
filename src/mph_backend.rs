@@ -115,6 +115,18 @@ impl MphBackend for PtrHash25Backend {
     }
 }
 
+impl PtrHash25Backend {
+    /// Upper bound on `lookup`'s return value.
+    pub fn slot_capacity(&self) -> usize {
+        match &self.storage {
+            PtrHash25Storage::Mph(mph) => mph.slot_capacity(),
+            PtrHash25Storage::Map(map) => {
+                map.values().copied().max().map_or(0, |m| m as usize + 1)
+            }
+        }
+    }
+}
+
 /// Single-variant dispatch wrapper. Kept as an enum so future algorithms can be
 /// added as additional variants without breaking callers that match on it.
 #[derive(Debug)]
@@ -139,6 +151,12 @@ impl BackendDispatch {
     pub fn memory_usage_bytes(&self) -> usize {
         match self {
             Self::PtrHash25(b) => b.memory_usage_bytes(),
+        }
+    }
+
+    pub fn slot_capacity(&self) -> usize {
+        match self {
+            Self::PtrHash25(b) => b.slot_capacity(),
         }
     }
 

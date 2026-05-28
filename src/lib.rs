@@ -1,8 +1,10 @@
 //! kira_kv_engine — PtrHash-style MPH + PGM index.
 //!
 //! - Build once on a set of **unique** keys (bytes/str).
-//! - O(1) lookups: key -> unique index in `[0..n)`.
-//! - Robust: if a build attempt finds a cycle, we rehash with another salt.
+//! - O(1) lookups: key → position in `[0..Index::slot_capacity())`. Note this
+//!   is *not* `[0..len())` — PtrHash25 over-provisions slot space by `1/gamma`.
+//!   Size parallel side arrays to `slot_capacity()`.
+//! - Empty input is supported (0.6.1+): produces a no-op instance.
 
 mod aes_hash;
 mod block_bloom;
