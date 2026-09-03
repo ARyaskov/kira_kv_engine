@@ -10,7 +10,7 @@ u128). Edition 2024, Rust 1.95+.
 | Engine | Memory | Lookup warm | Insert/Delete | Range | Best for |
 |---|---:|---:|:---:|:---:|---|
 | **PtrHash25-lean** | **0.6 B/key** | **13 ns** | ❌ static | ❌ | Closed-world point lookups (top pick) |
-| **PtrHash25** (default) | 4.5 B/key | 21 ns | ❌ static | ❌ | Open-world point lookups (Bloom-rejected misses) |
+| **PtrHash25** (default) | 4.2 B/key | 21 ns | ❌ static | ❌ | Open-world point lookups (Bloom-rejected misses) |
 | **DynamicIndex** | ~6 B/key | 25–40 ns | ✅ ~700 ns | ❌ | Mutable byte-key sets (LSM on top of MPH) |
 | **HybridIndex** | 13–16 B/key | 45–60 ns | ❌ static | hash-space | Universal byte keys + batch queries |
 | **PgmIndex** | ~5 B/key | 150–700 ns | ❌ static | ✅ semantic | u64 range queries (timestamps, IDs) |
@@ -168,9 +168,15 @@ All engines are static (built once from a unique key set). Each returns a stable
 IndexBuilder::new()
     .with_lean_mph(true)               // ★ -87% memory (closed-world only)
     .with_parallel_build(true)
-    .with_build_fast_profile(true)
-    .build_index(keys)?
+    .build_index_ref(&keys)?           // borrows: no clone, no 10M frees in the build
+    // or .build_index(keys)?          // owned: same build + parallel drop of `keys`
 ```
+
+Keys are hashed in place in parallel (no arena copy), split into ~32K-key **parts**,
+and every part is built independently on its own core with an L2-resident working
+set. Duplicate keys are detected exactly and reported as `IndexError::Mph("DuplicateKey")`.
+Key types need `AsRef<[u8]> + Sync` (`+ Send` for the owned variant) — true for
+`Vec<u8>`, `String`, `&[u8]`, `&str`, arrays.
 
 Lookups: `index.lookup(&[u8])`, `lookup_u64(u64)`, `lookup_batch_pipelined(&[&[u8]])`,
 `lookup_batch_u64_simd(&[u64])`.
@@ -235,6 +241,8 @@ let restored = kira_kv_engine::PgmIndex::from_bytes(&bytes)?;
 
 ```bash
 cargo run --release --example million_build   # PtrHash25 + lean comparison
+# KIRA_BENCH_N=100000000 KIRA_BENCH_OPS=10000000 KIRA_BENCH_RUNS=1  → key count,
+# lookups per measurement, repetitions; KIRA_BUILD_TRACE=1 prints build phases.
 cargo run --release --example pgm_bench       # PGM + HybridIndex variants
 ```
 
@@ -242,13 +250,30 @@ cargo run --release --example pgm_bench       # PGM + HybridIndex variants
 
 **`million_build` (mixed byte keys: 40% numeric + 40% random strings + 20% shared-prefix)**
 
-| Variant | Build ms | B/key | Warm ns | Cold ns | Throughput |
-|---|---:|---:|---:|---:|---:|
-| **PtrHash25-lean** ⭐ | **3884** | **0.59** | **13.49** | 15.44 | **74 M/s** |
-| PtrHash25 (default) | 6184 | 4.46 | 21.24 | 19.05 | 47 M/s |
+| Variant | Build ms | B/key | Warm ns | Throughput |
+|---|---:|---:|---:|---:|
+| **PtrHash25-lean** ⭐ | **190** | **0.59** | **13** | **75 M/s** |
+| PtrHash25 (default) | 210 | 4.16 | 21 | 48 M/s |
+
+**Same bench, 100M keys** (`KIRA_BENCH_N=100000000`):
+
+| Variant | Build s | B/key | Warm ns |
+|---|---:|---:|---:|
+| PtrHash25-lean | 2.4 | 0.59 | 22 |
+| PtrHash25 (default) | 2.9 | 4.16 | 30 |
+
+Build = `build_index_ref(&keys)` on the library's default pool (8 pinned P-cores);
+lookups are aggregate over 20 threads, measured on an otherwise idle box. v0.6 built
+10M keys in 3.3 s (lean) / 4.1 s (default): the build was 86% single-threaded and
+DRAM-latency bound. The build now hashes keys in place, partitions them into ~32K-key
+parts and builds every part in parallel inside L2 — see `KIRA_BUILD_TRACE=1` for the
+phase split (at 10M: canonical hash ~65 ms, Bloom + partition ~45, MPH + fingerprints
+~90). Above ~50M keys the remaining cost is memory behaviour (TLB misses on scattered
+key bodies, first-touch page faults on the big work buffers): enabling large pages (see
+below) is the next lever there.
 
 PtrHash25-lean approaches paper-PTHash 2025 memory (~4.7 bits/key vs ~2.6 bits/key in
-the paper) while being 1.4× faster than default and 1.6× faster to build.
+the paper) while being 1.6× faster than default on lookups.
 
 **`pgm_bench` (1M u64 keys, 60% clustered + 30% uniform + 10% sequential)**
 
@@ -270,6 +295,13 @@ the paper) while being 1.4× faster than default and 1.6× faster to build.
    `lookup_batch_u64_simd` (Hybrid) — 3-stream cache prefetch ladder.
 5. **u64 keys to Hybrid?** Use `build_from_u64()` instead of `build()` — SIMD
    hash path.
+6. **Building from keys you keep around?** Use `build_index_ref(&keys)` — the
+   owned `build_index(keys)` costs an extra clone on your side plus millions of
+   frees inside the build.
+7. **Build looks slow?** `KIRA_BUILD_TRACE=1` prints per-phase timings. The build
+   pool is one pinned thread per P-core by default (measured best on Alder Lake:
+   SMT siblings and E-cores slow the L2-resident per-part build down); override
+   with `KIRA_BUILD_THREADS` / `KIRA_BUILD_CORE_IDS` if your box differs.
 
 ## Hugepages (Windows / Linux)
 
@@ -286,8 +318,15 @@ The engine prints a guidance message at startup if hugepages are unavailable.
 
 ## Notes
 
-- Input keys must be **unique**.
+- Input keys must be **unique**. `Index` detects duplicates exactly (equal keys can
+  never be separated by any pilot) and returns `IndexError::Mph("DuplicateKey")`.
 - Indexes are static — modifications require a rebuild.
+- Indexes above ~32K keys are built in parts; the on-disk format marks this with a
+  flag bit, and files written by 0.6 (always single-part) still load unchanged.
+- The Block-Bloom lane index is now 6 bits (0.6 derived 5 bits and used only the low
+  half of every 64-bit word, so "11 bits/key" were effectively 5.5). New filters are
+  ~0.5% FPR at 11 bits/key and no longer rounded up to a power of two; filters from
+  0.6 files are read with the old formula (flag bit in the serialized length).
 - Public API reference: `API.md`.
 
 ## License

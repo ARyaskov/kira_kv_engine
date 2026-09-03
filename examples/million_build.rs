@@ -14,14 +14,36 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
-const N_KEYS: usize = 10_000_000;
+/// Default key count; override with `KIRA_BENCH_N=<n>`.
+const N_KEYS_DEFAULT: usize = 10_000_0000;
+fn n_keys() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        env::var("KIRA_BENCH_N")
+            .ok()
+            .and_then(|v| v.replace('_', "").parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(N_KEYS_DEFAULT)
+    })
+}
 const GEN_SEED: u64 = 42;
 const QUERY_SEED: u64 = 1337;
 const MISSING_POOL_FRACTION: f64 = 0.01;
 // Scaled with N so per-thread work amortizes thread overhead on Windows (where pthread/scope
 // startup is ~30-100 μs vs ~5-10 μs on macOS). 1M ops × 20 threads = 50k per thread ≈ 1.5 ms
 // of work per thread — enough to drown out spawn cost.
-const QUERY_OPS: usize = 1_000_000;
+/// Default lookup count per measurement; override with `KIRA_BENCH_OPS=<n>`.
+const QUERY_OPS_DEFAULT: usize = 1_000_0000;
+fn query_ops() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        env::var("KIRA_BENCH_OPS")
+            .ok()
+            .and_then(|v| v.replace('_', "").parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(QUERY_OPS_DEFAULT)
+    })
+}
 const USE_PARALLEL: bool = true;
 const BUILD_FAST_PROFILE: bool = true;
 const DEFAULT_BENCH_RUNS: usize = 2;
@@ -43,6 +65,9 @@ struct BenchSettings {
     runs: usize,
     threads: usize,
     core_ids: Option<Vec<usize>>,
+    /// True when the user pinned threads/cores explicitly via env — only then do we
+    /// also override the library's build pool.
+    explicit: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -56,7 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     apply_bench_settings(&settings);
 
     println!("kira_kv_engine benchmark");
-    println!("n = {} keys", N_KEYS);
+    println!("n = {} keys", n_keys());
     println!(
         "bench: runs={}, threads={}, core_ids={}",
         settings.runs,
@@ -73,23 +98,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn run_index_bench(settings: &BenchSettings) -> Result<(), Box<dyn std::error::Error>> {
     print_table_header();
 
-    let mixed_keys = gen_mixed_keys(N_KEYS, GEN_SEED ^ 0x6666_6666_6666_6666);
+    let mixed_keys = gen_mixed_keys(n_keys(), GEN_SEED ^ 0x6666_6666_6666_6666);
     let mut rng = StdRng::seed_from_u64(QUERY_SEED ^ 0x7777_7777_7777_7777);
 
-    let mut key_set = HashSet::with_capacity(N_KEYS * 2);
+    let mut key_set = HashSet::with_capacity(n_keys() * 2);
     for k in &mixed_keys {
         key_set.insert(k.clone());
     }
 
     let positive_queries =
-        make_positive_queries_bytes(&mixed_keys[..QUERY_OPS.min(mixed_keys.len())]);
+        make_positive_queries_bytes(&mixed_keys[..query_ops().min(mixed_keys.len())]);
 
-    let missing_total = (QUERY_OPS as f64 * MISSING_POOL_FRACTION).ceil() as usize;
+    let missing_total = (query_ops() as f64 * MISSING_POOL_FRACTION).ceil() as usize;
     let missing_keys = gen_mixed_keys_missing(missing_total, &mut rng, &key_set);
     let negative_queries =
-        make_negative_queries_bytes(&mixed_keys, &missing_keys, QUERY_OPS, 0.70, &mut rng);
+        make_negative_queries_bytes(&mixed_keys, &missing_keys, query_ops(), 0.70, &mut rng);
 
-    let zipf_queries = make_zipfian_queries_bytes(&mixed_keys, QUERY_OPS, &mut rng);
+    let zipf_queries = make_zipfian_queries_bytes(&mixed_keys, query_ops(), &mut rng);
 
     // Only one MPH backend exists in v0.5+ (PtrHash25). Loop preserved so the bench
     // shape stays familiar — future backends would be added here as additional entries.
@@ -118,13 +143,14 @@ fn run_index_bench(settings: &BenchSettings) -> Result<(), Box<dyn std::error::E
             cfg.build_fast_profile = BUILD_FAST_PROFILE;
             cfg.lean_mph = lean;
 
+            // Borrowing build: no clone of 10M keys, no 10M frees inside the timer.
             let t_build = Instant::now();
             let index = IndexBuilder::new()
                 .with_config(cfg)
-                .build_index(mixed_keys.clone())?;
+                .build_index_ref(&mixed_keys)?;
             let build_s = t_build.elapsed().as_secs_f64();
             build_samples.push(build_s);
-            bpk_samples.push(index.stats().total_memory as f64 / N_KEYS as f64);
+            bpk_samples.push(index.stats().total_memory as f64 / n_keys() as f64);
 
             let mut run_rng = StdRng::seed_from_u64(
                 QUERY_SEED
@@ -149,7 +175,7 @@ fn run_index_bench(settings: &BenchSettings) -> Result<(), Box<dyn std::error::E
         }
 
         let build_stats = summarize(&mut build_samples);
-        let _build_rate_median = N_KEYS as f64 / build_stats.median;
+        let _build_rate_median = n_keys() as f64 / build_stats.median;
 
         let bytes_per_key = summarize(&mut bpk_samples).median;
         let (hits_pos, misses_pos) = count_hits_bytes(&positive_queries);
@@ -163,7 +189,7 @@ fn run_index_bench(settings: &BenchSettings) -> Result<(), Box<dyn std::error::E
             settings.runs,
             build_stats,
             summarize(&mut pos_cold),
-            QUERY_OPS,
+            query_ops(),
             hits_pos,
             misses_pos,
             bytes_per_key,
@@ -175,7 +201,7 @@ fn run_index_bench(settings: &BenchSettings) -> Result<(), Box<dyn std::error::E
             settings.runs,
             build_stats,
             summarize(&mut pos_warm),
-            QUERY_OPS,
+            query_ops(),
             hits_pos,
             misses_pos,
             bytes_per_key,
@@ -187,7 +213,7 @@ fn run_index_bench(settings: &BenchSettings) -> Result<(), Box<dyn std::error::E
             settings.runs,
             build_stats,
             summarize(&mut neg_cold),
-            QUERY_OPS,
+            query_ops(),
             hits_neg,
             misses_neg,
             bytes_per_key,
@@ -199,7 +225,7 @@ fn run_index_bench(settings: &BenchSettings) -> Result<(), Box<dyn std::error::E
             settings.runs,
             build_stats,
             summarize(&mut neg_warm),
-            QUERY_OPS,
+            query_ops(),
             hits_neg,
             misses_neg,
             bytes_per_key,
@@ -211,7 +237,7 @@ fn run_index_bench(settings: &BenchSettings) -> Result<(), Box<dyn std::error::E
             settings.runs,
             build_stats,
             summarize(&mut zipf_cold),
-            QUERY_OPS,
+            query_ops(),
             hits_zipf,
             misses_zipf,
             bytes_per_key,
@@ -223,7 +249,7 @@ fn run_index_bench(settings: &BenchSettings) -> Result<(), Box<dyn std::error::E
             settings.runs,
             build_stats,
             summarize(&mut zipf_warm),
-            QUERY_OPS,
+            query_ops(),
             hits_zipf,
             misses_zipf,
             bytes_per_key,
@@ -267,7 +293,7 @@ fn print_row(
 ) {
     let build_ms_m = build_stats.median * 1000.0;
     let build_ms_p95 = build_stats.p95 * 1000.0;
-    let build_rate_m = N_KEYS as f64 / build_stats.median;
+    let build_rate_m = n_keys() as f64 / build_stats.median;
     let lookup_ns_m = (lookup_stats.median * 1e9) / ops as f64;
     let lookup_ns_p95 = (lookup_stats.p95 * 1e9) / ops as f64;
     let throughput_m = ops as f64 / lookup_stats.median;
@@ -1145,25 +1171,42 @@ fn load_bench_settings() -> BenchSettings {
         .unwrap_or(DEFAULT_BENCH_RUNS);
     let core_ids = parse_core_ids(env::var("KIRA_BENCH_CORE_IDS").ok().as_deref())
         .or_else(|| default_core_ids(threads));
+    let explicit = env::var_os("KIRA_BENCH_THREADS").is_some()
+        || env::var_os("KIRA_BENCH_CORE_IDS").is_some();
     BenchSettings {
         runs,
         threads,
         core_ids,
+        explicit,
     }
 }
 
+/// Lookup threads / cores always follow the bench settings. The *build* pool is left
+/// to the library default (one thread per P-core, pinned) unless the user explicitly
+/// set `KIRA_BENCH_THREADS` / `KIRA_BENCH_CORE_IDS` or the `KIRA_BUILD_*` variables:
+/// forcing all 20 logical CPUs (E-cores + SMT siblings) onto the L2-resident
+/// per-part build is measurably slower than 8 pinned P-cores.
 fn apply_bench_settings(settings: &BenchSettings) {
     unsafe {
-        env::set_var("KIRA_BUILD_THREADS", settings.threads.to_string());
         env::set_var("KIRA_BENCH_THREADS", settings.threads.to_string());
     }
     if let Some(core_ids) = settings.core_ids.as_ref() {
         let ids = format_core_ids(Some(core_ids));
         unsafe {
-            env::set_var("KIRA_BUILD_CORE_IDS", &ids);
             env::set_var("KIRA_BENCH_CORE_IDS", &ids);
         }
-        pin_thread_to_core(core_ids, 0);
+    }
+    if settings.explicit {
+        if env::var_os("KIRA_BUILD_THREADS").is_none() {
+            unsafe { env::set_var("KIRA_BUILD_THREADS", settings.threads.to_string()) };
+        }
+        if let Some(core_ids) = settings.core_ids.as_ref() {
+            if env::var_os("KIRA_BUILD_CORE_IDS").is_none() {
+                let ids = format_core_ids(Some(core_ids));
+                unsafe { env::set_var("KIRA_BUILD_CORE_IDS", &ids) };
+            }
+            pin_thread_to_core(core_ids, 0);
+        }
     }
 }
 

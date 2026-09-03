@@ -30,7 +30,7 @@ mod pgm_u128;
 mod ptrhash25;
 mod simd_hash;
 pub use index::{
-    BloomExport, GpuExport, Index, IndexBuilder, IndexConfig, IndexError, IndexStats,
+    BloomExport, GpuExport, GpuPart, Index, IndexBuilder, IndexConfig, IndexError, IndexStats,
 };
 pub use mph_backend::{BackendKind, BuildConfig as BackendBuildConfig, BuildProfile, MphBackend};
 
@@ -57,7 +57,9 @@ pub mod __internal {
     pub use crate::mini_chd::{MiniChd, MiniChdError};
     pub use crate::mmap_index::{Header, MmapIndex, MmapIndexWriter, SectionKind};
     pub use crate::ptrhash25::{
-        BuildConfig, Builder, PtrHash25Error, PtrHash25Mphf, read_ptrhash25, write_ptrhash25,
+        BuildConfig, BuildOutputs, Builder, PART_TARGET_KEYS, PartInfo, Partitioned,
+        PilotTable, PtrHash25Error, PtrHash25Mphf, build_partitioned, build_partitioned_with,
+        partition_keys, read_ptrhash25, write_ptrhash25,
     };
     pub mod simd_hash {
         pub fn hash_u64_scalar(keys: &[u64], seed: u64, out: &mut [u64]) {

@@ -13,13 +13,14 @@
 
 #![allow(dead_code)]
 
-use hashbrown::{HashMap, HashSet};
+use crate::ptrhash25::{self, Partitioned, PtrHash25Error};
+use hashbrown::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
     /// The only MPH algorithm. u8 pilots + 2-level bucketing + CompressedPilotsV2
-    /// (3-tier zero/nibble/overflow) + hugepage-backed storage + AVX2-vectorized
-    /// build. See `src/ptrhash25.rs`.
+    /// (3-tier zero/nibble/overflow) + hugepage-backed storage + partitioned,
+    /// parallel, AVX2-vectorized build. See `src/ptrhash25.rs`.
     PtrHash25,
 }
 
@@ -52,6 +53,20 @@ impl Default for BuildConfig {
     }
 }
 
+impl BuildConfig {
+    /// The PtrHash25 configuration derived from this backend configuration. The outer
+    /// `Index` layer adds its own fingerprint table, so inner fingerprints are off.
+    pub(crate) fn mph_config(&self) -> ptrhash25::BuildConfig {
+        ptrhash25::BuildConfig {
+            gamma: self.gamma,
+            max_rehash: self.rehash_limit.max(8),
+            with_fingerprints: false,
+            seed: self.seed,
+            use_aes_hash: false,
+        }
+    }
+}
+
 pub trait MphBackend {
     fn build(keys: &[u64], config: &BuildConfig) -> Self
     where
@@ -63,8 +78,8 @@ pub trait MphBackend {
 }
 
 /// PtrHash 2025 backend — u8 pilots, 2-level bucketing, 3-tier compressed pilots,
-/// hugepage-backed storage, AVX2-vectorized hash + prefix-sum + gather. The default
-/// and currently only backend.
+/// hugepage-backed storage, partitioned parallel build. The default and currently
+/// only backend.
 ///
 /// Lookup wraps `crate::ptrhash25::PtrHash25Mphf` directly without going through a
 /// generic dispatch enum, keeping the hot path branchless.
@@ -75,25 +90,24 @@ pub struct PtrHash25Backend {
 
 #[derive(Debug, Clone)]
 pub(crate) enum PtrHash25Storage {
-    Mph(crate::ptrhash25::PtrHash25Mphf),
+    Mph(ptrhash25::PtrHash25Mphf),
     /// Fallback for the unbuildable-after-rehash case (vanishingly rare).
     Map(HashMap<u64, u32>),
 }
 
 impl MphBackend for PtrHash25Backend {
     fn build(keys: &[u64], config: &BuildConfig) -> Self {
-        let cfg = crate::ptrhash25::BuildConfig {
-            gamma: config.gamma,
-            max_rehash: config.rehash_limit.max(8),
-            with_fingerprints: false, // outer Index layer adds its own fingerprint table
-            seed: config.seed,
-            use_aes_hash: false,
-        };
-        let storage = match crate::ptrhash25::Builder::new().with_config(cfg).build(keys) {
-            Ok(mph) => PtrHash25Storage::Mph(mph),
-            Err(_) => PtrHash25Storage::Map(build_fallback_map(keys)),
-        };
-        Self { storage }
+        let cfg = config.mph_config();
+        let part = ptrhash25::partition_keys(keys, &cfg);
+        match Self::build_from_partitioned(&part, config, false) {
+            Ok((backend, _)) => backend,
+            // Duplicate u64 keys: keep the historical behaviour of this low-level entry
+            // point (a map that keeps the last occurrence) — `Index` handles duplicates
+            // explicitly before ever reaching here.
+            Err(_) => Self {
+                storage: PtrHash25Storage::Map(build_fallback_map_original(keys)),
+            },
+        }
     }
 
     #[inline]
@@ -116,6 +130,51 @@ impl MphBackend for PtrHash25Backend {
 }
 
 impl PtrHash25Backend {
+    /// Build from already-partitioned keys. With `outer_fp16 = true` the u16
+    /// fingerprint table (`original_key & 0xFFFF` per slot) is filled inside the
+    /// per-part build — no slot array, no second pass.
+    ///
+    /// `Err(DuplicateKey)` is reported to the caller; `Unresolvable` (astronomically
+    /// rare) falls back to a hash map keyed by the original u64 keys.
+    pub(crate) fn build_from_partitioned(
+        part: &Partitioned,
+        config: &BuildConfig,
+        outer_fp16: bool,
+    ) -> Result<(Self, Option<Vec<u16>>), PtrHash25Error> {
+        let cfg = config.mph_config();
+        let outputs = ptrhash25::BuildOutputs {
+            slots: false,
+            fp16: outer_fp16,
+        };
+        match ptrhash25::build_partitioned_with(part, &cfg, outputs) {
+            Ok((mph, _, fp16)) => Ok((
+                Self {
+                    storage: PtrHash25Storage::Mph(mph),
+                },
+                fp16,
+            )),
+            Err(PtrHash25Error::DuplicateKey) => Err(PtrHash25Error::DuplicateKey),
+            Err(PtrHash25Error::Unresolvable) => {
+                let n = part.len();
+                let mut map = HashMap::with_capacity(n * 2);
+                let mut fp16 = if outer_fp16 { Some(vec![0u16; n]) } else { None };
+                for i in 0..n {
+                    let key = part.original_key(i);
+                    map.insert(key, i as u32);
+                    if let Some(fp) = fp16.as_mut() {
+                        fp[i] = (key & 0xFFFF) as u16;
+                    }
+                }
+                Ok((
+                    Self {
+                        storage: PtrHash25Storage::Map(map),
+                    },
+                    fp16,
+                ))
+            }
+        }
+    }
+
     /// Upper bound on `lookup`'s return value.
     pub fn slot_capacity(&self) -> usize {
         match &self.storage {
@@ -191,7 +250,7 @@ fn write_ptrhash25_storage(storage: &PtrHash25Storage, out: &mut Vec<u8>) {
     match storage {
         PtrHash25Storage::Mph(mph) => {
             out.push(0);
-            crate::ptrhash25::write_ptrhash25(mph, out);
+            ptrhash25::write_ptrhash25(mph, out);
         }
         PtrHash25Storage::Map(map) => {
             out.push(1);
@@ -207,7 +266,7 @@ fn write_ptrhash25_storage(storage: &PtrHash25Storage, out: &mut Vec<u8>) {
 fn read_ptrhash25_storage(buf: &[u8], pos: &mut usize) -> Option<PtrHash25Storage> {
     let tag = read_u8(buf, pos)?;
     match tag {
-        0 => crate::ptrhash25::read_ptrhash25(buf, pos).map(PtrHash25Storage::Mph),
+        0 => ptrhash25::read_ptrhash25(buf, pos).map(PtrHash25Storage::Mph),
         1 => {
             let len = read_u64(buf, pos)? as usize;
             let mut map = HashMap::with_capacity(len * 2);
@@ -222,7 +281,7 @@ fn read_ptrhash25_storage(buf: &[u8], pos: &mut usize) -> Option<PtrHash25Storag
     }
 }
 
-fn build_fallback_map(keys: &[u64]) -> HashMap<u64, u32> {
+fn build_fallback_map_original(keys: &[u64]) -> HashMap<u64, u32> {
     let mut map = HashMap::with_capacity(keys.len() * 2);
     for (i, &k) in keys.iter().enumerate() {
         map.insert(k, i as u32);
@@ -258,82 +317,3 @@ fn read_u64(buf: &[u8], pos: &mut usize) -> Option<u64> {
     *pos += 8;
     Some(u64::from_le_bytes(a))
 }
-
-pub use prehash::prehash_u64_arena;
-
-mod prehash {
-    #[cfg(feature = "parallel")]
-    use rayon::prelude::*;
-
-    pub fn prehash_u64_arena(
-        bytes: &[u8],
-        offsets: &[u32],
-        seed: u64,
-        verify_uniqueness: bool,
-    ) -> Option<(u64, Vec<u64>)> {
-        if offsets.len() < 2 {
-            return None;
-        }
-        let key_count = offsets.len() - 1;
-        let rounds: u64 = if verify_uniqueness { 64 } else { 1 };
-        for round in 0..rounds {
-            let s = seed ^ round.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-
-            #[cfg(feature = "parallel")]
-            let hashes: Vec<u64> = offsets
-                .par_windows(2)
-                .map(|w| {
-                    let start = w[0] as usize;
-                    let end = w[1] as usize;
-                    canonical_hash_bytes(&bytes[start..end], s)
-                })
-                .collect();
-            #[cfg(not(feature = "parallel"))]
-            let hashes: Vec<u64> = offsets
-                .windows(2)
-                .map(|w| {
-                    let start = w[0] as usize;
-                    let end = w[1] as usize;
-                    canonical_hash_bytes(&bytes[start..end], s)
-                })
-                .collect();
-
-            if !verify_uniqueness {
-                return Some((s, hashes));
-            }
-
-            let mut out = Vec::with_capacity(key_count);
-            let mut seen = hashbrown::HashSet::with_capacity(key_count * 2);
-            let mut ok = true;
-            for h in hashes.into_iter() {
-                if !seen.insert(h) {
-                    ok = false;
-                    break;
-                }
-                out.push(h);
-            }
-            if ok {
-                return Some((s, out));
-            }
-        }
-        None
-    }
-
-    pub fn prehash_unique_u64_arena(
-        bytes: &[u8],
-        offsets: &[u32],
-        seed: u64,
-    ) -> Option<(u64, Vec<u64>)> {
-        prehash_u64_arena(bytes, offsets, seed, true)
-    }
-
-    #[inline(always)]
-    fn canonical_hash_bytes(key: &[u8], seed: u64) -> u64 {
-        crate::canonical_hash::canonical_hash_bytes(key, seed)
-    }
-}
-
-// Suppress unused warning for HashSet — only used inside prehash submodule via
-// hashbrown::HashSet path.
-#[allow(unused_imports)]
-use HashSet as _;

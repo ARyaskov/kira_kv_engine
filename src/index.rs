@@ -1,7 +1,6 @@
 use crate::block_bloom::BlockBloom;
 use crate::mph_backend::{
-    BackendDispatch, BackendKind, BuildConfig as BackendConfig, BuildProfile, build_dispatch,
-    prehash_u64_arena,
+    BackendDispatch, BackendKind, BuildConfig as BackendConfig, BuildProfile, PtrHash25Backend,
 };
 use crate::pgm::PgmError;
 use crate::ptrhash25::{BuildConfig as MphConfig, PtrHash25Error as MphError};
@@ -82,6 +81,8 @@ pub struct IndexConfig {
     pub backend: BackendKind,
     pub hot_fraction: f32,
     pub enable_parallel_build: bool,
+    /// Kept for API compatibility; no effect. The build always detects
+    /// duplicate keys exactly, in every profile.
     pub build_fast_profile: bool,
     /// Enable Block-Bloom for fast PGM negative-lookup path. Costs
     /// ~10–12 bits/key, rejects ~99% of misses in O(1) without touching segments.
@@ -154,13 +155,45 @@ pub struct IndexStats {
 #[derive(Debug, Clone)]
 pub struct GpuExport {
     pub prehash_seed: u64,
+    /// Multi-part indexes: salt of the global base hash. Single-part: the part's own
+    /// hash salt (`parts[0].salt`).
     pub mph_salt: u64,
+    /// Total buckets across all parts (`pilots.len()`).
     pub num_buckets: u32,
+    /// Total slots across all parts.
     pub num_slots: u64,
     pub prerotate: u8,
     pub pilots: Vec<u8>,
     pub bloom: Option<BloomExport>,
     pub fingerprints: Option<Vec<u16>>,
+    /// Salt of the part selector:
+    /// `part = mulhi((rotated ^ part_salt) * 0x9E3779B97F4A7C15, parts.len())`.
+    /// Ignored when `parts.len() == 1`.
+    pub part_salt: u64,
+    /// Per-part geometry in part order. Always at least one entry; a single entry
+    /// means the single-partition formula (as in 0.6) applies unchanged.
+    pub parts: Vec<GpuPart>,
+}
+
+/// One PtrHash25 part for GPU export. Lookup inside part `p`
+/// (`rotated = key.rotate_left(prerotate)`):
+///
+/// ```text
+/// base   = mix64(rotated ^ mph_salt)
+/// h1     = parts.len() > 1 ? (base ^ p.salt) * 0xBF58476D1CE4E5B9 : base
+/// h2     = rotl(h1, 23) ^ 0xA24B1F6FDA392B31
+/// bucket = p.bucket_off + bucket_for(h1, p.num_buckets, p.large_buckets)
+/// slot   = p.slot_off + slot_for(h2, pilots[bucket], p.num_slots)
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct GpuPart {
+    pub slot_off: u64,
+    pub salt: u64,
+    pub bucket_off: u32,
+    pub num_slots: u32,
+    pub num_buckets: u32,
+    /// `floor(num_buckets × 0.30)` — size of the dense "large" zone.
+    pub large_buckets: u32,
 }
 
 /// Bloom filter snapshot for GPU export. The Bloom uses
@@ -168,35 +201,51 @@ pub struct GpuExport {
 /// Block index is `(((canonical >> 32) * blocks) >> 32)`.
 #[derive(Debug, Clone)]
 pub struct BloomExport {
-    /// Number of 64-byte blocks. Always a power of two.
+    /// Lane bit-index shift: 26 for filters built by this version (6-bit index), 27
+    /// for filters loaded from 0.6 files (5-bit index). See `BlockBloom::export_words`.
+    pub bit_shift: u32,
+    /// Number of 64-byte blocks. Always a multiple of 256 (no longer a power of two
+    /// since the partitioned build; the multiply-high reduction is unbiased regardless).
     pub blocks: usize,
     /// Concatenated 64-bit words. Length is `blocks * 8`.
     pub words: Vec<u64>,
 }
 
 impl Index {
+    /// Build from owned keys. Equivalent to [`Index::build_index_ref`] followed by
+    /// dropping `keys` (the drop of millions of small allocations runs in parallel).
+    ///
+    /// Prefer [`Index::build_index_ref`] when the keys stay alive anyway: it avoids the
+    /// clone on the caller side and the deallocation cost inside the build.
     pub fn build_index<K>(keys: Vec<K>, config: IndexConfig) -> Result<Self, IndexError>
     where
-        K: AsRef<[u8]>,
+        K: AsRef<[u8]> + Send + Sync,
+    {
+        let index = Self::build_index_ref(&keys, config)?;
+        drop_keys_parallel(keys);
+        Ok(index)
+    }
+
+    /// Build from borrowed keys (must be unique). Keys are hashed in place in parallel;
+    /// nothing is copied into an intermediate arena.
+    ///
+    /// Duplicate keys are detected exactly (`IndexError::Mph("DuplicateKey")`).
+    pub fn build_index_ref<K>(keys: &[K], config: IndexConfig) -> Result<Self, IndexError>
+    where
+        K: AsRef<[u8]> + Sync,
     {
         if keys.is_empty() {
             return Ok(Self::empty());
         }
-
         let mut config = config;
         if config.lean_mph {
             config.mph_config.with_fingerprints = false;
         }
-
-        let arena = build_key_arena(keys, config.mph_config.seed)?;
-        let key_count = arena.len();
-
-        let (prehash_seed, _canonical, backend, fingerprints, filter) =
-            run_build_pipeline_with_pool(&arena, &config)?;
-
+        let engine =
+            run_in_build_pool(config.enable_parallel_build, || build_engine(keys, &config))?;
         Ok(Index {
-            engine: Some(MphEngine { backend, prehash_seed, filter, fingerprints }),
-            key_count,
+            engine: Some(engine),
+            key_count: keys.len(),
         })
     }
 
@@ -791,6 +840,7 @@ impl Index {
         let bloom_export = engine.filter.as_ref().map(|bf| {
             let words = bf.export_words();
             BloomExport {
+                bit_shift: bf.bit_shift(),
                 blocks: words.len() / 8, // BLOCK_WORDS=8
                 words,
             }
@@ -801,6 +851,19 @@ impl Index {
             .as_ref()
             .map(|fps| fps.iter().copied().collect::<Vec<u16>>());
 
+        let parts = mph
+            .parts
+            .iter()
+            .map(|p| GpuPart {
+                slot_off: p.slot_off,
+                salt: p.salt,
+                bucket_off: p.bucket_off,
+                num_slots: p.num_slots,
+                num_buckets: p.num_buckets,
+                large_buckets: p.large_buckets,
+            })
+            .collect();
+
         Some(GpuExport {
             prehash_seed: engine.prehash_seed,
             mph_salt: mph.salt,
@@ -810,6 +873,8 @@ impl Index {
             pilots: pilots_flat,
             bloom: bloom_export,
             fingerprints,
+            part_salt: mph.part_salt,
+            parts,
         })
     }
 
@@ -1041,85 +1106,164 @@ fn make_backend_cfg(config: &IndexConfig) -> BackendConfig {
     }
 }
 
-fn run_build_pipeline(
-    arena: &KeyArena,
-    config: &IndexConfig,
-) -> Result<
-    (
-        u64,
-        Vec<u64>,
-        BackendDispatch,
-        Option<Box<[u16]>>,
-        Option<BlockBloom>,
-    ),
-    IndexError,
-> {
-    let (prehash_seed, canonical) = prehash_u64_arena(
-        arena.bytes.as_slice(),
-        arena.offsets.as_slice(),
-        config.mph_config.seed,
-        !config.build_fast_profile,
-    )
-    .ok_or(IndexError::CorruptData)?;
+/// Number of canonical-hash seeds tried before concluding that two input keys are
+/// byte-identical. Equal canonical hashes are detected exactly by the MPH build (equal
+/// keys can never be separated by any pilot). A pair of *distinct* keys colliding on the
+/// 64-bit canonical hash under two independent seeds has probability ~(n²/2⁶⁵)², which is
+/// negligible at any practical `n`, so "collides under a second seed" ⇒ duplicate.
+const MAX_PREHASH_ROUNDS: u32 = 4;
 
-    let filter = if config.lean_mph {
-        None
-    } else {
-        Some(BlockBloom::build_from_prehashed(&canonical))
-    };
-    let backend_cfg = make_backend_cfg(config);
-    let backend = build_dispatch(&canonical, &backend_cfg);
-    let fingerprints = if config.lean_mph {
-        None
-    } else {
-        Some(build_fingerprints_hashed(&backend, &canonical).into_boxed_slice())
-    };
-    Ok((prehash_seed, canonical, backend, fingerprints, filter))
-}
-
+/// Run `f` on the persistent build pool (P-core pinned on hybrid CPUs) so every rayon
+/// call inside the build lands there. Initialized once; avoids the ~150 ms Windows
+/// CreateThread cost of a per-build pool.
 #[cfg(feature = "parallel")]
-fn run_build_pipeline_with_pool(
-    arena: &KeyArena,
-    config: &IndexConfig,
-) -> Result<
-    (
-        u64,
-        Vec<u64>,
-        BackendDispatch,
-        Option<Box<[u16]>>,
-        Option<BlockBloom>,
-    ),
-    IndexError,
-> {
-    if !config.enable_parallel_build {
-        return run_build_pipeline(arena, config);
+fn run_in_build_pool<T: Send>(parallel: bool, f: impl FnOnce() -> T + Send) -> T {
+    if parallel {
+        crate::build_pool::pool().install(f)
+    } else {
+        f()
     }
-    // Per-call pinned pool. Tried OnceLock'd global pool to skip ~150 ms / build of
-    // thread spawn, but a single global pool pinned to core IDs interfered with the
-    // Use the global persistent pool (initialized once, reused across builds).
-    // Avoids the ~150 ms Windows CreateThread cost per build that the previous
-    // per-call pool incurred.
-    crate::build_pool::pool().install(|| run_build_pipeline(arena, config))
 }
 
 #[cfg(not(feature = "parallel"))]
-fn run_build_pipeline_with_pool(
-    arena: &KeyArena,
-    config: &IndexConfig,
-) -> Result<
-    (
-        u64,
-        Vec<u64>,
-        BackendDispatch,
-        Option<Box<[u16]>>,
-        Option<BlockBloom>,
-    ),
-    IndexError,
-> {
-    run_build_pipeline(arena, config)
+fn run_in_build_pool<T>(_parallel: bool, f: impl FnOnce() -> T) -> T {
+    f()
 }
 
-// Thread-pool & core-pinning logic now lives in `build_pool::pool()`.
+/// The build pipeline:
+///
+/// 1. canonical 64-bit hash of every key, in parallel, straight from the caller's slice;
+/// 2. partition the hashes into ~32K-key parts (`ptrhash25::partition_keys`);
+/// 3. build every part in parallel — bucket scatter, pilot search and per-key slots all
+///    stay inside L2 (`ptrhash25::build_partitioned`);
+/// 4. Block-Bloom (parallel by block range) and u16 fingerprints (parallel by part,
+///    written from the slots the build already computed) — skipped in lean mode.
+///
+/// There is no byte arena and no key copy: the only per-key allocations are the
+/// canonical hash array and the partitioned hash array (8 B/key each).
+fn build_engine<K>(keys: &[K], config: &IndexConfig) -> Result<MphEngine, IndexError>
+where
+    K: AsRef<[u8]> + Sync,
+{
+    let backend_cfg = make_backend_cfg(config);
+    let mph_cfg = backend_cfg.mph_config();
+    let base_seed = config.mph_config.seed;
+    // `KIRA_BUILD_TRACE=1` prints per-phase timings to stderr.
+    let trace = std::env::var_os("KIRA_BUILD_TRACE").is_some();
+    let mut round = 0u32;
+    loop {
+        let prehash_seed = base_seed ^ (round as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let n = keys.len();
+        let t0 = std::time::Instant::now();
+        let canonical = canonical_hash_all(keys, prehash_seed);
+        let t1 = std::time::Instant::now();
+        // Two big u64 buffers for the whole build (8 B/key each), never a third:
+        //  - non-lean: Bloom groups `canonical` (A) by filter window into B, then the
+        //    partition reads B and scatters into A, which becomes the part-key array;
+        //  - lean: the partition reads A and scatters into a fresh B.
+        // Filter and part builds only need *a* permutation of the hashes, so no copy of
+        // the original order is ever kept. At 100M keys this avoids faulting in 800 MB.
+        let (filter, part) = if config.lean_mph {
+            let part = crate::ptrhash25::partition_keys(canonical.as_slice(), &mph_cfg);
+            drop(canonical);
+            (None, part)
+        } else {
+            let mut grouped = crate::hugepage::HugeVec::<u64>::zeroed(n);
+            let filter =
+                BlockBloom::build_from_prehashed_into(canonical.as_slice(), grouped.as_mut_slice());
+            let part =
+                crate::ptrhash25::partition_keys_into(grouped.as_slice(), &mph_cfg, canonical);
+            drop(grouped);
+            (Some(filter), part)
+        };
+        let t2 = std::time::Instant::now();
+        let (backend, fp16) = match PtrHash25Backend::build_from_partitioned(
+            &part,
+            &backend_cfg,
+            !config.lean_mph,
+        ) {
+            Ok(v) => v,
+            Err(MphError::DuplicateKey) => {
+                round += 1;
+                if round >= MAX_PREHASH_ROUNDS {
+                    return Err(IndexError::Mph("DuplicateKey".to_string()));
+                }
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let t3 = std::time::Instant::now();
+        // Outer u16 fingerprints were filled per part inside the MPH build.
+        let fingerprints = fp16.map(Vec::into_boxed_slice);
+        if trace {
+            eprintln!(
+                "[kira_kv_engine build] n={} parts={} | canonical {:?} | bloom+partition {:?} | mph+fingerprints {:?} | total {:?}",
+                n,
+                part.num_parts(),
+                t1 - t0,
+                t2 - t1,
+                t3 - t2,
+                t3 - t0
+            );
+        }
+        return Ok(MphEngine {
+            backend: BackendDispatch::PtrHash25(backend),
+            prehash_seed,
+            filter,
+            fingerprints,
+        });
+    }
+}
+
+/// Canonical hash of every key, in parallel chunks of 4K keys. The output buffer is
+/// hugepage-backed when the process has the privilege and is first-touched
+/// sequentially otherwise (see `hugepage::prefault`).
+fn canonical_hash_all<K>(keys: &[K], seed: u64) -> crate::hugepage::HugeVec<u64>
+where
+    K: AsRef<[u8]> + Sync,
+{
+    let mut out = crate::hugepage::HugeVec::<u64>::zeroed(keys.len());
+    crate::hugepage::prefault(out.as_mut_slice());
+    const CHUNK: usize = 4096;
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        out.as_mut_slice()
+            .par_chunks_mut(CHUNK)
+            .zip(keys.par_chunks(CHUNK))
+            .for_each(|(o, kc)| hash_chunk(o, kc, seed));
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        hash_chunk(out.as_mut_slice(), keys, seed);
+    }
+    out
+}
+
+/// Hash one chunk of keys. With `Vec<Vec<u8>>` inputs whose bodies are scattered
+/// across the heap (e.g. shuffled), this phase is bound by TLB misses on the key
+/// bodies — software prefetch was measured to make no difference (PF = 0 / 16 / 64 all
+/// within noise at 10M keys), so the loop is kept plain.
+#[inline]
+fn hash_chunk<K: AsRef<[u8]>>(out: &mut [u64], keys: &[K], seed: u64) {
+    for (o, k) in out.iter_mut().zip(keys) {
+        *o = canonical_hash_key(k.as_ref(), seed);
+    }
+}
+
+/// Drop a large key vector using all build threads. Freeing 10M small allocations
+/// single-threaded costs ~200 ms on the Windows heap.
+fn drop_keys_parallel<K: Send>(keys: Vec<K>) {
+    #[cfg(feature = "parallel")]
+    {
+        if keys.len() >= 1 << 16 && std::mem::needs_drop::<K>() {
+            use rayon::prelude::*;
+            crate::build_pool::pool().install(|| keys.into_par_iter().for_each(drop));
+            return;
+        }
+    }
+    drop(keys);
+}
 
 #[inline(always)]
 fn canonical_hash_key(key: &[u8], seed: u64) -> u64 {
@@ -1233,9 +1377,18 @@ impl IndexBuilder {
 
     pub fn build_index<K>(self, keys: Vec<K>) -> Result<Index, IndexError>
     where
-        K: AsRef<[u8]>,
+        K: AsRef<[u8]> + Send + Sync,
     {
         Index::build_index(keys, self.config)
+    }
+
+    /// Build from borrowed keys — no clone, no deallocation inside the build. See
+    /// [`Index::build_index_ref`].
+    pub fn build_index_ref<K>(self, keys: &[K]) -> Result<Index, IndexError>
+    where
+        K: AsRef<[u8]> + Sync,
+    {
+        Index::build_index_ref(keys, self.config)
     }
 }
 
@@ -1243,173 +1396,6 @@ impl Default for IndexBuilder {
     fn default() -> Self {
         Self::new()
     }
-}
-
-struct KeyArena {
-    bytes: Vec<u8>,
-    offsets: Vec<u32>,
-}
-
-impl KeyArena {
-    fn len(&self) -> usize {
-        self.offsets.len().saturating_sub(1)
-    }
-}
-
-fn build_key_arena<K>(keys: Vec<K>, seed: u64) -> Result<KeyArena, IndexError>
-where
-    K: AsRef<[u8]>,
-{
-    let total_bytes = keys.iter().map(|k| k.as_ref().len()).sum();
-    let mut bytes = Vec::with_capacity(total_bytes);
-    let mut offsets = Vec::with_capacity(keys.len() + 1);
-    offsets.push(0u32);
-    // Fast-path detector: if every key is exactly 8 bytes, we can dedupe by sorting
-    // the u64 values directly — no hashing required.
-    let mut all_u64 = true;
-    let mut u64_values: Vec<u64> = Vec::with_capacity(keys.len());
-    let mut hashes_with_idx = Vec::with_capacity(keys.len());
-
-    for (i, key) in keys.into_iter().enumerate() {
-        let k = key.as_ref();
-        if all_u64 && k.len() == 8 {
-            let v = unsafe { std::ptr::read_unaligned(k.as_ptr() as *const u64) };
-            u64_values.push(u64::from_le(v));
-        } else if all_u64 {
-            // First non-u64 key: switch to hash-based dedup, backfill what we already have.
-            all_u64 = false;
-            hashes_with_idx.reserve(u64_values.len() + 1);
-            for (j, &v) in u64_values.iter().enumerate() {
-                hashes_with_idx.push((crate::build_hasher::fast_hash_bytes(&v.to_le_bytes()), j as u32));
-            }
-            u64_values.clear();
-        }
-        if !all_u64 {
-            let h = crate::build_hasher::fast_hash_bytes(k);
-            hashes_with_idx.push((h, i as u32));
-        }
-        bytes.extend_from_slice(k);
-        offsets.push(bytes.len() as u32);
-    }
-
-    if all_u64 && !u64_values.is_empty() {
-        // O(N log N) sort of plain u64 — no hashing collisions to worry about, no byte compare.
-        let mut sorted = u64_values.clone();
-        #[cfg(feature = "parallel")]
-        {
-            use rayon::prelude::*;
-            sorted.par_sort_unstable();
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            sorted.sort_unstable();
-        }
-        for w in sorted.windows(2) {
-            if w[0] == w[1] {
-                return Err(IndexError::Mph("DuplicateKey".to_string()));
-            }
-        }
-    } else {
-        #[cfg(feature = "parallel")]
-        {
-            use rayon::prelude::*;
-            hashes_with_idx.par_sort_unstable_by_key(|&(h, _)| h);
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            hashes_with_idx.sort_unstable_by_key(|&(h, _)| h);
-        }
-
-        for window in hashes_with_idx.windows(2) {
-            if window[0].0 == window[1].0 {
-                let idx1 = window[0].1 as usize;
-                let idx2 = window[1].1 as usize;
-                let k1 = &bytes[(offsets[idx1] as usize)..(offsets[idx1 + 1] as usize)];
-                let k2 = &bytes[(offsets[idx2] as usize)..(offsets[idx2 + 1] as usize)];
-                if k1 == k2 {
-                    return Err(IndexError::Mph("DuplicateKey".to_string()));
-                }
-            }
-        }
-    }
-
-    if offsets.len() <= 2 {
-        return Ok(KeyArena { bytes, offsets });
-    }
-
-    let mut order: Vec<usize> = (0..offsets.len() - 1).collect();
-    permute_order_for_builder(&mut order, &bytes, &offsets, seed);
-    compact_arena_by_order(&bytes, &offsets, &order)
-}
-
-fn permute_order_for_builder(order: &mut [usize], bytes: &[u8], offsets: &[u32], seed: u64) {
-    if order.len() <= 1 {
-        return;
-    }
-    let mut s = seed ^ (order.len() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-    let sample = order.len().min(8);
-    for i in 0..sample {
-        let idx = order[i];
-        let start = offsets[idx] as usize;
-        let end = offsets[idx + 1] as usize;
-        s ^= crate::build_hasher::fast_hash_bytes(&bytes[start..end]);
-        s = xorshift64(s);
-    }
-    for i in (1..order.len()).rev() {
-        s = xorshift64(s);
-        let j = (s % (i as u64 + 1)) as usize;
-        order.swap(i, j);
-    }
-}
-
-fn compact_arena_by_order(
-    bytes: &[u8],
-    offsets: &[u32],
-    order: &[usize],
-) -> Result<KeyArena, IndexError> {
-    let mut out_offsets = Vec::with_capacity(order.len() + 1);
-    out_offsets.push(0u32);
-    let mut out_bytes = Vec::with_capacity(bytes.len());
-    for &idx in order {
-        let start = offsets[idx] as usize;
-        let end = offsets[idx + 1] as usize;
-        out_bytes.extend_from_slice(&bytes[start..end]);
-        if out_bytes.len() > u32::MAX as usize {
-            return Err(IndexError::CorruptData);
-        }
-        out_offsets.push(out_bytes.len() as u32);
-    }
-    Ok(KeyArena {
-        bytes: out_bytes,
-        offsets: out_offsets,
-    })
-}
-
-#[inline]
-fn xorshift64(mut x: u64) -> u64 {
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    x
-}
-
-fn build_fingerprints_hashed(backend: &BackendDispatch, keys: &[u64]) -> Vec<u16> {
-    // First pass: find the maximum slot the backend returns. Most backends map to
-    // exactly [0, N) but PtrHashV2's near-minimal variant maps to [0, ~1.1*N).
-    let mut max_idx = keys.len();
-    for &k in keys {
-        let idx = backend.lookup(k).expect("backend must map training keys") as usize;
-        if idx >= max_idx {
-            max_idx = idx + 1;
-        }
-    }
-    let mut fps = vec![0u16; max_idx];
-    for &k in keys {
-        let idx = backend.lookup(k).expect("backend must map training keys") as usize;
-        let fp = fingerprint16_mph(k);
-        fps[idx] = fp;
-    }
-    fps
 }
 
 #[inline]

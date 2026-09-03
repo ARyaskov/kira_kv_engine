@@ -19,7 +19,7 @@ use kira_kv_engine::{
     // Workload-aware caching
     DynamicHotTier, SpaceSaving,
     // GPU export (PtrHash25 snapshot for off-host lookup)
-    GpuExport, BloomExport,
+    GpuExport, GpuPart, BloomExport,
     // Backend config
     BackendKind, BackendBuildConfig, BuildProfile, MphBackend,
 };
@@ -57,9 +57,23 @@ impl IndexBuilder {
     pub fn with_pgm_elias_fano(self, enabled: bool) -> Self;
     pub fn with_pgm_target_lookup_ns(self, ns: u32) -> Self;
 
-    pub fn build_index<K: AsRef<[u8]>>(self, keys: Vec<K>) -> Result<Index, IndexError>;
+    /// Owned keys: same build as `build_index_ref`, then `keys` is dropped in
+    /// parallel on the build pool.
+    pub fn build_index<K: AsRef<[u8]> + Send + Sync>(self, keys: Vec<K>)
+        -> Result<Index, IndexError>;
+
+    /// Borrowed keys. No clone on the caller side, no deallocation inside
+    /// the build. Keys are hashed in parallel straight from the slice, partitioned
+    /// into ~32K-key parts and every part is built independently (parallel,
+    /// L2-resident). Duplicates → `Err(IndexError::Mph("DuplicateKey"))`.
+    pub fn build_index_ref<K: AsRef<[u8]> + Sync>(self, keys: &[K])
+        -> Result<Index, IndexError>;
 }
 ```
+
+Build diagnostics: set `KIRA_BUILD_TRACE=1` to print per-phase timings (canonical
+hash, partition, MPH, Bloom, fingerprints) to stderr. The build pool defaults to one
+pinned thread per P-core; override with `KIRA_BUILD_THREADS` / `KIRA_BUILD_CORE_IDS`.
 
 ### `IndexConfig`
 
@@ -385,18 +399,42 @@ POD snapshot of a built `Index` for GPU/SIMD pipeline consumers.
 ```rust
 pub struct GpuExport {
     pub prehash_seed: u64,
-    pub mph_salt: u64,
-    pub num_buckets: u32,
-    pub num_slots: u64,
+    pub mph_salt: u64,          // salt of part 0 (base-hash salt for multi-part)
+    pub num_buckets: u32,       // total over all parts == pilots.len()
+    pub num_slots: u64,         // total over all parts
     pub prerotate: u8,
     pub pilots: Vec<u8>,
     pub bloom: Option<BloomExport>,
     pub fingerprints: Option<Vec<u16>>,
+    pub part_salt: u64,         // part selector salt (multi-part indexes)
+    pub parts: Vec<GpuPart>,    // ≥ 1 entry; a single entry means the single-partition formula
+}
+
+/// One part of the partitioned PtrHash25. Lookup:
+///   rotated = key.rotate_left(prerotate)
+///   p       = parts.len() > 1 ? mulhi((rotated ^ part_salt) * 0x9E3779B97F4A7C15, parts.len()) : 0
+///   base    = mix64(rotated ^ mph_salt)          // single part: mix64(rotated ^ parts[0].salt)
+///   h1      = parts.len() > 1 ? (base ^ parts[p].salt) * 0xBF58476D1CE4E5B9 : base
+///   h2      = rotl(h1, 23) ^ 0xA24B1F6FDA392B31
+///   bucket  = parts[p].bucket_off + bucket_for(h1, parts[p].num_buckets, parts[p].large_buckets)
+///   slot    = parts[p].slot_off + slot_for(h2, pilots[bucket], parts[p].num_slots)
+pub struct GpuPart {
+    pub slot_off: u64,
+    pub salt: u64,
+    pub bucket_off: u32,
+    pub num_slots: u32,
+    pub num_buckets: u32,
+    pub large_buckets: u32,    // floor(num_buckets * 0.30)
 }
 
 pub struct BloomExport {
-    pub blocks: usize,        // power-of-two
+    pub blocks: usize,        // multiple of 256 (was a power of two in 0.6)
     pub words: Vec<u64>,      // length = blocks * 8
+    /// Lane bit-index shift: 26 for current filters (6-bit index, all 64 bits of a
+    /// word used), 27 for filters deserialized from 0.6 files (5-bit index).
+    ///   block = ((hash >> 32) * blocks) >> 32
+    ///   bit_w = (((hash & 0xFFFFFFFF) * SALT[w]) >> bit_shift) & 0x3F
+    pub bit_shift: u32,
 }
 ```
 

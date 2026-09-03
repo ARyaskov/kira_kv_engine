@@ -81,6 +81,33 @@ fn print_hugepage_help() {
 /// 2 MB hugepage size.
 const HUGEPAGE_SIZE: usize = 2 * 1024 * 1024;
 
+/// Touch one byte per 4 KB page of a freshly allocated (zeroed) buffer, sequentially.
+///
+/// Windows materializes zero pages on first touch under an address-space lock; when
+/// eight workers first-touch the same fresh buffer at random offsets the faults
+/// serialize *and* contend (~1-5 µs each, measured at 100M keys), which dwarfed the
+/// actual work of the parallel phases. One sequential sweep ahead of the parallel
+/// phase pays ~0.3 µs per page instead. A no-op cost-wise on hugepage-backed buffers
+/// (few pages) and on memory that is already resident.
+pub fn prefault<T: Copy>(buf: &mut [T]) {
+    const PAGE: usize = 4096;
+    let bytes = std::mem::size_of_val(buf);
+    if bytes < PAGE {
+        return;
+    }
+    let base = buf.as_mut_ptr() as *mut u8;
+    let mut off = 0usize;
+    while off < bytes {
+        // SAFETY: `off < bytes`, inside the buffer; writing the byte's own value (zero on
+        // fresh memory, unchanged otherwise) is a no-op for the contents.
+        unsafe {
+            let p = base.add(off);
+            std::ptr::write_volatile(p, std::ptr::read_volatile(p));
+        }
+        off += PAGE;
+    }
+}
+
 /// Owned byte buffer that may live in hugepages (preferred) or regular pages (fallback).
 pub struct HugepageBuf {
     ptr: *mut u8,
