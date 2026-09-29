@@ -131,9 +131,6 @@ pub enum PgmError {
     KeyNotFound,
     #[error("corrupt data")]
     CorruptData,
-    #[cfg(feature = "serde")]
-    #[error("serialization error: {0}")]
-    Serde(String),
 }
 
 impl PgmIndex {

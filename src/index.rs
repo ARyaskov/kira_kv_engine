@@ -1387,10 +1387,10 @@ where
 {
     let mut out = crate::hugepage::HugeVec::<u64>::zeroed(keys.len());
     crate::hugepage::prefault(out.as_mut_slice());
-    const CHUNK: usize = 4096;
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
+        const CHUNK: usize = 4096;
         out.as_mut_slice()
             .par_chunks_mut(CHUNK)
             .zip(keys.par_chunks(CHUNK))

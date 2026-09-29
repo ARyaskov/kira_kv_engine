@@ -1,6 +1,6 @@
 [package]
 name = "kira_kv_engine"
-version = "0.6.3"
+version = "0.7.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
@@ -14,36 +14,41 @@ categories = ["data-structures", "database"]
 
 
 [features]
-default = ["serde", "simd", "parallel", "pgm"]
-serde = ["dep:serde", "dep:rkyv"]
-simd = []
+default = ["parallel"]
+# Parallel builds on a persistent rayon pool (P-core pinned on hybrid CPUs).
 parallel = ["dep:rayon", "dep:core_affinity"]
+# Legacy feature names kept so existing `features = [...]` lists keep compiling.
+# They have no effect: SIMD paths are dispatched at runtime, the PGM engines are
+# always compiled in, and nothing in the crate uses serde/rkyv.
+serde = []
+simd = []
 pgm = []
-avx512 = ["simd"]
+avx512 = []
 unsafe_optimizations = []
 bbhash = []
 
 [dependencies]
 thiserror = "2"
-serde = { version = "1", features = ["derive"], optional = true }
-rkyv = { version = "0.7", features = ["validation"], optional = true }
 rayon = { version = "1.11", optional = true }
 core_affinity = { version = "0.8", optional = true }
-wyhash = { version = "0.6"}
+wyhash = "0.6"
 hashbrown = "0.16"
-rand = "0.8.5"
 
 [dev-dependencies]
 tempfile = "3"
+rand = "0.8.5"
+
+[[example]]
+name = "million_build"
+required-features = ["parallel"]
 
 
+# Profiles below apply only when building this crate's own examples, benches and
+# tests; a dependent crate's profile is what governs the library code it links.
 [profile.release]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
-overflow-checks = false
-debug-assertions = false
 
 [profile.bench]
 inherits = "release"

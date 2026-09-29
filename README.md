@@ -133,8 +133,11 @@ let positions = hybrid.lookup_batch_u64_simd(&query_keys);  // 30-50 ns/key
 
 ```toml
 [dependencies]
-kira_kv_engine = ">=0.3.2"
+kira_kv_engine = "0.7"
 ```
+
+The on-disk formats and parts of the API changed in 0.7 (see *Notes*); pin the
+minor version.
 
 ## Quick Start
 

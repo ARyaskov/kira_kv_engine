@@ -55,7 +55,9 @@ pub mod __internal {
         pub use crate::aes_hash::{aes_round_hw, aes_round_soft, hash_bytes, hash_u64, hw_available};
     }
     pub use crate::block_bloom::BlockBloom;
-    pub use crate::build_pool::{pool, radix_sort_u64_pairs};
+    #[cfg(feature = "parallel")]
+    pub use crate::build_pool::pool;
+    pub use crate::build_pool::radix_sort_u64_pairs;
     pub use crate::hugepage::HugepageBuf;
     pub use crate::mini_chd::{MiniChd, MiniChdError};
     pub use crate::mmap_index::{Header, MmapIndex, MmapIndexWriter, SectionKind};
