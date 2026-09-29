@@ -375,12 +375,16 @@ impl HybridBuilder {
         let sorted_hashes: Vec<u64> = hashed.iter().map(|&(h, _)| h).collect();
         let sorted_positions: Vec<u32> = hashed.iter().map(|&(_, p)| p).collect();
 
-        // Phase 3: build PGM on sorted hashes.
-        let pgm = PgmBuilder::new()
+        // Phase 3: build PGM on sorted hashes. The PGM is only used as a segment
+        // locator here (`segment_for_key`), so the key array is taken back out of it
+        // once the segments are fitted: no clone during the build and no second
+        // 8 B/key copy in the finished index.
+        let mut pgm = PgmBuilder::new()
             .with_epsilon(self.pgm_epsilon)
             .with_parallel(self.enable_parallel)
-            .build(sorted_hashes.clone())
+            .build(sorted_hashes)
             .map_err(|e| HybridError::Pgm(format!("{:?}", e)))?;
+        let sorted_hashes = pgm.take_keys();
 
         // Phase 4: enumerate segments and build per-segment storage.
         let num_segments = enumerate_segments(&pgm);

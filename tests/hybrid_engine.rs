@@ -115,3 +115,17 @@ fn storage_stats_mixed() {
     );
     assert_eq!(stats.linear_keys + stats.chd_keys + stats.mph_keys, 20_000);
 }
+
+/// The PGM inside a HybridIndex is only a segment locator; it must not keep a
+/// second copy of every hash. Memory per key stays well under the 8 B a
+/// retained key array alone would cost.
+#[test]
+fn hybrid_does_not_retain_pgm_keys() {
+    let keys: Vec<u64> = (0u64..200_000).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
+    let idx = HybridBuilder::new().with_pgm_epsilon(2048).with_lean(true).build_from_u64(&keys).unwrap();
+    let per_key = idx.memory_usage() as f64 / keys.len() as f64;
+    assert!(per_key < 8.0, "hybrid lean index uses {per_key:.2} B/key");
+    for (i, &k) in keys.iter().enumerate().step_by(97) {
+        assert_eq!(idx.lookup_u64(k), Some(i as u32));
+    }
+}

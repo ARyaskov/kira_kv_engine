@@ -103,6 +103,9 @@ pub struct PgmIndex {
     keys_ef: Option<crate::elias_fano::EliasFano>,
     /// Learned segments.
     segments: SegmentsSoA,
+    /// Number of keys the segments were fitted on. Stays valid after
+    /// [`PgmIndex::take_keys`] releases the key array.
+    key_count: usize,
     /// Epsilon parameter for error tolerance (max across all segments).
     epsilon: u32,
     /// Optional Block-Bloom filter for fast negative lookup rejection.
@@ -140,12 +143,29 @@ impl PgmIndex {
         bloom: Option<BlockBloom>,
     ) -> Self {
         Self {
+            key_count: keys.len(),
             keys,
             keys_ef: None,
             segments,
             epsilon,
             bloom,
         }
+    }
+
+    /// Give the sorted key array back to the caller and switch this index into
+    /// *locator-only* mode: `segment_for_key` / `segment_bounds` keep working from
+    /// the segment tables alone, while `index()`/`lower_bound()`/`range()` — which
+    /// need the keys — report misses. Used by `HybridIndex`, which only needs the
+    /// segment locator and keeps its own per-segment storage, saving 8 B/key.
+    pub(crate) fn take_keys(&mut self) -> Vec<u64> {
+        self.keys_ef = None;
+        std::mem::take(&mut self.keys)
+    }
+
+    /// Whether the key array is present (see [`PgmIndex::take_keys`]).
+    #[inline]
+    fn has_keys(&self) -> bool {
+        self.keys_ef.is_some() || self.keys.len() == self.key_count
     }
 
     /// Compact `self.keys` into an Elias-Fano representation, freeing the plain
@@ -189,11 +209,7 @@ impl PgmIndex {
     /// Number of keys in the index.
     #[inline]
     fn keys_count(&self) -> usize {
-        if let Some(ef) = &self.keys_ef {
-            ef.len()
-        } else {
-            self.keys.len()
-        }
+        self.key_count
     }
 
     /// Materialize keys in `[from, to)` into `out`. Used by `index()` /
@@ -210,23 +226,21 @@ impl PgmIndex {
         }
     }
 
-    /// Greedy-PLA optimal segmentation in O(N · avg_seg_len) time. Replaces the
-    /// old O(N²) "regress from scratch on every extension attempt" loop.
+    /// Linear-time piecewise-linear segmentation (slope-window / "swing" filter).
     ///
-    /// The shape of the algorithm:
-    /// 1. We process keys left-to-right.
-    /// 2. For each prefix we maintain incremental linear-regression stats
-    ///    (sum_x, sum_y, sum_xy, sum_xx). Adding a point is O(1).
-    /// 3. After each `add`, we recompute (slope, intercept) and validate
-    ///    max_error against ALL points in the current segment. Validating is
-    ///    O(seg_len) — but seg_len averages 30–100, so total work is linear in N.
-    /// 4. If max_error > ε, we close the segment at the *previous* boundary
-    ///    and start a new one.
+    /// Each segment is anchored at its first key `(x0, y0)`. Every further key
+    /// `(x, y)` constrains the slope to `[(y - y0 - ε) / (x - x0), (y - y0 + ε) / (x - x0)]`;
+    /// the running intersection of these intervals is the set of lines through
+    /// the anchor that keep *every* key of the segment within ε. The segment is
+    /// closed at the first key that empties the interval, and the middle of the
+    /// interval is emitted as the slope. Adding a key is O(1), so the whole pass
+    /// is O(N) — the previous implementation re-validated the entire segment on
+    /// every extension, which was O(L²) per segment and took seconds for a
+    /// single 200K-key segment.
     ///
-    /// Why this beats the old "fit_segment(start..end) for every end"
-    /// — the old code did a full quadratic-sum regression each time, so
-    /// extending a segment to length L cost O(L), and extending to L+1 cost O(L+1),
-    /// totalling O(L²) for the segment. Our incremental version is O(L) total.
+    /// Anchoring the intercept costs a few percent more segments than the optimal
+    /// convex-hull PLA, but the guarantee is exact for the f64 line. The f32
+    /// quantization is measured afterwards (see `segments_to_soa`).
     fn build_segments_greedy(
         keys: &[u64],
         epsilon: u32,
@@ -241,64 +255,51 @@ impl PgmIndex {
         let mut segments: Vec<SegmentBuild> = Vec::with_capacity(n / 32 + 1);
         let mut start = 0usize;
         while start < n {
-            let mut reg = LinReg::new();
-            let mut last_good: Option<SegmentBuild> = None;
             let local_eps = if start >= hot_start && start < hot_end {
                 epsilon
             } else {
                 cold_epsilon
-            };
-            let mut end = start;
+            } as f64;
+            let x0 = keys[start] as f64;
+            let y0 = start as f64;
+            let mut lo = f64::NEG_INFINITY;
+            let mut hi = f64::INFINITY;
+            let mut end = start + 1;
             while end < n {
-                reg.add(keys[end], end);
-                end += 1;
-                if reg.n < 2.0 {
-                    last_good = Some(SegmentBuild {
-                        slope: 0.0,
-                        intercept: start as f64,
-                        min_key: keys[start],
-                        max_key: keys[start],
-                        start,
-                        end,
-                    });
-                    continue;
-                }
-                if let Some((slope, intercept)) = reg.slope_intercept() {
-                    if reg.max_error_quantized(slope, intercept, keys, start) <= local_eps {
-                        last_good = Some(SegmentBuild {
-                            slope,
-                            intercept,
-                            min_key: keys[start],
-                            max_key: keys[end - 1],
-                            start,
-                            end,
-                        });
-                    } else {
-                        end -= 1;
-                        break;
-                    }
-                } else {
+                // Keys are sorted and unique, so dx > 0 (as f64 it can round to a
+                // value equal to a neighbour's only for keys > 2^53 apart by < 1 ulp,
+                // in which case the window simply closes).
+                let dx = keys[end] as f64 - x0;
+                if dx <= 0.0 {
                     break;
                 }
-            }
-            match last_good {
-                Some(seg) => {
-                    let advance = seg.end;
-                    segments.push(seg);
-                    start = advance;
+                let dy = (end - start) as f64;
+                let slo = (dy - local_eps) / dx;
+                let shi = (dy + local_eps) / dx;
+                lo = lo.max(slo);
+                hi = hi.min(shi);
+                if lo > hi {
+                    break;
                 }
-                None => {
-                    segments.push(SegmentBuild {
-                        slope: 0.0,
-                        intercept: start as f64,
-                        min_key: keys[start],
-                        max_key: keys[start],
-                        start,
-                        end: start + 1,
-                    });
-                    start += 1;
-                }
+                end += 1;
             }
+            let slope = if end == start + 1 {
+                0.0
+            } else {
+                // Any slope in [lo, hi] is valid; the midpoint maximizes the margin
+                // that survives f32 quantization.
+                0.5 * (lo + hi)
+            };
+            let intercept = y0 - slope * x0;
+            segments.push(SegmentBuild {
+                slope,
+                intercept,
+                min_key: keys[start],
+                max_key: keys[end - 1],
+                start,
+                end,
+            });
+            start = end;
         }
         segments
     }
@@ -367,6 +368,9 @@ impl PgmIndex {
             if !bf.contains_u64(key) {
                 return Err(PgmError::KeyNotFound);
             }
+        }
+        if !self.has_keys() {
+            return Err(PgmError::KeyNotFound);
         }
 
         let segment_idx = find_segment_branchless(&self.segments.max_keys, key);
@@ -442,6 +446,9 @@ impl PgmIndex {
     /// Find first position where key >= target.
     pub fn lower_bound(&self, target: u64) -> usize {
         let n = self.keys_count();
+        if !self.has_keys() {
+            return n;
+        }
         let segment_idx = find_segment_branchless(&self.segments.max_keys, target);
         if segment_idx >= self.segments.max_keys.len() {
             return n;
@@ -677,6 +684,7 @@ impl PgmIndex {
             None
         };
         let idx = PgmIndex {
+            key_count: keys.len(),
             keys,
             keys_ef: None,
             segments: SegmentsSoA {
@@ -984,6 +992,7 @@ impl PgmIndex {
             None
         };
         let idx = PgmIndex {
+            key_count: keys.len(),
             keys,
             keys_ef: None,
             segments: SegmentsSoA {
@@ -1113,74 +1122,6 @@ fn u32_pairs_from_section(bytes: &[u8]) -> Vec<(u32, u32)> {
         out.push((u32::from_le_bytes(a), u32::from_le_bytes(b)));
     }
     out
-}
-
-// --------------------------------------------------------------------------------------
-// Incremental linear regression. Used by build_segments_greedy.
-// --------------------------------------------------------------------------------------
-
-struct LinReg {
-    n: f64,
-    sum_x: f64,
-    sum_y: f64,
-    sum_xy: f64,
-    sum_xx: f64,
-}
-
-impl LinReg {
-    fn new() -> Self {
-        Self {
-            n: 0.0,
-            sum_x: 0.0,
-            sum_y: 0.0,
-            sum_xy: 0.0,
-            sum_xx: 0.0,
-        }
-    }
-
-    #[inline]
-    fn add(&mut self, key: u64, pos: usize) {
-        let kf = key as f64;
-        let pf = pos as f64;
-        self.n += 1.0;
-        self.sum_x += kf;
-        self.sum_y += pf;
-        self.sum_xy += kf * pf;
-        self.sum_xx += kf * kf;
-    }
-
-    #[inline]
-    fn slope_intercept(&self) -> Option<(f64, f64)> {
-        let denom = self.n * self.sum_xx - self.sum_x * self.sum_x;
-        if denom.abs() < 1e-10 {
-            return None;
-        }
-        let slope = (self.n * self.sum_xy - self.sum_x * self.sum_y) / denom;
-        let intercept = (self.sum_y - slope * self.sum_x) / self.n;
-        Some((slope, intercept))
-    }
-
-    /// Compute max prediction error after we'd quantize slope→f32 and intercept→f32.
-    /// This is what determines whether the segment can be stored with the current ε.
-    /// We compute it against the quantized values so we don't accept segments that
-    /// later violate ε once we drop precision (honesty check).
-    #[inline]
-    fn max_error_quantized(&self, slope: f64, intercept: f64, keys: &[u64], start: usize) -> u32 {
-        let sq = slope as f32 as f64;
-        let iq = intercept as f32 as f64;
-        let mut max_err = 0u32;
-        let end = start + self.n as usize;
-        for (offset, &key) in keys[start..end].iter().enumerate() {
-            let pred = sq.mul_add(key as f64, iq);
-            let actual = (start + offset) as f64;
-            // Round up — see `segments_to_soa` for why truncation loses keys.
-            let err = (pred - actual).abs().ceil() as u32;
-            if err > max_err {
-                max_err = err;
-            }
-        }
-        max_err
-    }
 }
 
 // --------------------------------------------------------------------------------------
@@ -1622,6 +1563,7 @@ impl PgmBuilder {
 
         if sorted.is_empty() {
             return Ok(PgmIndex {
+                key_count: 0,
                 keys: Vec::new(),
                 keys_ef: None,
                 segments: SegmentsSoA::default(),
@@ -1674,6 +1616,7 @@ impl PgmBuilder {
         };
 
         let mut idx = PgmIndex {
+            key_count: sorted.len(),
             keys: sorted,
             keys_ef: None,
             segments,
