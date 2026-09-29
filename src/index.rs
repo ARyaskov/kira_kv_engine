@@ -1,4 +1,5 @@
 use crate::block_bloom::BlockBloom;
+#[allow(deprecated)]
 use crate::mph_backend::{
     BackendDispatch, BackendKind, BuildConfig as BackendConfig, BuildProfile, PtrHash25Backend,
 };
@@ -66,31 +67,32 @@ impl From<PgmError> for IndexError {
 
 /// Configuration for the index.
 ///
-/// As of v0.5 there's only one MPH backend (PtrHash25); the `backend` field is kept
-/// as a 1-variant enum for future extensibility. `hot_fraction` controls the PGM
-/// hot-tier cache for numeric workloads.
-///
-/// PGM-specific options (`pgm_*`) apply only when `auto_detect_numeric = true` and
-/// all input keys are 8-byte little-endian u64.
+/// The live options are `mph_config`, `enable_parallel_build` and `lean_mph`.
+/// The PGM-related fields and `backend`/`hot_fraction`/`build_fast_profile` are
+/// left over from the removed in-`Index` PGM engine (0.6) and the multi-backend
+/// era (0.5): they have no effect, are deprecated, and will be removed in the next
+/// breaking release. Use [`crate::PgmBuilder`] / [`crate::HybridBuilder`] for
+/// numeric range indexes.
 #[derive(Debug, Clone)]
 pub struct IndexConfig {
     pub mph_config: MphConfig,
+    #[deprecated(since = "0.7.0", note = "no effect; use PgmBuilder::with_epsilon")]
     pub pgm_epsilon: u32,
+    #[deprecated(since = "0.7.0", note = "no effect; Index is always MPH-backed")]
     pub auto_detect_numeric: bool,
+    #[deprecated(since = "0.7.0", note = "no effect; PtrHash25 is the only backend")]
     pub backend: BackendKind,
+    #[deprecated(since = "0.7.0", note = "no effect")]
     pub hot_fraction: f32,
     pub enable_parallel_build: bool,
-    /// Kept for API compatibility; no effect. The build always detects
-    /// duplicate keys exactly, in every profile.
+    /// No effect. The build always detects duplicate keys exactly.
+    #[deprecated(since = "0.7.0", note = "no effect; duplicates are always detected")]
     pub build_fast_profile: bool,
-    /// Enable Block-Bloom for fast PGM negative-lookup path. Costs
-    /// ~10–12 bits/key, rejects ~99% of misses in O(1) without touching segments.
+    #[deprecated(since = "0.7.0", note = "no effect; use PgmBuilder::with_bloom_filter")]
     pub pgm_enable_bloom: bool,
-    /// Compact PGM keys via Elias-Fano. Saves ~30–50% on key memory at
-    /// large N, costs ~50 ns/lookup for materialization. Default off.
+    #[deprecated(since = "0.7.0", note = "no effect; use PgmBuilder::with_elias_fano")]
     pub pgm_enable_elias_fano: bool,
-    /// Auto-tune ε for a target per-lookup latency in nanoseconds. When
-    /// set, overrides `pgm_epsilon`. Default: None (use `pgm_epsilon` as-is).
+    #[deprecated(since = "0.7.0", note = "no effect; use PgmBuilder::with_target_lookup_ns")]
     pub pgm_target_lookup_ns: Option<u32>,
     /// **Lean MPH mode** (saves ~50% memory for positive-only workloads).
     ///
@@ -109,6 +111,7 @@ pub struct IndexConfig {
     pub lean_mph: bool,
 }
 
+#[allow(deprecated)]
 impl Default for IndexConfig {
     fn default() -> Self {
         let mut cfg = crate::cpu::detect_features().optimal_index_config();
@@ -287,6 +290,7 @@ impl Index {
         self.lookup_mph(engine, key)
     }
 
+    #[deprecated(since = "0.7.0", note = "alias; use lookup")]
     pub fn get(&self, key: &[u8]) -> Result<usize, IndexError> {
         self.lookup(key)
     }
@@ -295,6 +299,7 @@ impl Index {
         self.lookup(key.as_bytes())
     }
 
+    #[deprecated(since = "0.7.0", note = "alias; use lookup_str")]
     pub fn get_str(&self, key: &str) -> Result<usize, IndexError> {
         self.lookup_str(key)
     }
@@ -541,13 +546,9 @@ impl Index {
         i
     }
 
-    /// Fast-path lookup for u64 keys on PtrHash25-backed Mph engines. Skips the
-    /// canonical bytes path (no `to_le_bytes` allocation, no wyhash dispatch) and
-    /// the BackendDispatch enum match — straight to PtrHash25::index_u64. Saves
-    /// ~5-10 ns per lookup vs `lookup_u64` for hot paths.
-    ///
-    /// Returns `None` for non-PtrHash25 engines or non-Mph engines; callers
-    /// detecting `None` should fall back to `lookup_u64`.
+    /// Same result as [`Index::lookup_u64`]; the extra `Option` layer dates from
+    /// the multi-backend era and is always `Some` for a non-empty index.
+    #[deprecated(since = "0.7.0", note = "use lookup_u64; it is the same code path")]
     #[inline]
     pub fn lookup_u64_fast(&self, key: u64) -> Option<Result<usize, IndexError>> {
         let engine = self.engine.as_ref()?;
@@ -574,16 +575,20 @@ impl Index {
         }
     }
 
+    #[deprecated(since = "0.7.0", note = "alias; use lookup_u64")]
     pub fn get_u64(&self, key: u64) -> Result<usize, IndexError> {
         self.lookup_u64(key)
     }
 
-    /// Range queries are not supported by the PtrHash25-only `Index`. Use
-    /// `PgmIndex` directly for semantic u64 range queries.
+    /// Range queries are not supported by the hash-based `Index`; this always
+    /// returns an empty vector. Use [`crate::PgmIndex`] for semantic u64 ranges.
+    #[deprecated(since = "0.7.0", note = "Index has no order; use PgmIndex::range")]
     pub fn range(&self, _min_key: u64, _max_key: u64) -> Vec<usize> {
         Vec::new()
     }
 
+    #[deprecated(since = "0.7.0", note = "Index has no order; use PgmIndex::range")]
+    #[allow(deprecated)]
     pub fn get_all(&self, min_key: u64, max_key: u64) -> Vec<usize> {
         self.range(min_key, max_key)
     }
@@ -624,10 +629,12 @@ impl Index {
         }
     }
 
+    #[deprecated(since = "0.7.0", note = "alias; use contains")]
     pub fn has(&self, key: &[u8]) -> bool {
         self.contains(key)
     }
 
+    #[deprecated(since = "0.7.0", note = "alias; use contains")]
     pub fn exists(&self, key: &[u8]) -> bool {
         self.contains(key)
     }
@@ -649,10 +656,12 @@ impl Index {
             .collect()
     }
 
+    #[deprecated(since = "0.7.0", note = "alias; use contains_batch")]
     pub fn has_batch(&self, keys: &[&[u8]]) -> Vec<bool> {
         self.contains_batch(keys)
     }
 
+    #[deprecated(since = "0.7.0", note = "alias; use contains_batch")]
     pub fn exists_batch(&self, keys: &[&[u8]]) -> Vec<bool> {
         self.contains_batch(keys)
     }
@@ -684,6 +693,7 @@ impl Index {
         out
     }
 
+    #[deprecated(since = "0.7.0", note = "alias; use lookup_batch")]
     pub fn get_batch(&self, keys: &[&[u8]]) -> Vec<Option<usize>> {
         self.lookup_batch(keys)
     }
@@ -1017,6 +1027,7 @@ impl Index {
         Self::from_bytes(&bytes)
     }
 
+    #[deprecated(since = "0.7.0", note = "alias; use to_bytes")]
     pub fn serialize(&self) -> Result<Vec<u8>, IndexError> {
         self.to_bytes()
     }
@@ -1180,6 +1191,7 @@ impl Index {
         }
     }
 
+    #[deprecated(since = "0.7.0", note = "alias; use from_bytes")]
     pub fn deserialize(bytes: &[u8]) -> Result<Self, IndexError> {
         Self::from_bytes(bytes)
     }
@@ -1211,6 +1223,7 @@ impl Index {
 }
 
 #[inline(always)]
+#[allow(deprecated)]
 fn make_backend_cfg(config: &IndexConfig) -> BackendConfig {
     BackendConfig {
         backend: config.backend,
@@ -1434,16 +1447,22 @@ impl IndexBuilder {
         self
     }
 
+    #[deprecated(since = "0.7.0", note = "no effect; use PgmBuilder::with_epsilon")]
+    #[allow(deprecated)]
     pub fn with_pgm_epsilon(mut self, epsilon: u32) -> Self {
         self.config.pgm_epsilon = epsilon;
         self
     }
 
+    #[deprecated(since = "0.7.0", note = "no effect; PtrHash25 is the only backend")]
+    #[allow(deprecated)]
     pub fn with_backend(mut self, backend: BackendKind) -> Self {
         self.config.backend = backend;
         self
     }
 
+    #[deprecated(since = "0.7.0", note = "no effect")]
+    #[allow(deprecated)]
     pub fn with_hot_fraction(mut self, hot_fraction: f32) -> Self {
         self.config.hot_fraction = hot_fraction;
         self
@@ -1454,32 +1473,36 @@ impl IndexBuilder {
         self
     }
 
+    #[deprecated(since = "0.7.0", note = "no effect; duplicates are always detected")]
+    #[allow(deprecated)]
     pub fn with_build_fast_profile(mut self, enabled: bool) -> Self {
         self.config.build_fast_profile = enabled;
         self
     }
 
+    #[deprecated(since = "0.7.0", note = "no effect; Index is always MPH-backed")]
+    #[allow(deprecated)]
     pub fn auto_detect_numeric(mut self, enabled: bool) -> Self {
         self.config.auto_detect_numeric = enabled;
         self
     }
 
-    /// Enable the PGM Block-Bloom fast-negative-lookup filter. Only
-    /// effective when `auto_detect_numeric=true` and all keys are 8-byte u64.
+    #[deprecated(since = "0.7.0", note = "no effect; use PgmBuilder::with_bloom_filter")]
+    #[allow(deprecated)]
     pub fn with_pgm_bloom(mut self, enabled: bool) -> Self {
         self.config.pgm_enable_bloom = enabled;
         self
     }
 
-    /// Compact PGM key storage via Elias-Fano. 30–50% memory win for
-    /// large indexes; ~50 ns/lookup overhead.
+    #[deprecated(since = "0.7.0", note = "no effect; use PgmBuilder::with_elias_fano")]
+    #[allow(deprecated)]
     pub fn with_pgm_elias_fano(mut self, enabled: bool) -> Self {
         self.config.pgm_enable_elias_fano = enabled;
         self
     }
 
-    /// Auto-tune PGM ε for a target per-lookup latency. Overrides
-    /// `with_pgm_epsilon` if set.
+    #[deprecated(since = "0.7.0", note = "no effect; use PgmBuilder::with_target_lookup_ns")]
+    #[allow(deprecated)]
     pub fn with_pgm_target_lookup_ns(mut self, ns: u32) -> Self {
         self.config.pgm_target_lookup_ns = Some(ns);
         self

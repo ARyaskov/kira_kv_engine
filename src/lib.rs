@@ -34,6 +34,7 @@ mod wire;
 pub use index::{
     BloomExport, GpuExport, GpuPart, Index, IndexBuilder, IndexConfig, IndexError, IndexStats,
 };
+#[allow(deprecated)]
 pub use mph_backend::{BackendKind, BuildConfig as BackendBuildConfig, BuildProfile, MphBackend};
 
 // PGM extensions exposed for advanced users:

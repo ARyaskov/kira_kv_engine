@@ -88,6 +88,7 @@ impl CpuFeatures {
         }
     }
 
+    #[allow(deprecated)]
     pub fn optimal_index_config(&self) -> crate::IndexConfig {
         let has_wide_simd = self.has_avx2 || self.has_neon;
         crate::IndexConfig {

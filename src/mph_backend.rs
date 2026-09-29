@@ -16,6 +16,9 @@
 use crate::ptrhash25::{self, Partitioned, PtrHash25Error};
 use hashbrown::HashMap;
 
+/// The MPH algorithm selector. Only one variant exists since 0.5; the type is
+/// kept so existing `IndexConfig` literals compile, and will go away with the
+/// deprecated `IndexConfig::backend` field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
     /// The only MPH algorithm. u8 pilots + 2-level bucketing + cuckoo-style
@@ -24,6 +27,8 @@ pub enum BackendKind {
     PtrHash25,
 }
 
+/// No effect since 0.6 (duplicates are always detected exactly).
+#[deprecated(since = "0.7.0", note = "no effect")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuildProfile {
     Balanced,
@@ -31,6 +36,7 @@ pub enum BuildProfile {
 }
 
 #[derive(Debug, Clone)]
+#[allow(deprecated)]
 pub struct BuildConfig {
     pub backend: BackendKind,
     pub enable_parallel_build: bool,
@@ -43,6 +49,7 @@ pub struct BuildConfig {
     pub build_profile: BuildProfile,
 }
 
+#[allow(deprecated)]
 impl Default for BuildConfig {
     fn default() -> Self {
         Self {
@@ -72,6 +79,9 @@ impl BuildConfig {
     }
 }
 
+/// Backend abstraction from the multi-algorithm era; `PtrHash25Backend` is the only
+/// implementor and `Index` calls it directly.
+#[deprecated(since = "0.7.0", note = "single backend; use Index / ptrhash25 directly")]
 pub trait MphBackend {
     fn build(keys: &[u64], config: &BuildConfig) -> Self
     where
@@ -100,6 +110,7 @@ pub(crate) enum PtrHash25Storage {
     Map(HashMap<u64, u32>),
 }
 
+#[allow(deprecated)]
 impl MphBackend for PtrHash25Backend {
     fn build(keys: &[u64], config: &BuildConfig) -> Self {
         let cfg = config.mph_config();
@@ -198,6 +209,7 @@ pub enum BackendDispatch {
     PtrHash25(PtrHash25Backend),
 }
 
+#[allow(deprecated)]
 impl BackendDispatch {
     pub fn kind(&self) -> BackendKind {
         match self {
@@ -245,6 +257,7 @@ impl BackendDispatch {
     }
 }
 
+#[allow(deprecated)]
 pub fn build_dispatch(keys: &[u64], cfg: &BuildConfig) -> BackendDispatch {
     match cfg.backend {
         BackendKind::PtrHash25 => BackendDispatch::PtrHash25(PtrHash25Backend::build(keys, cfg)),

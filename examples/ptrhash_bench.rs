@@ -67,11 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for backend in backends {
         let cfg = IndexConfig {
-            auto_detect_numeric: false,
-            backend,
-            hot_fraction: 0.15,
             enable_parallel_build: true,
-            build_fast_profile: true,
             ..IndexConfig::default()
         };
 

@@ -124,7 +124,7 @@ fn run_index_bench(settings: &BenchSettings) -> Result<(), Box<dyn std::error::E
         (BackendKind::PtrHash25, "PtrHash25-lean", true),
     ];
 
-    for (backend_kind, backend_name, lean) in backends {
+    for (_backend_kind, backend_name, lean) in backends {
         let mut build_samples = Vec::with_capacity(settings.runs);
         let mut bpk_samples = Vec::with_capacity(settings.runs);
         let mut pos_cold = Vec::with_capacity(settings.runs);
@@ -136,11 +136,7 @@ fn run_index_bench(settings: &BenchSettings) -> Result<(), Box<dyn std::error::E
 
         for run in 0..settings.runs {
             let mut cfg = IndexConfig::default();
-            cfg.auto_detect_numeric = false;
-            cfg.backend = backend_kind;
-            cfg.hot_fraction = 0.15;
             cfg.enable_parallel_build = true;
-            cfg.build_fast_profile = BUILD_FAST_PROFILE;
             cfg.lean_mph = lean;
 
             // Borrowing build: no clone of 10M keys, no 10M frees inside the timer.
