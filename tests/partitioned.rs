@@ -214,7 +214,7 @@ fn index_duplicate_bytes_rejected() {
     let mut keys = byte_keys(100_000, 0x39);
     keys[99_999] = keys[42].clone();
     let err = IndexBuilder::new().build_index_ref(&keys).err().expect("must fail");
-    assert!(err.to_string().contains("DuplicateKey"), "got {err}");
+    assert!(matches!(err, kira_kv_engine::IndexError::DuplicateKey), "got {err}");
 }
 
 #[test]
@@ -309,4 +309,14 @@ fn contains_semantics_lean_vs_full() {
     let refs: Vec<&[u8]> = foreign.iter().map(|k| k.as_slice()).collect();
     assert_eq!(full.contains_batch(&refs).iter().filter(|&&b| b).count(), fp);
     assert!(Index::empty().supports_negative_lookups());
+}
+
+#[test]
+fn duplicate_keys_are_a_typed_error() {
+    let mut keys = byte_keys(5_000, 0x9F);
+    keys[4_999] = keys[42].clone();
+    let err = IndexBuilder::new().build_index_ref(&keys).err().expect("duplicate must fail");
+    assert!(matches!(err, kira_kv_engine::IndexError::DuplicateKey), "{err:?}");
+    let io = Index::load("/definitely/not/a/path/kira.idx").err().expect("missing file");
+    assert!(matches!(io, kira_kv_engine::IndexError::Io(_)), "{io:?}");
 }

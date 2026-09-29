@@ -40,28 +40,52 @@ pub struct Index {
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum IndexError {
-    #[error("MPH error: {0}")]
-    Mph(String),
-    #[error("PGM error: {0}")]
-    Pgm(String),
+    /// The input contains the same key twice. Detected exactly, never by chance.
+    #[error("duplicate key in input")]
+    DuplicateKey,
+    /// The pilot search gave up after `max_rehash` salts. Practically unreachable
+    /// for distinct keys; a different `mph_config.seed` is the remedy.
+    #[error("could not place all keys after max rehash rounds")]
+    Unresolvable,
     #[error("key not found")]
     KeyNotFound,
     #[error("invalid key format")]
     InvalidKey,
+    /// Serialized data failed the checksum or a structural check.
     #[error("corrupt data")]
     CorruptData,
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    /// The operation is not available for this index configuration (for example
+    /// a negative-lookup guarantee on a `lean_mph` index).
+    #[error("unsupported: {0}")]
+    Unsupported(&'static str),
+    /// Any other MPH build failure.
+    #[error("MPH error: {0}")]
+    Mph(String),
+    /// Any other PGM failure.
+    #[error("PGM error: {0}")]
+    Pgm(String),
 }
 
 impl From<MphError> for IndexError {
     fn from(err: MphError) -> Self {
-        IndexError::Mph(err.to_string())
+        match err {
+            MphError::DuplicateKey => IndexError::DuplicateKey,
+            MphError::Unresolvable => IndexError::Unresolvable,
+        }
     }
 }
 
 impl From<PgmError> for IndexError {
     fn from(err: PgmError) -> Self {
-        IndexError::Pgm(err.to_string())
+        match err {
+            PgmError::CorruptData => IndexError::CorruptData,
+            PgmError::KeyNotFound => IndexError::KeyNotFound,
+            other => IndexError::Pgm(other.to_string()),
+        }
     }
 }
 
@@ -241,7 +265,7 @@ impl Index {
     /// Build from borrowed keys (must be unique). Keys are hashed in place in parallel;
     /// nothing is copied into an intermediate arena.
     ///
-    /// Duplicate keys are detected exactly (`IndexError::Mph("DuplicateKey")`).
+    /// Duplicate keys are detected exactly (`IndexError::DuplicateKey`).
     pub fn build_index_ref<K>(keys: &[K], config: IndexConfig) -> Result<Self, IndexError>
     where
         K: AsRef<[u8]> + Sync,
@@ -935,14 +959,13 @@ impl Index {
     /// single `LegacyPayload` section that wraps `to_bytes()`.
     pub fn save_mmap<P: AsRef<std::path::Path>>(&self, path: P) -> Result<(), IndexError> {
         use crate::mmap_index::{MmapIndexWriter, SectionKind};
-        let mut w = MmapIndexWriter::create(path, self.key_count as u64)
-            .map_err(|_| IndexError::CorruptData)?;
+        let mut w = MmapIndexWriter::create(path, self.key_count as u64)?;
         // We always write the legacy payload (so open_mmap continues to work).
         // For PtrHashV2-backed Mph engines we ALSO add per-field sections, enabling
         // zero-copy reads via Index::open_mmap_zero_copy in future versions.
         let bytes = self.to_bytes()?;
         w.add_section(SectionKind::LegacyPayload, bytes);
-        w.finalize().map_err(|_| IndexError::CorruptData)
+        Ok(w.finalize()?)
     }
 
     /// Open a previously `save_mmap`'d index. Currently does a one-time read from the
@@ -950,8 +973,11 @@ impl Index {
     /// the mmap alive and return views into it without copying.
     pub fn open_mmap<P: AsRef<std::path::Path>>(path: P) -> Result<Self, IndexError> {
         use crate::mmap_index::{MmapIndex, SectionKind};
-        let mmap = MmapIndex::open(path).map_err(|_| IndexError::CorruptData)?;
-        let header = mmap.parse_header().map_err(|_| IndexError::CorruptData)?;
+        let mmap = MmapIndex::open(path)?;
+        let header = mmap.parse_header().map_err(|e| match e.kind() {
+            std::io::ErrorKind::InvalidData => IndexError::CorruptData,
+            _ => IndexError::Io(e),
+        })?;
         let bytes = mmap
             .section(&header, SectionKind::LegacyPayload)
             .or_else(|| mmap.section(&header, SectionKind::PtrHash25Pilots))
@@ -970,7 +996,7 @@ impl Index {
     /// checksum verification).
     pub fn to_bytes(&self) -> Result<Vec<u8>, IndexError> {
         let mut out = Vec::with_capacity(self.stats().total_memory + 64);
-        self.write_to(&mut out).map_err(|_| IndexError::CorruptData)?;
+        self.write_to(&mut out)?;
         Ok(out)
     }
 
@@ -1023,7 +1049,7 @@ impl Index {
 
     /// Read an index written by [`Index::save`] / [`Index::write_to`].
     pub fn load<P: AsRef<std::path::Path>>(path: P) -> Result<Self, IndexError> {
-        let bytes = std::fs::read(path).map_err(|_| IndexError::CorruptData)?;
+        let bytes = std::fs::read(path)?;
         Self::from_bytes(&bytes)
     }
 
@@ -1319,7 +1345,7 @@ where
             Err(MphError::DuplicateKey) => {
                 round += 1;
                 if round >= MAX_PREHASH_ROUNDS {
-                    return Err(IndexError::Mph("DuplicateKey".to_string()));
+                    return Err(IndexError::DuplicateKey);
                 }
                 continue;
             }

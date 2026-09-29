@@ -113,7 +113,13 @@ pub struct PgmIndex {
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum PgmError {
+    /// The input contains the same key twice (the builder sorts, so order is
+    /// never the problem).
+    #[error("duplicate key in input")]
+    DuplicateKeys,
+    #[deprecated(since = "0.7.0", note = "the builder sorts its input; duplicates raise DuplicateKeys")]
     #[error("keys must be sorted and unique")]
     UnsortedKeys,
     #[error("empty key set")]
@@ -1460,10 +1466,8 @@ impl PgmBuilder {
     pub fn build(self, keys: Vec<u64>) -> Result<PgmIndex, PgmError> {
         let mut sorted = keys;
         sorted.sort_unstable();
-        for w in sorted.windows(2) {
-            if w[0] >= w[1] {
-                return Err(PgmError::UnsortedKeys);
-            }
+        if sorted.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(PgmError::DuplicateKeys);
         }
 
         if sorted.is_empty() {
