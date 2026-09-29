@@ -47,7 +47,7 @@ pub use pgm_u128::{PgmIndexU128, PgmU128Error};
 #[doc(hidden)]
 pub mod __internal {
     pub mod aes_hash {
-        pub use crate::aes_hash::{hash_bytes, hash_u64};
+        pub use crate::aes_hash::{aes_round_hw, aes_round_soft, hash_bytes, hash_u64, hw_available};
     }
     pub use crate::block_bloom::BlockBloom;
     pub use crate::build_arena::BuildArena;

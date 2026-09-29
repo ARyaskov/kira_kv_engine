@@ -1,9 +1,11 @@
 //! Canonical key→u64 hash used at every Index build/lookup boundary.
 //!
 //! Dispatches to:
-//! - `simd_hash::hash_u64_one` for the 8-byte fast path.
-//! - `aes_hash::hash_bytes` for variable-length byte keys (AES-NI on x86,
-//!   wyhash fallback otherwise).
+//! - `simd_hash::hash_u64_one` for the 8-byte fast path (`mix64`, a bijection).
+//! - `aes_hash::hash_bytes` for variable-length byte keys.
+//!
+//! Both are platform-independent: the same key and seed hash to the same value on
+//! x86_64, aarch64 and everything else, so serialized indexes are portable.
 
 #[inline(always)]
 pub fn canonical_hash_bytes(key: &[u8], seed: u64) -> u64 {
