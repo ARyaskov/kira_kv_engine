@@ -161,6 +161,9 @@ fn every_built_key_is_found_random_and_sequential() {
                 assert_eq!(pgm.index(k).ok(), Some(i), "n={n} eps={eps} miss at #{i}");
                 assert_eq!(pgm.lower_bound(k), i, "n={n} eps={eps} lower_bound at #{i}");
             }
+            // The configured epsilon bounds every segment (f32 rounding may add 1).
+            let max_err = pgm.stats().max_error;
+            assert!(max_err <= eps + 1, "n={n} eps={eps}: max_error {max_err}");
         }
     }
     // Near-linear keys with sub-integer jitter: the case that lost 1/3 of all keys.

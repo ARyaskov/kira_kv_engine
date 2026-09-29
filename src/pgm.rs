@@ -241,25 +241,15 @@ impl PgmIndex {
     /// Anchoring the intercept costs a few percent more segments than the optimal
     /// convex-hull PLA, but the guarantee is exact for the f64 line. The f32
     /// quantization is measured afterwards (see `segments_to_soa`).
-    fn build_segments_greedy(
-        keys: &[u64],
-        epsilon: u32,
-        cold_epsilon: u32,
-        hot_start: usize,
-        hot_end: usize,
-    ) -> Vec<SegmentBuild> {
+    fn build_segments_greedy(keys: &[u64], epsilon: u32) -> Vec<SegmentBuild> {
         let n = keys.len();
         if n == 0 {
             return Vec::new();
         }
+        let local_eps = epsilon as f64;
         let mut segments: Vec<SegmentBuild> = Vec::with_capacity(n / 32 + 1);
         let mut start = 0usize;
         while start < n {
-            let local_eps = if start >= hot_start && start < hot_end {
-                epsilon
-            } else {
-                cold_epsilon
-            } as f64;
             let x0 = keys[start] as f64;
             let y0 = start as f64;
             let mut lo = f64::NEG_INFINITY;
@@ -274,13 +264,14 @@ impl PgmIndex {
                     break;
                 }
                 let dy = (end - start) as f64;
-                let slo = (dy - local_eps) / dx;
-                let shi = (dy + local_eps) / dx;
-                lo = lo.max(slo);
-                hi = hi.min(shi);
-                if lo > hi {
+                let new_lo = lo.max((dy - local_eps) / dx);
+                let new_hi = hi.min((dy + local_eps) / dx);
+                if new_lo > new_hi {
+                    // This key does not fit; `lo..=hi` still describes the keys before it.
                     break;
                 }
+                lo = new_lo;
+                hi = new_hi;
                 end += 1;
             }
             let slope = if end == start + 1 {
@@ -312,18 +303,12 @@ impl PgmIndex {
     /// segment crosses chunks — that's the cost of cheap parallelism (it loses
     /// ~1 segment per chunk boundary, ≤ 0.1% overhead at CHUNK=128K).
     #[cfg(feature = "parallel")]
-    fn build_segments_parallel(
-        keys: &[u64],
-        epsilon: u32,
-        cold_epsilon: u32,
-        hot_start: usize,
-        hot_end: usize,
-    ) -> Vec<SegmentBuild> {
+    fn build_segments_parallel(keys: &[u64], epsilon: u32) -> Vec<SegmentBuild> {
         use rayon::prelude::*;
         const CHUNK: usize = 128 * 1024;
         let n = keys.len();
         if n < CHUNK * 2 {
-            return Self::build_segments_greedy(keys, epsilon, cold_epsilon, hot_start, hot_end);
+            return Self::build_segments_greedy(keys, epsilon);
         }
         let chunks: Vec<(usize, usize)> = (0..n)
             .step_by(CHUNK)
@@ -336,13 +321,7 @@ impl PgmIndex {
                 // Build a sub-vector of keys for this chunk. We pass positions
                 // as the global index so segments carry true positions.
                 let sub = &keys[c_start..c_end];
-                let mut local = Self::build_segments_greedy(
-                    sub,
-                    epsilon,
-                    cold_epsilon,
-                    hot_start.saturating_sub(c_start).min(sub.len()),
-                    hot_end.saturating_sub(c_start).min(sub.len()),
-                );
+                let mut local = Self::build_segments_greedy(sub, epsilon);
                 // Translate local positions (0..sub.len()) to global (c_start..c_end).
                 for seg in &mut local {
                     seg.start += c_start;
@@ -1513,6 +1492,12 @@ impl PgmBuilder {
         }
     }
 
+    /// Maximum distance between the predicted and the true position of any key
+    /// (the local scan window is `2ε + 1` keys). The bound holds for the f64 fit;
+    /// after f32 quantization of the segment parameters the measured error can
+    /// exceed it by 1 for indexes beyond ~8M keys — `stats().max_error` reports
+    /// the exact value. Applies uniformly to every key (earlier versions silently
+    /// used `4ε` for the first and last 10% of the keys).
     pub fn with_epsilon(mut self, epsilon: u32) -> Self {
         self.epsilon = epsilon;
         self
@@ -1577,34 +1562,18 @@ impl PgmBuilder {
             None => self.epsilon,
         };
 
-        let cold_epsilon = epsilon.saturating_mul(4).max(epsilon);
-        let hot_start = sorted.len() / 10;
-        let hot_end = sorted.len().saturating_sub(sorted.len() / 10);
-
         let raw_segments = {
             #[cfg(feature = "parallel")]
             {
                 if self.enable_parallel {
-                    PgmIndex::build_segments_parallel(
-                        &sorted,
-                        epsilon,
-                        cold_epsilon,
-                        hot_start,
-                        hot_end,
-                    )
+                    PgmIndex::build_segments_parallel(&sorted, epsilon)
                 } else {
-                    PgmIndex::build_segments_greedy(
-                        &sorted,
-                        epsilon,
-                        cold_epsilon,
-                        hot_start,
-                        hot_end,
-                    )
+                    PgmIndex::build_segments_greedy(&sorted, epsilon)
                 }
             }
             #[cfg(not(feature = "parallel"))]
             {
-                PgmIndex::build_segments_greedy(&sorted, epsilon, cold_epsilon, hot_start, hot_end)
+                PgmIndex::build_segments_greedy(&sorted, epsilon)
             }
         };
         let segments = PgmIndex::segments_to_soa(&sorted, raw_segments);
@@ -1649,13 +1618,7 @@ impl PgmBuilder {
         let n_sample = sample.len() as f64;
         let mut best: Option<(u32, f64)> = None;
         for &eps in &[16u32, 32, 48, 64, 96, 128, 192, 256] {
-            let segs = PgmIndex::build_segments_greedy(
-                &sample,
-                eps,
-                eps.saturating_mul(4),
-                sample.len() / 10,
-                sample.len().saturating_sub(sample.len() / 10),
-            );
+            let segs = PgmIndex::build_segments_greedy(&sample, eps);
             // Scale segment count from sample to full N: same density.
             let scaled_segs = segs.len() as f64 * (n_full / n_sample);
             let seg_lookup_steps = (scaled_segs.max(2.0)).log2();
