@@ -214,7 +214,10 @@ unsafe fn lookup_linear_avx2(hashes: &[u64], positions: &[u32], target: u64) -> 
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum HybridError {
+    /// No longer returned: an empty key set builds an always-miss index.
+    #[deprecated(since = "0.7.0", note = "empty input is accepted")]
     #[error("empty key set")]
     EmptyKeys,
     #[error("duplicate hash detected — increase seed entropy or use a stronger hash")]
@@ -222,7 +225,10 @@ pub enum HybridError {
     #[error("MPH build failed: {0}")]
     Mph(String),
     #[error("PGM build failed: {0}")]
-    Pgm(String),
+    Pgm(#[from] crate::pgm::PgmError),
+    /// Serialized data failed the checksum or a structural check.
+    #[error("corrupt data")]
+    CorruptData,
 }
 
 impl From<MphError> for HybridError {
@@ -304,12 +310,14 @@ impl HybridBuilder {
     }
 
     /// Build the index over `keys`. Keys can be any byte slice.
+    ///
+    /// An empty key set yields an index on which every lookup misses.
     pub fn build<K>(self, keys: &[K]) -> Result<HybridIndex, HybridError>
     where
         K: AsRef<[u8]>,
     {
         if keys.is_empty() {
-            return Err(HybridError::EmptyKeys);
+            return Ok(HybridIndex::empty(self.seed));
         }
         let n = keys.len();
 
@@ -335,7 +343,7 @@ impl HybridBuilder {
     /// (sort, PGM, mini-MPHs) is shared with `build()`.
     pub fn build_from_u64(self, keys: &[u64]) -> Result<HybridIndex, HybridError> {
         if keys.is_empty() {
-            return Err(HybridError::EmptyKeys);
+            return Ok(HybridIndex::empty(self.seed));
         }
         let n = keys.len();
         let mut hashes = vec![0u64; n];
@@ -382,8 +390,7 @@ impl HybridBuilder {
         let mut pgm = PgmBuilder::new()
             .with_epsilon(self.pgm_epsilon)
             .with_parallel(self.enable_parallel)
-            .build(sorted_hashes)
-            .map_err(|e| HybridError::Pgm(format!("{:?}", e)))?;
+            .build(sorted_hashes)?;
         let sorted_hashes = pgm.take_keys();
 
         // Phase 4: enumerate segments and build per-segment storage.
@@ -515,7 +522,168 @@ fn enumerate_segments(pgm: &PgmIndex) -> usize {
     i
 }
 
+/// Segment payload tags in the serialized form.
+const SEG_LINEAR: u8 = 0;
+const SEG_CHD: u8 = 1;
+const SEG_MPH: u8 = 2;
+
 impl HybridIndex {
+    /// An index over zero keys: every lookup misses.
+    pub fn empty(seed: u64) -> Self {
+        HybridIndex {
+            pgm: PgmBuilder::new().build(Vec::new()).expect("empty PGM never fails"),
+            segments: Vec::new(),
+            seg_offsets: vec![0],
+            seed,
+            bloom: None,
+            n: 0,
+        }
+    }
+
+    /// Serialize into a self-contained, checksummed byte vector.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut body = Vec::with_capacity(self.memory_usage() + 64);
+        body.extend_from_slice(&self.seed.to_le_bytes());
+        body.extend_from_slice(&(self.n as u64).to_le_bytes());
+        body.extend_from_slice(&(self.seg_offsets.len() as u64).to_le_bytes());
+        crate::wire::extend_le(&mut body, &self.seg_offsets);
+        self.pgm.write_to(&mut body);
+        match &self.bloom {
+            Some(bf) => {
+                body.push(1);
+                bf.write_to(&mut body);
+            }
+            None => body.push(0),
+        }
+        body.extend_from_slice(&(self.segments.len() as u64).to_le_bytes());
+        for seg in &self.segments {
+            match seg {
+                SegmentStorage::Linear { hashes, positions } => {
+                    body.push(SEG_LINEAR);
+                    body.extend_from_slice(&(hashes.len() as u32).to_le_bytes());
+                    crate::wire::extend_le(&mut body, hashes);
+                    crate::wire::extend_le(&mut body, positions);
+                }
+                SegmentStorage::MiniChd { chd, positions, slot_hashes } => {
+                    body.push(SEG_CHD);
+                    body.extend_from_slice(&chd.n.to_le_bytes());
+                    body.extend_from_slice(&chd.salt.to_le_bytes());
+                    body.extend_from_slice(&chd.num_buckets.to_le_bytes());
+                    body.extend_from_slice(&chd.pilots);
+                    crate::wire::extend_le(&mut body, slot_hashes);
+                    crate::wire::extend_le(&mut body, positions);
+                }
+                SegmentStorage::MiniMph { mph, positions } => {
+                    body.push(SEG_MPH);
+                    crate::ptrhash25::write_ptrhash25(mph, &mut body);
+                    crate::wire::extend_le(&mut body, positions);
+                }
+            }
+        }
+        crate::wire::seal(crate::wire::KIND_HYBRID, &body)
+    }
+
+    /// Deserialize [`HybridIndex::to_bytes`] output. Checksum and every structural
+    /// invariant are verified; corrupt input is rejected, never read out of bounds.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, HybridError> {
+        let body = crate::wire::unseal(bytes, crate::wire::KIND_HYBRID).ok_or(HybridError::CorruptData)?;
+        let bad = || HybridError::CorruptData;
+        let mut pos = 0usize;
+        let rd_u64 = |pos: &mut usize| -> Result<u64, HybridError> {
+            let v = body.get(*pos..*pos + 8).ok_or(HybridError::CorruptData)?;
+            *pos += 8;
+            Ok(u64::from_le_bytes(v.try_into().unwrap()))
+        };
+        let rd_u32 = |pos: &mut usize| -> Result<u32, HybridError> {
+            let v = body.get(*pos..*pos + 4).ok_or(HybridError::CorruptData)?;
+            *pos += 4;
+            Ok(u32::from_le_bytes(v.try_into().unwrap()))
+        };
+        let rd_u8 = |pos: &mut usize| -> Result<u8, HybridError> {
+            let v = *body.get(*pos).ok_or(HybridError::CorruptData)?;
+            *pos += 1;
+            Ok(v)
+        };
+        let seed = rd_u64(&mut pos)?;
+        let n = usize::try_from(rd_u64(&mut pos)?).map_err(|_| bad())?;
+        if n > u32::MAX as usize {
+            return Err(bad());
+        }
+        let off_len = usize::try_from(rd_u64(&mut pos)?).map_err(|_| bad())?;
+        let seg_offsets: Vec<u32> = crate::wire::read_le_at(body, &mut pos, off_len).ok_or_else(bad)?;
+        let pgm = PgmIndex::read_from(body, &mut pos).map_err(|_| bad())?;
+        let bloom = match rd_u8(&mut pos)? {
+            0 => None,
+            1 => Some(BlockBloom::read_from(body, &mut pos).ok_or_else(bad)?),
+            _ => return Err(bad()),
+        };
+        let seg_count = usize::try_from(rd_u64(&mut pos)?).map_err(|_| bad())?;
+        // Structure: one storage per PGM segment, offsets cover [0, n].
+        if seg_count != pgm.num_segments()
+            || seg_offsets.len() != seg_count + 1
+            || seg_offsets.first().copied().unwrap_or(1) != 0
+            || seg_offsets.last().copied().unwrap_or(1) as usize != n
+            || seg_offsets.windows(2).any(|w| w[0] > w[1])
+            || seg_count > body.len() - pos
+        {
+            return Err(bad());
+        }
+        let pos_ok = |p: &[u32]| p.iter().all(|&v| v == u32::MAX || (v as usize) < n);
+        let mut segments = Vec::with_capacity(seg_count);
+        for _ in 0..seg_count {
+            let seg = match rd_u8(&mut pos)? {
+                SEG_LINEAR => {
+                    let len = rd_u32(&mut pos)? as usize;
+                    let hashes: Vec<u64> = crate::wire::read_le_at(body, &mut pos, len).ok_or_else(bad)?;
+                    let positions: Vec<u32> = crate::wire::read_le_at(body, &mut pos, len).ok_or_else(bad)?;
+                    if !pos_ok(&positions) {
+                        return Err(bad());
+                    }
+                    SegmentStorage::Linear { hashes, positions }
+                }
+                SEG_CHD => {
+                    let cn = rd_u32(&mut pos)?;
+                    let salt = rd_u64(&mut pos)?;
+                    let num_buckets = rd_u32(&mut pos)?;
+                    if cn == 0 || num_buckets == 0 {
+                        return Err(bad());
+                    }
+                    let pilots = body.get(pos..pos + num_buckets as usize).ok_or_else(bad)?.to_vec();
+                    pos += num_buckets as usize;
+                    let slot_hashes: Vec<u64> =
+                        crate::wire::read_le_at(body, &mut pos, cn as usize).ok_or_else(bad)?;
+                    let positions: Vec<u32> =
+                        crate::wire::read_le_at(body, &mut pos, cn as usize).ok_or_else(bad)?;
+                    if !pos_ok(&positions) {
+                        return Err(bad());
+                    }
+                    let chd = crate::mini_chd::MiniChd {
+                        n: cn,
+                        salt,
+                        pilots: pilots.into_boxed_slice(),
+                        num_buckets,
+                    };
+                    SegmentStorage::MiniChd { chd, positions, slot_hashes }
+                }
+                SEG_MPH => {
+                    let mph = crate::ptrhash25::read_ptrhash25(body, &mut pos).ok_or_else(bad)?;
+                    let positions: Vec<u32> =
+                        crate::wire::read_le_at(body, &mut pos, mph.slot_capacity()).ok_or_else(bad)?;
+                    if !pos_ok(&positions) {
+                        return Err(bad());
+                    }
+                    SegmentStorage::MiniMph { mph, positions }
+                }
+                _ => return Err(bad()),
+            };
+            segments.push(seg);
+        }
+        if pos != body.len() {
+            return Err(bad());
+        }
+        Ok(HybridIndex { pgm, segments, seg_offsets, seed, bloom, n })
+    }
+
     /// Look up `key`. Returns `Some(original_position)` on hit, `None` on miss.
     #[inline]
     pub fn lookup(&self, key: &[u8]) -> Option<u32> {

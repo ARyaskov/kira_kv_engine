@@ -334,6 +334,86 @@ impl DynamicIndex {
     }
 }
 
+impl DynamicIndex {
+    /// Serialize the live key→id set, the id counter and the configuration into
+    /// a self-contained, checksummed byte vector. Tiers are not stored; they are
+    /// rebuilt on load (one compacted tier).
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut body = Vec::with_capacity(self.memory_usage() / 2 + 64);
+        body.extend_from_slice(&(self.cfg.flush_threshold as u64).to_le_bytes());
+        body.extend_from_slice(&(self.cfg.max_tiers as u64).to_le_bytes());
+        body.push(self.cfg.lean_tiers as u8);
+        body.push(self.cfg.parallel_build as u8);
+        body.extend_from_slice(&self.next_id.to_le_bytes());
+        body.extend_from_slice(&(self.live as u64).to_le_bytes());
+        let mut write = |k: &[u8], id: StableId| {
+            body.extend_from_slice(&(k.len() as u32).to_le_bytes());
+            body.extend_from_slice(k);
+            body.extend_from_slice(&id.to_le_bytes());
+        };
+        for (k, &id) in &self.buffer {
+            write(k, id);
+        }
+        // Oldest tier last so a key shadowed by a younger tier or the buffer is
+        // skipped; tombstoned keys are dead.
+        let mut seen: HashSet<&[u8]> = self.buffer.keys().map(|k| k.as_slice()).collect();
+        for tier in &self.tiers {
+            for (k, id) in tier.entries.iter() {
+                if self.tombstones.contains(k) || !seen.insert(k.as_slice()) {
+                    continue;
+                }
+                write(k, *id);
+            }
+        }
+        crate::wire::seal(crate::wire::KIND_DYNAMIC, &body)
+    }
+
+    /// Restore an index written by [`DynamicIndex::to_bytes`]. The entries are
+    /// loaded into one compacted tier; stable ids are preserved.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, IndexError> {
+        let body = crate::wire::unseal(bytes, crate::wire::KIND_DYNAMIC).ok_or(IndexError::CorruptData)?;
+        let bad = || IndexError::CorruptData;
+        let mut pos = 0usize;
+        let rd = |pos: &mut usize, n: usize| -> Result<&[u8], IndexError> {
+            let v = body.get(*pos..*pos + n).ok_or(IndexError::CorruptData)?;
+            *pos += n;
+            Ok(v)
+        };
+        let u64_at = |v: &[u8]| u64::from_le_bytes(v.try_into().unwrap());
+        let flush_threshold = usize::try_from(u64_at(rd(&mut pos, 8)?)).map_err(|_| bad())?;
+        let max_tiers = usize::try_from(u64_at(rd(&mut pos, 8)?)).map_err(|_| bad())?;
+        let lean_tiers = rd(&mut pos, 1)?[0] != 0;
+        let parallel_build = rd(&mut pos, 1)?[0] != 0;
+        let next_id = u32::from_le_bytes(rd(&mut pos, 4)?.try_into().unwrap());
+        let live = usize::try_from(u64_at(rd(&mut pos, 8)?)).map_err(|_| bad())?;
+        if live > (body.len() - pos) / 8 || flush_threshold == 0 {
+            return Err(bad());
+        }
+        let mut entries: Vec<(Vec<u8>, StableId)> = Vec::with_capacity(live);
+        let mut seen: HashSet<Vec<u8>> = HashSet::with_capacity(live);
+        for _ in 0..live {
+            let len = u32::from_le_bytes(rd(&mut pos, 4)?.try_into().unwrap()) as usize;
+            let key = rd(&mut pos, len)?.to_vec();
+            let id = u32::from_le_bytes(rd(&mut pos, 4)?.try_into().unwrap());
+            if id >= next_id || !seen.insert(key.clone()) {
+                return Err(bad());
+            }
+            entries.push((key, id));
+        }
+        if pos != body.len() {
+            return Err(bad());
+        }
+        let mut idx = Self::with_config(DynamicConfig { flush_threshold, max_tiers, lean_tiers, parallel_build });
+        idx.next_id = next_id;
+        idx.live = live;
+        if !entries.is_empty() {
+            let tier = idx.build_tier(entries)?;
+            idx.tiers.push(tier);
+        }
+        Ok(idx)
+    }
+}
+
 impl Default for DynamicIndex {
     fn default() -> Self {
         Self::new()

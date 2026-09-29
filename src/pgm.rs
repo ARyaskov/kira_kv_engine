@@ -34,6 +34,9 @@ use crate::prefetch::prefetch_read;
 // Wire format version. v1 = legacy (f64 slopes, u32 errors). v2 = current.
 // --------------------------------------------------------------------------------------
 const PGM_FORMAT_V2: u8 = 0x02;
+/// v3 adds the fitted key count separately from the stored keys, so a
+/// locator-only index (keys released, see `take_keys`) round-trips.
+const PGM_FORMAT_V3: u8 = 0x03;
 
 /// Segment built in-memory (used during PGM construction only).
 /// Working-storage segment used during greedy-PLA construction. f64 is
@@ -525,8 +528,8 @@ impl PgmIndex {
         Self::read_from(bytes, &mut pos)
     }
 
-    /// Wire format v2:
-    /// [u8 ver] [u32 epsilon] [u64 keys_len] [keys×u64]
+    /// Wire format v3:
+    /// [u8 ver=3] [u32 epsilon] [u64 key_count] [u64 stored_keys] [keys×u64]
     /// [u64 seg_len]
     /// segments contiguous SoA: slopes[u32 f32][intercepts][min_keys u64][max_keys u64]
     ///                          [max_errors u8] [u64 overflow_count]
@@ -534,18 +537,22 @@ impl PgmIndex {
     ///                          [filters u64][starts u32][ends u32]
     /// [u8 has_bloom] [bloom payload if present]
     pub(crate) fn write_to(&self, out: &mut Vec<u8>) {
-        out.push(PGM_FORMAT_V2);
+        out.push(PGM_FORMAT_V3);
         write_u32(out, self.epsilon);
-        let n = self.keys_count();
-        write_u64(out, n as u64);
+        write_u64(out, self.key_count as u64);
         // Plain or EF — emit the materialized u64 stream either way. EF reload
         // is a post-deserialization choice (call `compact_keys` if desired).
-        if self.keys_ef.is_some() {
-            for k in self.keys_iter() {
-                write_u64(out, k);
+        // Locator-only indexes store no keys at all.
+        let stored = if self.has_keys() { self.key_count } else { 0 };
+        write_u64(out, stored as u64);
+        if stored > 0 {
+            if self.keys_ef.is_some() {
+                for k in self.keys_iter() {
+                    write_u64(out, k);
+                }
+            } else {
+                crate::wire::extend_le(out, &self.keys);
             }
-        } else {
-            crate::wire::extend_le(out, &self.keys);
         }
         let s = &self.segments;
         write_u64(out, s.len() as u64);
@@ -579,14 +586,22 @@ impl PgmIndex {
             pos: *pos,
         };
         let ver = cur.read_u8().ok_or(PgmError::CorruptData)?;
-        if ver != PGM_FORMAT_V2 {
+        if ver != PGM_FORMAT_V2 && ver != PGM_FORMAT_V3 {
             return Err(PgmError::CorruptData);
         }
         let epsilon = cur.read_u32().ok_or(PgmError::CorruptData)?;
         // Every count is capped by the bytes actually present before allocating.
         let remaining = |cur: &Cursor<'_>| cur.buf.len() - cur.pos;
-        let keys_len = cur.read_u64().ok_or(PgmError::CorruptData)? as usize;
-        let keys: Vec<u64> = cur.read_le(keys_len)?;
+        let key_count = cur.read_u64().ok_or(PgmError::CorruptData)? as usize;
+        let stored = if ver == PGM_FORMAT_V3 {
+            cur.read_u64().ok_or(PgmError::CorruptData)? as usize
+        } else {
+            key_count
+        };
+        if stored != 0 && stored != key_count {
+            return Err(PgmError::CorruptData);
+        }
+        let keys: Vec<u64> = cur.read_le(stored)?;
         let seg_len = cur.read_u64().ok_or(PgmError::CorruptData)? as usize;
         if seg_len > remaining(&cur) / 41 {
             return Err(PgmError::CorruptData);
@@ -625,7 +640,7 @@ impl PgmIndex {
             None
         };
         let idx = PgmIndex {
-            key_count: keys.len(),
+            key_count,
             keys,
             keys_ef: None,
             segments: SegmentsSoA {
@@ -669,6 +684,9 @@ impl PgmIndex {
             return m == 0;
         }
         if m == 0 {
+            return false;
+        }
+        if !self.keys.is_empty() && self.keys.len() != n {
             return false;
         }
         if self.keys.windows(2).any(|w| w[0] >= w[1]) {
@@ -806,7 +824,7 @@ impl PgmIndex {
     }
 
     /// Number of segments — companion to `max_keys_ptr`.
-    pub(crate) fn num_segments(&self) -> usize {
+    pub fn num_segments(&self) -> usize {
         self.segments.max_keys.len()
     }
 

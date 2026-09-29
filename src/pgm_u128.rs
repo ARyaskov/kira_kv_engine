@@ -58,9 +58,17 @@ impl SegmentsSoA {
 }
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum PgmU128Error {
+    /// The input contains the same key twice (the builder sorts, so order is
+    /// never the problem).
+    #[error("duplicate key in input")]
+    DuplicateKeys,
+    #[deprecated(since = "0.7.0", note = "the builder sorts its input; duplicates raise DuplicateKeys")]
     #[error("keys must be sorted and unique")]
     UnsortedKeys,
+    /// No longer returned: an empty key set builds an always-miss index.
+    #[deprecated(since = "0.7.0", note = "empty input is accepted")]
     #[error("empty key set")]
     EmptyKeys,
     #[error("key not found")]
@@ -70,16 +78,12 @@ pub enum PgmU128Error {
 }
 
 impl PgmIndexU128 {
-    /// Build a PGM-U128 from sorted unique u128 keys.
+    /// Build a PGM-U128 from unique u128 keys (sorted here if needed). An empty
+    /// key set yields an index on which every lookup misses.
     pub fn build(mut keys: Vec<u128>, epsilon: u32) -> Result<Self, PgmU128Error> {
-        if keys.is_empty() {
-            return Err(PgmU128Error::EmptyKeys);
-        }
         keys.sort_unstable();
-        for w in keys.windows(2) {
-            if w[0] >= w[1] {
-                return Err(PgmU128Error::UnsortedKeys);
-            }
+        if keys.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(PgmU128Error::DuplicateKeys);
         }
         let segs = Self::build_segments(&keys, epsilon);
         Ok(Self {
@@ -264,6 +268,107 @@ impl PgmIndexU128 {
 
     pub fn epsilon(&self) -> u32 {
         self.epsilon
+    }
+
+    /// Serialize into a self-contained, checksummed byte vector.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let s = &self.segments;
+        let mut body = Vec::with_capacity(self.memory_usage() + 64);
+        body.extend_from_slice(&self.epsilon.to_le_bytes());
+        body.extend_from_slice(&(self.keys.len() as u64).to_le_bytes());
+        crate::wire::extend_le(&mut body, &self.keys);
+        body.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        crate::wire::extend_le(&mut body, &s.slopes);
+        crate::wire::extend_le(&mut body, &s.min_keys);
+        crate::wire::extend_le(&mut body, &s.max_keys);
+        body.extend_from_slice(&s.max_errors_u8);
+        body.extend_from_slice(&(s.overflow_errors.len() as u64).to_le_bytes());
+        for &(si, er) in &s.overflow_errors {
+            body.extend_from_slice(&si.to_le_bytes());
+            body.extend_from_slice(&er.to_le_bytes());
+        }
+        crate::wire::extend_le(&mut body, &s.starts);
+        crate::wire::extend_le(&mut body, &s.ends);
+        crate::wire::seal(crate::wire::KIND_PGM_U128, &body)
+    }
+
+    /// Deserialize [`PgmIndexU128::to_bytes`] output; checksum and structure are verified.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, PgmU128Error> {
+        let body = crate::wire::unseal(bytes, crate::wire::KIND_PGM_U128).ok_or(PgmU128Error::CorruptData)?;
+        let bad = || PgmU128Error::CorruptData;
+        let mut pos = 0usize;
+        let rd_u64 = |pos: &mut usize| -> Result<usize, PgmU128Error> {
+            let v = body.get(*pos..*pos + 8).ok_or(PgmU128Error::CorruptData)?;
+            *pos += 8;
+            usize::try_from(u64::from_le_bytes(v.try_into().unwrap())).map_err(|_| PgmU128Error::CorruptData)
+        };
+        let epsilon = u32::from_le_bytes(body.get(0..4).ok_or_else(bad)?.try_into().unwrap());
+        pos += 4;
+        let n = rd_u64(&mut pos)?;
+        let keys: Vec<u128> = crate::wire::read_le_at(body, &mut pos, n).ok_or_else(bad)?;
+        let m = rd_u64(&mut pos)?;
+        if m > (body.len() - pos) / 49 {
+            return Err(bad());
+        }
+        let slopes: Vec<f64> = crate::wire::read_le_at(body, &mut pos, m).ok_or_else(bad)?;
+        let min_keys: Vec<u128> = crate::wire::read_le_at(body, &mut pos, m).ok_or_else(bad)?;
+        let max_keys: Vec<u128> = crate::wire::read_le_at(body, &mut pos, m).ok_or_else(bad)?;
+        let max_errors_u8 = body.get(pos..pos + m).ok_or_else(bad)?.to_vec();
+        pos += m;
+        let ov = rd_u64(&mut pos)?;
+        if ov > (body.len() - pos) / 8 {
+            return Err(bad());
+        }
+        let mut overflow_errors = Vec::with_capacity(ov);
+        for _ in 0..ov {
+            let a = body.get(pos..pos + 8).ok_or_else(bad)?;
+            overflow_errors.push((
+                u32::from_le_bytes(a[..4].try_into().unwrap()),
+                u32::from_le_bytes(a[4..].try_into().unwrap()),
+            ));
+            pos += 8;
+        }
+        let starts: Vec<u32> = crate::wire::read_le_at(body, &mut pos, m).ok_or_else(bad)?;
+        let ends: Vec<u32> = crate::wire::read_le_at(body, &mut pos, m).ok_or_else(bad)?;
+        if pos != body.len() {
+            return Err(bad());
+        }
+        let idx = Self {
+            keys,
+            segments: SegmentsSoA { slopes, min_keys, max_keys, max_errors_u8, overflow_errors, starts, ends },
+            epsilon,
+        };
+        if idx.validate() { Ok(idx) } else { Err(bad()) }
+    }
+
+    /// Structural invariants the lookup relies on.
+    fn validate(&self) -> bool {
+        let s = &self.segments;
+        let n = self.keys.len();
+        let m = s.len();
+        if n == 0 {
+            return m == 0;
+        }
+        if m == 0 || n > u32::MAX as usize || self.keys.windows(2).any(|w| w[0] >= w[1]) {
+            return false;
+        }
+        let mut prev_end = 0u32;
+        for i in 0..m {
+            if s.starts[i] != prev_end || s.ends[i] <= s.starts[i] || s.ends[i] as usize > n {
+                return false;
+            }
+            if s.min_keys[i] > s.max_keys[i]
+                || s.min_keys[i] != self.keys[s.starts[i] as usize]
+                || s.max_keys[i] != self.keys[s.ends[i] as usize - 1]
+                || !s.slopes[i].is_finite()
+            {
+                return false;
+            }
+            prev_end = s.ends[i];
+        }
+        prev_end as usize == n
+            && s.overflow_errors.windows(2).all(|w| w[0].0 < w[1].0)
+            && s.overflow_errors.iter().all(|&(si, _)| (si as usize) < m)
     }
 }
 

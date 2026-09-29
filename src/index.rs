@@ -1273,7 +1273,7 @@ const FORMAT_VERSION: u16 = 1;
 /// Identifier of the canonical key hash: mix64 for 8-byte keys, AES-round hash for
 /// everything else (see `canonical_hash`). A different id means the file was built
 /// with a hash this version cannot reproduce.
-const HASH_ID_CANONICAL: u8 = 1;
+const HASH_ID_CANONICAL: u8 = crate::wire::KIND_INDEX;
 
 /// Number of canonical-hash seeds tried before concluding that two input keys are
 /// byte-identical. Equal canonical hashes are detected exactly by the MPH build (equal
