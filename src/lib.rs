@@ -9,7 +9,6 @@
 
 mod aes_hash;
 mod block_bloom;
-mod build_arena;
 mod build_hasher;
 mod build_pool;
 mod canonical_hash;
@@ -51,7 +50,6 @@ pub mod __internal {
         pub use crate::aes_hash::{aes_round_hw, aes_round_soft, hash_bytes, hash_u64, hw_available};
     }
     pub use crate::block_bloom::BlockBloom;
-    pub use crate::build_arena::BuildArena;
     pub use crate::build_pool::{pool, radix_sort_u64_pairs};
     pub use crate::hugepage::HugepageBuf;
     pub use crate::mini_chd::{MiniChd, MiniChdError};
