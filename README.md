@@ -59,7 +59,7 @@ let gene_index = IndexBuilder::new()
     .build_index(gene_names)?;
 
 // "All variants in chr1:1M-2M" — semantic range over u64 keys.
-let variants_in_region: Vec<usize> = pos_index.range(start, end);
+let variants_in_region: std::ops::Range<usize> = pos_index.range(start, end);
 ```
 
 **LLM token vocabulary (closed set, ~100K tokens)**

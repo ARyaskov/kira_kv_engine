@@ -211,11 +211,13 @@ impl PgmIndexU128 {
         self.index(u128::from_be_bytes(*key))
     }
 
-    /// Range query — returns positions for keys in [min_key, max_key].
-    pub fn range(&self, min_key: u128, max_key: u128) -> Vec<usize> {
+    /// Positions of all keys in `[min_key, max_key]`, as the half-open range
+    /// `lower_bound(min_key)..upper_bound(max_key)` — O(1) space however large the
+    /// range is.
+    pub fn range(&self, min_key: u128, max_key: u128) -> std::ops::Range<usize> {
         let lo = self.lower_bound(min_key);
         let hi = self.upper_bound(max_key);
-        (lo..hi).collect()
+        lo..hi.max(lo)
     }
 
     pub fn lower_bound(&self, target: u128) -> usize {

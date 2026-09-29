@@ -411,11 +411,13 @@ impl PgmIndex {
         (start, end.max(start))
     }
 
-    /// Range query: find all positions with keys in [min_key, max_key].
-    pub fn range(&self, min_key: u64, max_key: u64) -> Vec<usize> {
+    /// Positions of all keys in `[min_key, max_key]`, as the half-open range
+    /// `lower_bound(min_key)..upper_bound(max_key)` — O(1) space however large the
+    /// range is. Iterate it, take its `len()`, or slice a side array with it.
+    pub fn range(&self, min_key: u64, max_key: u64) -> std::ops::Range<usize> {
         let start_pos = self.lower_bound(min_key);
         let end_pos = self.upper_bound(max_key);
-        (start_pos..end_pos).collect()
+        start_pos..end_pos.max(start_pos)
     }
 
     pub(crate) fn range_guard(&self, key: u64) -> bool {

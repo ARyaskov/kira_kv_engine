@@ -47,7 +47,7 @@ fn empty_index_save_open_mmap_roundtrip() {
 fn empty_pgm_build_and_query() {
     let pgm = PgmBuilder::new().with_epsilon(16).build(Vec::new()).unwrap();
     assert!(pgm.index(1).is_err());
-    assert_eq!(pgm.range(0, u64::MAX), Vec::<usize>::new());
+    assert!(pgm.range(0, u64::MAX).is_empty());
     assert_eq!(pgm.lower_bound(0), 0);
     assert_eq!(pgm.upper_bound(0), 0);
 }

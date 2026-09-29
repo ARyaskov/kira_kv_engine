@@ -15,8 +15,8 @@ fn range_query() {
     let keys: Vec<u128> = (10..1010).map(|i| i as u128).collect();
     let idx = PgmIndexU128::build(keys, 16).unwrap();
     let r = idx.range(100, 200);
-    assert_eq!(r.first(), Some(&90));
-    assert_eq!(r.last(), Some(&190));
+    assert_eq!(r, 90..191);
+    assert!(idx.range(200, 100).is_empty());
 }
 
 #[test]

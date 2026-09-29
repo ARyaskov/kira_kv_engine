@@ -71,8 +71,11 @@ fn range_returns_consecutive_positions() {
     let keys: Vec<u64> = (100..2_000).collect();
     let pgm = PgmBuilder::new().with_epsilon(16).build(keys).unwrap();
     let r = pgm.range(500, 510);
-    assert_eq!(r.first(), Some(&400));
-    assert_eq!(r.last(), Some(&410));
+    assert_eq!(r, 400..411);
+    assert_eq!(r.len(), 11);
+    // Reversed / disjoint bounds give an empty range, never a panic.
+    assert!(pgm.range(510, 500).is_empty());
+    assert!(pgm.range(5_000, 6_000).is_empty());
 }
 
 #[test]
