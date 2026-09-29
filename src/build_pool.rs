@@ -50,8 +50,7 @@ pub fn pool() -> &'static rayon::ThreadPool {
             builder = builder.start_handler(move |idx| {
                 if !cores_handler.is_empty() {
                     let core_id = cores_handler[idx % cores_handler.len()];
-                    let _ =
-                        core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
+                    let _ = core_affinity::set_for_current(core_affinity::CoreId { id: core_id });
                 }
             });
         }
@@ -62,9 +61,10 @@ pub fn pool() -> &'static rayon::ThreadPool {
 #[cfg(feature = "parallel")]
 fn pick_thread_count() -> usize {
     if let Some(v) = std::env::var_os("KIRA_BUILD_THREADS")
-        && let Ok(parsed) = v.to_string_lossy().parse::<usize>() {
-            return parsed.max(1);
-        }
+        && let Ok(parsed) = v.to_string_lossy().parse::<usize>()
+    {
+        return parsed.max(1);
+    }
     let topo = crate::hybrid_topology::Topology::detect();
     if topo.is_hybrid && !topo.performance_cores.is_empty() {
         return topo.performance_cores.len();
@@ -75,11 +75,8 @@ fn pick_thread_count() -> usize {
 #[cfg(feature = "parallel")]
 fn pick_pinning_cores() -> Option<Vec<usize>> {
     if let Some(v) = std::env::var_os("KIRA_BUILD_CORE_IDS") {
-        let ids: Vec<usize> = v
-            .to_string_lossy()
-            .split(',')
-            .filter_map(|s| s.trim().parse::<usize>().ok())
-            .collect();
+        let ids: Vec<usize> =
+            v.to_string_lossy().split(',').filter_map(|s| s.trim().parse::<usize>().ok()).collect();
         if !ids.is_empty() {
             return Some(ids);
         }

@@ -118,9 +118,10 @@ impl HugepageBuf {
     /// global allocator if hugepages are unavailable.
     pub fn alloc_zeroed(len: usize) -> Self {
         if len >= 1024 * 1024
-            && let Some(buf) = try_alloc_hugepage(len) {
-                return buf;
-            }
+            && let Some(buf) = try_alloc_hugepage(len)
+        {
+            return buf;
+        }
         alloc_fallback(len)
     }
 
@@ -167,11 +168,7 @@ impl Drop for HugepageBuf {
 #[derive(Debug)]
 pub enum HugeVec<T: Copy + Default + 'static> {
     Small(Vec<T>),
-    Huge {
-        buf: HugepageBuf,
-        len: usize,
-        _t: std::marker::PhantomData<T>,
-    },
+    Huge { buf: HugepageBuf, len: usize, _t: std::marker::PhantomData<T> },
 }
 
 impl<T: Copy + Default + 'static> HugeVec<T> {
@@ -181,11 +178,7 @@ impl<T: Copy + Default + 'static> HugeVec<T> {
         let byte_size = len.checked_mul(std::mem::size_of::<T>()).expect("size overflow");
         if byte_size >= 1024 * 1024 {
             let buf = HugepageBuf::alloc_zeroed(byte_size);
-            HugeVec::Huge {
-                buf,
-                len,
-                _t: std::marker::PhantomData,
-            }
+            HugeVec::Huge { buf, len, _t: std::marker::PhantomData }
         } else {
             HugeVec::Small(vec![T::default(); len])
         }
@@ -255,11 +248,7 @@ fn alloc_fallback(len: usize) -> HugepageBuf {
     if ptr.is_null() {
         std::alloc::handle_alloc_error(layout);
     }
-    HugepageBuf {
-        ptr,
-        len,
-        layout: HugepageLayout::Fallback(layout),
-    }
+    HugepageBuf { ptr, len, layout: HugepageLayout::Fallback(layout) }
 }
 
 fn try_alloc_hugepage(len: usize) -> Option<HugepageBuf> {
@@ -340,11 +329,7 @@ mod windows {
                 MEM_COMMIT | MEM_RESERVE | MEM_LARGE_PAGES,
                 PAGE_READWRITE,
             );
-            if ptr.is_null() {
-                None
-            } else {
-                Some(ptr as *mut u8)
-            }
+            if ptr.is_null() { None } else { Some(ptr as *mut u8) }
         }
     }
 
@@ -412,11 +397,7 @@ mod linux {
                 -1,
                 0,
             );
-            if ptr == MAP_FAILED {
-                None
-            } else {
-                Some(ptr as *mut u8)
-            }
+            if ptr == MAP_FAILED { None } else { Some(ptr as *mut u8) }
         }
     }
 
@@ -434,4 +415,3 @@ mod linux {
         }
     }
 }
-

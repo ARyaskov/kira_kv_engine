@@ -39,9 +39,8 @@ fn main() {
     println!("{}", "=".repeat(110));
 
     let mut rng = StdRng::seed_from_u64(GEN_SEED);
-    let keys: Vec<Vec<u8>> = (0..N_KEYS)
-        .map(|i| format!("key-{:09}-{}", i, rng.next_u64()).into_bytes())
-        .collect();
+    let keys: Vec<Vec<u8>> =
+        (0..N_KEYS).map(|i| format!("key-{:09}-{}", i, rng.next_u64()).into_bytes()).collect();
     let extra_keys: Vec<Vec<u8>> = (0..STEADY_OPS.max(MIXED_OPS))
         .map(|i| format!("extra-{:09}-{}", i, rng.next_u64()).into_bytes())
         .collect();
@@ -210,10 +209,7 @@ fn bench_lookup_tiered(initial: &[Vec<u8>], extra: &[Vec<u8>], lookup_keys: &[Ve
     // Measure.
     let warm = lookup_pass(&idx, lookup_keys);
     let warm_ns = warm.0 * 1e9 / lookup_keys.len() as f64;
-    println!(
-        "  lookup (pre-compact, {} tiers): {:.2} ns/op, {} hits",
-        pre_tiers, warm_ns, warm.1
-    );
+    println!("  lookup (pre-compact, {} tiers): {:.2} ns/op, {} hits", pre_tiers, warm_ns, warm.1);
 
     // Compact and re-measure.
     let t = Instant::now();
@@ -223,10 +219,7 @@ fn bench_lookup_tiered(initial: &[Vec<u8>], extra: &[Vec<u8>], lookup_keys: &[Ve
     let _ = lookup_pass(&idx, lookup_keys);
     let post_warm = lookup_pass(&idx, lookup_keys);
     let post_ns = post_warm.0 * 1e9 / lookup_keys.len() as f64;
-    println!(
-        "  compact took {:.1} ms → {} tier",
-        compact_ms, post_tiers
-    );
+    println!("  compact took {:.1} ms → {} tier", compact_ms, post_tiers);
     println!(
         "  lookup (post-compact, {} tier): {:.2} ns/op, {} hits — speedup {:.2}×",
         post_tiers,
@@ -345,11 +338,7 @@ fn bench_hashmap_baseline(initial: &[Vec<u8>], extra: &[Vec<u8>], lookup_keys: &
         map.insert(k.clone(), (initial.len() + i) as u32);
     }
     let ins_secs = t.elapsed().as_secs_f64();
-    println!(
-        "  HashMap steady insert: {} ops, {:.0} ns/op",
-        n,
-        ins_secs * 1e9 / n as f64
-    );
+    println!("  HashMap steady insert: {} ops, {:.0} ns/op", n, ins_secs * 1e9 / n as f64);
 
     // Lookup.
     let t = Instant::now();
@@ -369,9 +358,8 @@ fn bench_hashmap_baseline(initial: &[Vec<u8>], extra: &[Vec<u8>], lookup_keys: &
 
     // Memory estimate: HashMap is `(K, V)` pairs + ~25% bucket overhead.
     let entries = map.len();
-    let avg_key_len: usize =
-        map.iter().take(1000).map(|(k, _)| k.capacity()).sum::<usize>() / 1000;
-    let est_mem = entries * (avg_key_len + std::mem::size_of::<u32>() + 8 /* pointer */)
+    let avg_key_len: usize = map.iter().take(1000).map(|(k, _)| k.capacity()).sum::<usize>() / 1000;
+    let est_mem = entries * (avg_key_len + std::mem::size_of::<u32>() + 8/* pointer */)
         + map.capacity() * std::mem::size_of::<(Vec<u8>, u32)>();
     println!(
         "  HashMap memory: ~{:.2} MB ({:.2} bytes/key, estimate)",

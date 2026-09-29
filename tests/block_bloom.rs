@@ -10,9 +10,8 @@ fn no_false_negatives_and_low_fp() {
         assert!(bb.contains_u64(k), "false negative for {k:#x}");
     }
 
-    let probes: Vec<u64> = (0..n as u64)
-        .map(|i| (i + 1_000_000_000).wrapping_mul(0xBF58_476D_1CE4_E5B9))
-        .collect();
+    let probes: Vec<u64> =
+        (0..n as u64).map(|i| (i + 1_000_000_000).wrapping_mul(0xBF58_476D_1CE4_E5B9)).collect();
     let mut fp = 0usize;
     for &k in &probes {
         if bb.contains_u64(k) {

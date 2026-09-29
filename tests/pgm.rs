@@ -23,11 +23,8 @@ fn end_to_end_lookup() {
 fn lookup_with_bloom() {
     let mut keys = build_keys(20_000);
     keys.sort_unstable();
-    let pgm = PgmBuilder::new()
-        .with_epsilon(32)
-        .with_bloom_filter(true)
-        .build(keys.clone())
-        .unwrap();
+    let pgm =
+        PgmBuilder::new().with_epsilon(32).with_bloom_filter(true).build(keys.clone()).unwrap();
     assert!(pgm.has_bloom());
     for (i, &k) in keys.iter().enumerate() {
         assert_eq!(pgm.index(k).unwrap(), i);
@@ -38,11 +35,7 @@ fn lookup_with_bloom() {
 fn lookup_with_elias_fano() {
     let mut keys = build_keys(20_000);
     keys.sort_unstable();
-    let pgm = PgmBuilder::new()
-        .with_epsilon(32)
-        .with_elias_fano(true)
-        .build(keys.clone())
-        .unwrap();
+    let pgm = PgmBuilder::new().with_epsilon(32).with_elias_fano(true).build(keys.clone()).unwrap();
     for (i, &k) in keys.iter().enumerate() {
         assert_eq!(pgm.index(k).unwrap(), i, "ef miss at {i}");
     }
@@ -97,11 +90,8 @@ fn compact_keys_preserves_lookups() {
 fn mmap_sections_roundtrip() {
     let mut keys: Vec<u64> = (0..2_000u64).map(|i| i * 997).collect();
     keys.sort_unstable();
-    let pgm = PgmBuilder::new()
-        .with_epsilon(16)
-        .with_bloom_filter(true)
-        .build(keys.clone())
-        .unwrap();
+    let pgm =
+        PgmBuilder::new().with_epsilon(16).with_bloom_filter(true).build(keys.clone()).unwrap();
     let tmp = std::env::temp_dir().join(format!("kira_pgm_mmap_{}.bin", std::process::id()));
     {
         let mut w = MmapIndexWriter::create(&tmp, keys.len() as u64).unwrap();
@@ -122,11 +112,8 @@ fn mmap_sections_roundtrip() {
 fn write_read_v2_roundtrip() {
     let mut keys = build_keys(5_000);
     keys.sort_unstable();
-    let pgm = PgmBuilder::new()
-        .with_epsilon(32)
-        .with_bloom_filter(true)
-        .build(keys.clone())
-        .unwrap();
+    let pgm =
+        PgmBuilder::new().with_epsilon(32).with_bloom_filter(true).build(keys.clone()).unwrap();
     let bytes = pgm.to_bytes().unwrap();
     let pgm2 = PgmIndex::from_bytes(&bytes).unwrap();
     for (i, &k) in keys.iter().enumerate() {

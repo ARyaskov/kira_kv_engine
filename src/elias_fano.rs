@@ -53,11 +53,7 @@ impl EliasFano {
         let ratio = (universe / n as u64).max(1);
         let low_bits = (63 - ratio.leading_zeros()) as u8;
         let low_bits = low_bits.min(56);
-        let low_mask = if low_bits == 0 {
-            0
-        } else {
-            (1u64 << low_bits) - 1
-        };
+        let low_mask = if low_bits == 0 { 0 } else { (1u64 << low_bits) - 1 };
 
         // Pack low bits.
         let total_low_bits = n * low_bits as usize;
@@ -109,16 +105,7 @@ impl EliasFano {
             }
         }
 
-        Some(EliasFano {
-            n,
-            universe,
-            low_bits,
-            low_mask,
-            low,
-            high_len,
-            high,
-            select_sample,
-        })
+        Some(EliasFano { n, universe, low_bits, low_mask, low, high_len, high, select_sample })
     }
 
     pub fn len(&self) -> usize {
@@ -278,11 +265,7 @@ impl EliasFano {
         if low_bits > 56 || n == 0 {
             return None;
         }
-        let low_mask = if low_bits == 0 {
-            0
-        } else {
-            (1u64 << low_bits) - 1
-        };
+        let low_mask = if low_bits == 0 { 0 } else { (1u64 << low_bits) - 1 };
         let low_len = rd_u64(bytes, pos)? as usize;
         let low: Vec<u64> = crate::wire::read_le_at(bytes, pos, low_len)?;
         let high_len = rd_u64(bytes, pos)?;
@@ -305,16 +288,6 @@ impl EliasFano {
         {
             return None;
         }
-        Some(EliasFano {
-            n,
-            universe,
-            low_bits,
-            low_mask,
-            low,
-            high_len,
-            high,
-            select_sample,
-        })
+        Some(EliasFano { n, universe, low_bits, low_mask, low, high_len, high, select_sample })
     }
 }
-

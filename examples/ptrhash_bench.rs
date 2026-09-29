@@ -66,34 +66,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backends = [BackendKind::PtrHash25];
 
     for backend in backends {
-        let cfg = IndexConfig {
-            enable_parallel_build: true,
-            ..IndexConfig::default()
-        };
+        let cfg = IndexConfig { enable_parallel_build: true, ..IndexConfig::default() };
 
         let t0 = Instant::now();
-        let index = IndexBuilder::new()
-            .with_config(cfg)
-            .build_index(keys.clone())?;
+        let index = IndexBuilder::new().with_config(cfg).build_index(keys.clone())?;
         let build_s = t0.elapsed().as_secs_f64();
         let build_ms = build_s * 1000.0;
         let keys_per_sec = DATASET_KEYS as f64 / build_s;
 
-        let pos = run_workload(
-            &index,
-            positive_queries.clone(),
-            QUERY_SEED ^ 0x1111_1111_1111_1111,
-        );
-        let neg = run_workload(
-            &index,
-            negative_queries.clone(),
-            QUERY_SEED ^ 0x2222_2222_2222_2222,
-        );
-        let zipf = run_workload(
-            &index,
-            zipf_queries.clone(),
-            QUERY_SEED ^ 0x3333_3333_3333_3333,
-        );
+        let pos =
+            run_workload(&index, positive_queries.clone(), QUERY_SEED ^ 0x1111_1111_1111_1111);
+        let neg =
+            run_workload(&index, negative_queries.clone(), QUERY_SEED ^ 0x2222_2222_2222_2222);
+        let zipf = run_workload(&index, zipf_queries.clone(), QUERY_SEED ^ 0x3333_3333_3333_3333);
 
         let stats = index.stats();
         let bits_per_key = if DATASET_KEYS > 0 {
@@ -169,12 +154,7 @@ fn run_workload(
 }
 
 fn make_positive_queries_bytes(keys: &[Vec<u8>]) -> Vec<QueryBytes> {
-    keys.iter()
-        .map(|k| QueryBytes {
-            key: k.clone(),
-            is_hit: true,
-        })
-        .collect()
+    keys.iter().map(|k| QueryBytes { key: k.clone(), is_hit: true }).collect()
 }
 
 fn make_negative_queries_bytes(
@@ -190,17 +170,11 @@ fn make_negative_queries_bytes(
 
     for _ in 0..hit_count {
         let idx = rng.gen_range(0..keys.len());
-        queries.push(QueryBytes {
-            key: keys[idx].clone(),
-            is_hit: true,
-        });
+        queries.push(QueryBytes { key: keys[idx].clone(), is_hit: true });
     }
     for _ in 0..miss_count {
         let idx = rng.gen_range(0..missing.len());
-        queries.push(QueryBytes {
-            key: missing[idx].clone(),
-            is_hit: false,
-        });
+        queries.push(QueryBytes { key: missing[idx].clone(), is_hit: false });
     }
     queries
 }
@@ -220,10 +194,7 @@ fn make_zipfian_queries_bytes(keys: &[Vec<u8>], total: usize, rng: &mut StdRng) 
         } else {
             rng.gen_range(0..keys.len())
         };
-        queries.push(QueryBytes {
-            key: keys[idx].clone(),
-            is_hit: true,
-        });
+        queries.push(QueryBytes { key: keys[idx].clone(), is_hit: true });
     }
     queries
 }

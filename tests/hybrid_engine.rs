@@ -3,11 +3,8 @@ use kira_kv_engine::HybridBuilder;
 #[test]
 fn build_and_lookup_byte_keys() {
     let keys: Vec<Vec<u8>> = (0..1000).map(|i| format!("key-{i}").into_bytes()).collect();
-    let idx = HybridBuilder::new()
-        .with_pgm_epsilon(32)
-        .with_linear_threshold(32)
-        .build(&keys)
-        .unwrap();
+    let idx =
+        HybridBuilder::new().with_pgm_epsilon(32).with_linear_threshold(32).build(&keys).unwrap();
     for (i, k) in keys.iter().enumerate() {
         assert_eq!(
             idx.lookup(k),
@@ -43,10 +40,7 @@ fn build_from_u64_simd_path() {
     let keys: Vec<u64> = (0u64..5_000).map(|i| i * 1_000_003).collect();
     let idx = HybridBuilder::new().with_pgm_epsilon(64).build_from_u64(&keys).unwrap();
     let key_bytes: Vec<[u8; 8]> = keys.iter().map(|k| k.to_le_bytes()).collect();
-    let idx_scalar = HybridBuilder::new()
-        .with_pgm_epsilon(64)
-        .build(&key_bytes)
-        .unwrap();
+    let idx_scalar = HybridBuilder::new().with_pgm_epsilon(64).build(&key_bytes).unwrap();
     for (k_u64, k_bytes) in keys.iter().zip(key_bytes.iter()) {
         let a = idx.lookup_u64(*k_u64);
         let b = idx_scalar.lookup(k_bytes);
@@ -72,19 +66,11 @@ fn lookup_batch_u64_simd_correctness() {
 #[test]
 fn lean_mode_lookup_works_on_valid_keys() {
     let keys: Vec<Vec<u8>> = (0u32..2000).map(|i| format!("hot-key-{i}").into_bytes()).collect();
-    let lean = HybridBuilder::new()
-        .with_pgm_epsilon(256)
-        .with_lean(true)
-        .build(&keys)
-        .unwrap();
+    let lean = HybridBuilder::new().with_pgm_epsilon(256).with_lean(true).build(&keys).unwrap();
     for (i, k) in keys.iter().enumerate() {
         assert_eq!(lean.lookup(k), Some(i as u32), "miss at #{i}");
     }
-    let full = HybridBuilder::new()
-        .with_pgm_epsilon(256)
-        .with_lean(false)
-        .build(&keys)
-        .unwrap();
+    let full = HybridBuilder::new().with_pgm_epsilon(256).with_lean(false).build(&keys).unwrap();
     assert!(lean.memory_usage() < full.memory_usage());
 }
 
@@ -103,11 +89,8 @@ fn lookup_after_negative_workload() {
 #[test]
 fn storage_stats_mixed() {
     let keys: Vec<[u8; 8]> = (0u64..20_000).map(|i| (i * 13).to_le_bytes()).collect();
-    let idx = HybridBuilder::new()
-        .with_pgm_epsilon(256)
-        .with_linear_threshold(64)
-        .build(&keys)
-        .unwrap();
+    let idx =
+        HybridBuilder::new().with_pgm_epsilon(256).with_linear_threshold(64).build(&keys).unwrap();
     let stats = idx.storage_stats();
     assert_eq!(
         stats.total_segments,
@@ -122,7 +105,8 @@ fn storage_stats_mixed() {
 #[test]
 fn hybrid_does_not_retain_pgm_keys() {
     let keys: Vec<u64> = (0u64..200_000).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
-    let idx = HybridBuilder::new().with_pgm_epsilon(2048).with_lean(true).build_from_u64(&keys).unwrap();
+    let idx =
+        HybridBuilder::new().with_pgm_epsilon(2048).with_lean(true).build_from_u64(&keys).unwrap();
     let per_key = idx.memory_usage() as f64 / keys.len() as f64;
     assert!(per_key < 8.0, "hybrid lean index uses {per_key:.2} B/key");
     for (i, &k) in keys.iter().enumerate().step_by(97) {

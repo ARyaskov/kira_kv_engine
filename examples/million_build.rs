@@ -141,9 +141,7 @@ fn run_index_bench(settings: &BenchSettings) -> Result<(), Box<dyn std::error::E
 
             // Borrowing build: no clone of 10M keys, no 10M frees inside the timer.
             let t_build = Instant::now();
-            let index = IndexBuilder::new()
-                .with_config(cfg)
-                .build_index_ref(&mixed_keys)?;
+            let index = IndexBuilder::new().with_config(cfg).build_index_ref(&mixed_keys)?;
             let build_s = t_build.elapsed().as_secs_f64();
             build_samples.push(build_s);
             bpk_samples.push(index.stats().total_memory as f64 / n_keys() as f64);
@@ -329,10 +327,7 @@ fn measure_lookup_pair(
 
 fn summarize(samples: &mut [f64]) -> SummaryStats {
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    SummaryStats {
-        median: percentile_sorted(samples, 0.5),
-        p95: percentile_sorted(samples, 0.95),
-    }
+    SummaryStats { median: percentile_sorted(samples, 0.5), p95: percentile_sorted(samples, 0.95) }
 }
 
 fn percentile_sorted(sorted: &[f64], q: f64) -> f64 {
@@ -394,11 +389,8 @@ fn measure_bytes_queries_batch(
 
     refs.shuffle(rng);
     let t0 = Instant::now();
-    let acc = if USE_PARALLEL {
-        parallel_batch_lookup(index, &refs)
-    } else {
-        batch_lookup(index, &refs)
-    };
+    let acc =
+        if USE_PARALLEL { parallel_batch_lookup(index, &refs) } else { batch_lookup(index, &refs) };
     let elapsed = t0.elapsed().as_secs_f64();
 
     (elapsed, acc)
@@ -474,21 +466,11 @@ fn count_hits_u64(queries: &[QueryU64]) -> (usize, usize) {
 }
 
 fn make_positive_queries_bytes(keys: &[Vec<u8>]) -> Vec<QueryBytes> {
-    keys.iter()
-        .map(|k| QueryBytes {
-            key: k.clone(),
-            is_hit: true,
-        })
-        .collect()
+    keys.iter().map(|k| QueryBytes { key: k.clone(), is_hit: true }).collect()
 }
 
 fn make_positive_queries_u64(keys: &[u64]) -> Vec<QueryU64> {
-    keys.iter()
-        .map(|&k| QueryU64 {
-            key: k,
-            is_hit: true,
-        })
-        .collect()
+    keys.iter().map(|&k| QueryU64 { key: k, is_hit: true }).collect()
 }
 
 fn make_negative_queries_bytes(
@@ -504,17 +486,11 @@ fn make_negative_queries_bytes(
 
     for _ in 0..hit_count {
         let idx = rng.gen_range(0..keys.len());
-        queries.push(QueryBytes {
-            key: keys[idx].clone(),
-            is_hit: true,
-        });
+        queries.push(QueryBytes { key: keys[idx].clone(), is_hit: true });
     }
     for _ in 0..miss_count {
         let idx = rng.gen_range(0..missing.len());
-        queries.push(QueryBytes {
-            key: missing[idx].clone(),
-            is_hit: false,
-        });
+        queries.push(QueryBytes { key: missing[idx].clone(), is_hit: false });
     }
 
     queries
@@ -533,17 +509,11 @@ fn make_negative_queries_u64(
 
     for _ in 0..hit_count {
         let idx = rng.gen_range(0..keys.len());
-        queries.push(QueryU64 {
-            key: keys[idx],
-            is_hit: true,
-        });
+        queries.push(QueryU64 { key: keys[idx], is_hit: true });
     }
     for _ in 0..miss_count {
         let idx = rng.gen_range(0..missing.len());
-        queries.push(QueryU64 {
-            key: missing[idx],
-            is_hit: false,
-        });
+        queries.push(QueryU64 { key: missing[idx], is_hit: false });
     }
 
     queries
@@ -564,10 +534,7 @@ fn make_zipfian_queries_bytes(keys: &[Vec<u8>], total: usize, rng: &mut StdRng) 
         } else {
             rng.gen_range(0..keys.len())
         };
-        queries.push(QueryBytes {
-            key: keys[idx].clone(),
-            is_hit: true,
-        });
+        queries.push(QueryBytes { key: keys[idx].clone(), is_hit: true });
     }
 
     queries
@@ -588,10 +555,7 @@ fn make_zipfian_queries_u64(keys: &[u64], total: usize, rng: &mut StdRng) -> Vec
         } else {
             rng.gen_range(0..keys.len())
         };
-        queries.push(QueryU64 {
-            key: keys[idx],
-            is_hit: true,
-        });
+        queries.push(QueryU64 { key: keys[idx], is_hit: true });
     }
 
     queries
@@ -796,9 +760,7 @@ fn gen_random_strings_parallel(
 
     if keys.len() < n {
         let missing = n - keys.len();
-        keys.extend(gen_random_strings_with_range(
-            missing, rng, seen, min_len, max_len,
-        ));
+        keys.extend(gen_random_strings_with_range(missing, rng, seen, min_len, max_len));
     }
 
     keys
@@ -1148,11 +1110,7 @@ fn thread_count() -> usize {
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&v| v > 0)
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|v| v.get())
-                .unwrap_or(1)
-        })
+        .unwrap_or_else(|| std::thread::available_parallelism().map(|v| v.get()).unwrap_or(1))
 }
 
 fn load_bench_settings() -> BenchSettings {
@@ -1164,14 +1122,9 @@ fn load_bench_settings() -> BenchSettings {
         .unwrap_or(DEFAULT_BENCH_RUNS);
     let core_ids = parse_core_ids(env::var("KIRA_BENCH_CORE_IDS").ok().as_deref())
         .or_else(|| default_core_ids(threads));
-    let explicit = env::var_os("KIRA_BENCH_THREADS").is_some()
-        || env::var_os("KIRA_BENCH_CORE_IDS").is_some();
-    BenchSettings {
-        runs,
-        threads,
-        core_ids,
-        explicit,
-    }
+    let explicit =
+        env::var_os("KIRA_BENCH_THREADS").is_some() || env::var_os("KIRA_BENCH_CORE_IDS").is_some();
+    BenchSettings { runs, threads, core_ids, explicit }
 }
 
 /// Lookup threads / cores always follow the bench settings. The *build* pool is left
@@ -1205,10 +1158,7 @@ fn apply_bench_settings(settings: &BenchSettings) {
 
 fn parse_core_ids(v: Option<&str>) -> Option<Vec<usize>> {
     let text = v?;
-    let ids = text
-        .split(',')
-        .filter_map(|s| s.trim().parse::<usize>().ok())
-        .collect::<Vec<_>>();
+    let ids = text.split(',').filter_map(|s| s.trim().parse::<usize>().ok()).collect::<Vec<_>>();
     if ids.is_empty() { None } else { Some(ids) }
 }
 
@@ -1229,11 +1179,9 @@ fn configured_core_ids() -> Vec<usize> {
 
 fn format_core_ids(core_ids: Option<&Vec<usize>>) -> String {
     match core_ids {
-        Some(ids) if !ids.is_empty() => ids
-            .iter()
-            .map(|v| v.to_string())
-            .collect::<Vec<_>>()
-            .join(","),
+        Some(ids) if !ids.is_empty() => {
+            ids.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")
+        }
         _ => "none".to_string(),
     }
 }

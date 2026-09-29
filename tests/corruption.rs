@@ -92,7 +92,13 @@ fn index_v3_rejects_every_mutation_and_truncation() {
 #[test]
 fn index_legacy_tag2_never_panics_on_corruption() {
     let keys = byte_keys(10_000);
-    let foreign = byte_keys(10_000).into_iter().map(|mut k| { k.push(b'!'); k }).collect::<Vec<_>>();
+    let foreign = byte_keys(10_000)
+        .into_iter()
+        .map(|mut k| {
+            k.push(b'!');
+            k
+        })
+        .collect::<Vec<_>>();
     let idx = IndexBuilder::new().build_index_ref(&keys).unwrap();
     let v3 = idx.to_bytes().unwrap();
     // v3: [tag][magic 4][version 2][hash 1][reserved 1][key_count 8][payload...][checksum 8]
@@ -148,7 +154,8 @@ fn pgm_reader_never_panics_on_corruption() {
     let mut keys: Vec<u64> = (0..20_000u64).map(|i| i * 1_000_003 % 0xFFFF_FFFF).collect();
     keys.sort_unstable();
     keys.dedup();
-    let pgm = PgmBuilder::new().with_epsilon(32).with_bloom_filter(true).build(keys.clone()).unwrap();
+    let pgm =
+        PgmBuilder::new().with_epsilon(32).with_bloom_filter(true).build(keys.clone()).unwrap();
     let bytes = pgm.to_bytes().unwrap();
     let exercise = |b: &[u8]| {
         if let Ok(p) = PgmIndex::from_bytes(b) {

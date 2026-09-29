@@ -55,7 +55,8 @@ fn space_saving_matches_reference_bounds_on_zipf() {
         assert!(est >= truth, "undercount for {k}: {est} < {truth}");
         assert!(est - truth <= bound, "overcount for {k}: {est} vs {truth}");
     }
-    let tracked: std::collections::HashSet<u64> = ss.top_k(capacity).into_iter().map(|(k, _)| k).collect();
+    let tracked: std::collections::HashSet<u64> =
+        ss.top_k(capacity).into_iter().map(|(k, _)| k).collect();
     for (k, &c) in &exact {
         if c > bound {
             assert!(tracked.contains(k), "frequent key {k} ({c}) evicted");

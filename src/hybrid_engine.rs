@@ -68,11 +68,11 @@ use crate::ptrhash25::{
 };
 
 #[cfg(target_arch = "x86_64")]
+use std::arch::is_x86_feature_detected;
+#[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
     __m256i, _mm256_cmpeq_epi64, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi64x,
 };
-#[cfg(target_arch = "x86_64")]
-use std::arch::is_x86_feature_detected;
 
 /// Hybrid PGM + MPH index for any key type (operates over `canonical_hash(key)`).
 #[derive(Debug)]
@@ -97,10 +97,7 @@ enum SegmentStorage {
     /// Tiny segment — linear SIMD scan. `hashes` and `positions` are parallel
     /// vectors sorted by `hashes`. Lookup is `O(seg_len)` but seg_len ≤ 64, so
     /// the whole structure typically fits in one L1 cache line.
-    Linear {
-        hashes: Vec<u64>,
-        positions: Vec<u32>,
-    },
+    Linear { hashes: Vec<u64>, positions: Vec<u32> },
     /// Mid-sized segment (64–4096 keys) — MiniChd (simple single-level CHD,
     /// ~0.6 B/key of pilots, cheap to build for small N).
     MiniChd {
@@ -112,10 +109,7 @@ enum SegmentStorage {
     },
     /// Large segment (> 4096 keys) — full PtrHash25 with 2-level bucketing
     /// and eviction. ~0.4 B/key of pilots plus optional 1 B/key fingerprints.
-    MiniMph {
-        mph: PtrHash25Mphf,
-        positions: Vec<u32>,
-    },
+    MiniMph { mph: PtrHash25Mphf, positions: Vec<u32> },
 }
 
 impl SegmentStorage {
@@ -137,11 +131,7 @@ impl SegmentStorage {
                 }
                 None
             }
-            SegmentStorage::MiniChd {
-                chd,
-                positions,
-                slot_hashes,
-            } => {
+            SegmentStorage::MiniChd { chd, positions, slot_hashes } => {
                 let slot = chd.index(hash) as usize;
                 if slot >= slot_hashes.len() {
                     return None;
@@ -157,11 +147,7 @@ impl SegmentStorage {
             SegmentStorage::MiniMph { mph, positions } => {
                 let slot = mph.lookup_u64(hash)?;
                 let pos = *positions.get(slot as usize)?;
-                if pos == u32::MAX {
-                    None
-                } else {
-                    Some(pos)
-                }
+                if pos == u32::MAX { None } else { Some(pos) }
             }
         }
     }
@@ -171,11 +157,7 @@ impl SegmentStorage {
             SegmentStorage::Linear { hashes, positions } => {
                 hashes.len() * 8 + positions.len() * 4 + std::mem::size_of::<Self>()
             }
-            SegmentStorage::MiniChd {
-                chd,
-                positions,
-                slot_hashes,
-            } => {
+            SegmentStorage::MiniChd { chd, positions, slot_hashes } => {
                 chd.memory_usage()
                     + positions.len() * 4
                     + slot_hashes.len() * 8
@@ -350,11 +332,8 @@ impl HybridBuilder {
         crate::simd_hash::hash_u64(keys, self.seed, &mut hashes);
 
         // Pair with original index (i as u32).
-        let mut hashed: Vec<(u64, u32)> = hashes
-            .into_iter()
-            .enumerate()
-            .map(|(i, h)| (h, i as u32))
-            .collect();
+        let mut hashed: Vec<(u64, u32)> =
+            hashes.into_iter().enumerate().map(|(i, h)| (h, i as u32)).collect();
         self.finalize_build(&mut hashed, n)
     }
 
@@ -434,11 +413,7 @@ impl HybridBuilder {
                         positions[slot] = seg_positions[i];
                         slot_hashes[slot] = h;
                     }
-                    return SegmentStorage::MiniChd {
-                        chd,
-                        positions,
-                        slot_hashes,
-                    };
+                    return SegmentStorage::MiniChd { chd, positions, slot_hashes };
                 }
                 // CHD build failed — fall through to PtrHash25 (more robust).
             }
@@ -490,20 +465,10 @@ impl HybridBuilder {
         let bloom = if self.lean {
             None
         } else {
-            Some(BlockBloom::build_from_u64(
-                &sorted_hashes,
-                self.seed ^ 0xBB00_BB00_BB00_BB00,
-            ))
+            Some(BlockBloom::build_from_u64(&sorted_hashes, self.seed ^ 0xBB00_BB00_BB00_BB00))
         };
 
-        Ok(HybridIndex {
-            pgm,
-            segments,
-            seg_offsets,
-            seed: self.seed,
-            bloom,
-            n,
-        })
+        Ok(HybridIndex { pgm, segments, seg_offsets, seed: self.seed, bloom, n })
     }
 }
 
@@ -586,7 +551,8 @@ impl HybridIndex {
     /// Deserialize [`HybridIndex::to_bytes`] output. Checksum and every structural
     /// invariant are verified; corrupt input is rejected, never read out of bounds.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, HybridError> {
-        let body = crate::wire::unseal(bytes, crate::wire::KIND_HYBRID).ok_or(HybridError::CorruptData)?;
+        let body =
+            crate::wire::unseal(bytes, crate::wire::KIND_HYBRID).ok_or(HybridError::CorruptData)?;
         let bad = || HybridError::CorruptData;
         let mut pos = 0usize;
         let rd_u64 = |pos: &mut usize| -> Result<u64, HybridError> {
@@ -610,7 +576,8 @@ impl HybridIndex {
             return Err(bad());
         }
         let off_len = usize::try_from(rd_u64(&mut pos)?).map_err(|_| bad())?;
-        let seg_offsets: Vec<u32> = crate::wire::read_le_at(body, &mut pos, off_len).ok_or_else(bad)?;
+        let seg_offsets: Vec<u32> =
+            crate::wire::read_le_at(body, &mut pos, off_len).ok_or_else(bad)?;
         let pgm = PgmIndex::read_from(body, &mut pos).map_err(|_| bad())?;
         let bloom = match rd_u8(&mut pos)? {
             0 => None,
@@ -634,8 +601,10 @@ impl HybridIndex {
             let seg = match rd_u8(&mut pos)? {
                 SEG_LINEAR => {
                     let len = rd_u32(&mut pos)? as usize;
-                    let hashes: Vec<u64> = crate::wire::read_le_at(body, &mut pos, len).ok_or_else(bad)?;
-                    let positions: Vec<u32> = crate::wire::read_le_at(body, &mut pos, len).ok_or_else(bad)?;
+                    let hashes: Vec<u64> =
+                        crate::wire::read_le_at(body, &mut pos, len).ok_or_else(bad)?;
+                    let positions: Vec<u32> =
+                        crate::wire::read_le_at(body, &mut pos, len).ok_or_else(bad)?;
                     if !pos_ok(&positions) {
                         return Err(bad());
                     }
@@ -648,7 +617,8 @@ impl HybridIndex {
                     if cn == 0 || num_buckets == 0 {
                         return Err(bad());
                     }
-                    let pilots = body.get(pos..pos + num_buckets as usize).ok_or_else(bad)?.to_vec();
+                    let pilots =
+                        body.get(pos..pos + num_buckets as usize).ok_or_else(bad)?.to_vec();
                     pos += num_buckets as usize;
                     let slot_hashes: Vec<u64> =
                         crate::wire::read_le_at(body, &mut pos, cn as usize).ok_or_else(bad)?;
@@ -668,7 +638,8 @@ impl HybridIndex {
                 SEG_MPH => {
                     let mph = crate::ptrhash25::read_ptrhash25(body, &mut pos).ok_or_else(bad)?;
                     let positions: Vec<u32> =
-                        crate::wire::read_le_at(body, &mut pos, mph.slot_capacity()).ok_or_else(bad)?;
+                        crate::wire::read_le_at(body, &mut pos, mph.slot_capacity())
+                            .ok_or_else(bad)?;
                     if !pos_ok(&positions) {
                         return Err(bad());
                     }
@@ -704,9 +675,10 @@ impl HybridIndex {
     #[inline]
     pub fn lookup_hash(&self, hash: u64) -> Option<u32> {
         if let Some(bf) = &self.bloom
-            && !bf.contains_u64(hash) {
-                return None;
-            }
+            && !bf.contains_u64(hash)
+        {
+            return None;
+        }
         let seg_id = self.pgm.segment_for_key(hash)?;
         let seg = &self.segments[seg_id];
         seg.lookup(hash)
@@ -764,9 +736,10 @@ impl HybridIndex {
             let hash = hashes[i];
             // Bloom check (if present).
             if let Some(bf) = &self.bloom
-                && !bf.contains_u64(hash) {
-                    continue;
-                }
+                && !bf.contains_u64(hash)
+            {
+                continue;
+            }
             // Segment find + lookup.
             if let Some(seg_id) = self.pgm.segment_for_key(hash) {
                 out[i] = self.segments[seg_id].lookup(hash);
@@ -888,4 +861,3 @@ impl HybridStorageStats {
         );
     }
 }
-

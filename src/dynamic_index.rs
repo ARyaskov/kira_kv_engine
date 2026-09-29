@@ -371,7 +371,8 @@ impl DynamicIndex {
     /// Restore an index written by [`DynamicIndex::to_bytes`]. The entries are
     /// loaded into one compacted tier; stable ids are preserved.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, IndexError> {
-        let body = crate::wire::unseal(bytes, crate::wire::KIND_DYNAMIC).ok_or(IndexError::CorruptData)?;
+        let body =
+            crate::wire::unseal(bytes, crate::wire::KIND_DYNAMIC).ok_or(IndexError::CorruptData)?;
         let bad = || IndexError::CorruptData;
         let mut pos = 0usize;
         let rd = |pos: &mut usize, n: usize| -> Result<&[u8], IndexError> {
@@ -403,7 +404,12 @@ impl DynamicIndex {
         if pos != body.len() {
             return Err(bad());
         }
-        let mut idx = Self::with_config(DynamicConfig { flush_threshold, max_tiers, lean_tiers, parallel_build });
+        let mut idx = Self::with_config(DynamicConfig {
+            flush_threshold,
+            max_tiers,
+            lean_tiers,
+            parallel_build,
+        });
         idx.next_id = next_id;
         idx.live = live;
         if !entries.is_empty() {

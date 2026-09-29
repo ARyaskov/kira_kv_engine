@@ -64,7 +64,10 @@ pub enum PgmU128Error {
     /// never the problem).
     #[error("duplicate key in input")]
     DuplicateKeys,
-    #[deprecated(since = "0.7.0", note = "the builder sorts its input; duplicates raise DuplicateKeys")]
+    #[deprecated(
+        since = "0.7.0",
+        note = "the builder sorts its input; duplicates raise DuplicateKeys"
+    )]
     #[error("keys must be sorted and unique")]
     UnsortedKeys,
     /// No longer returned: an empty key set builds an always-miss index.
@@ -86,11 +89,7 @@ impl PgmIndexU128 {
             return Err(PgmU128Error::DuplicateKeys);
         }
         let segs = Self::build_segments(&keys, epsilon);
-        Ok(Self {
-            keys,
-            segments: segs,
-            epsilon,
-        })
+        Ok(Self { keys, segments: segs, epsilon })
     }
 
     /// Convenience: build from raw 16-byte slices (e.g. `&[[u8; 16]]`). Each slice
@@ -289,13 +288,15 @@ impl PgmIndexU128 {
 
     /// Deserialize [`PgmIndexU128::to_bytes`] output; checksum and structure are verified.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, PgmU128Error> {
-        let body = crate::wire::unseal(bytes, crate::wire::KIND_PGM_U128).ok_or(PgmU128Error::CorruptData)?;
+        let body = crate::wire::unseal(bytes, crate::wire::KIND_PGM_U128)
+            .ok_or(PgmU128Error::CorruptData)?;
         let bad = || PgmU128Error::CorruptData;
         let mut pos = 0usize;
         let rd_u64 = |pos: &mut usize| -> Result<usize, PgmU128Error> {
             let v = body.get(*pos..*pos + 8).ok_or(PgmU128Error::CorruptData)?;
             *pos += 8;
-            usize::try_from(u64::from_le_bytes(v.try_into().unwrap())).map_err(|_| PgmU128Error::CorruptData)
+            usize::try_from(u64::from_le_bytes(v.try_into().unwrap()))
+                .map_err(|_| PgmU128Error::CorruptData)
         };
         let epsilon = u32::from_le_bytes(body.get(0..4).ok_or_else(bad)?.try_into().unwrap());
         pos += 4;
@@ -330,7 +331,15 @@ impl PgmIndexU128 {
         }
         let idx = Self {
             keys,
-            segments: SegmentsSoA { slopes, min_keys, max_keys, max_errors_u8, overflow_errors, starts, ends },
+            segments: SegmentsSoA {
+                slopes,
+                min_keys,
+                max_keys,
+                max_errors_u8,
+                overflow_errors,
+                starts,
+                ends,
+            },
             epsilon,
         };
         if idx.validate() { Ok(idx) } else { Err(bad()) }
@@ -414,10 +423,5 @@ fn find_segment_u128(max_keys: &[u128], key: u128) -> usize {
         base = new_base;
         len = new_len;
     }
-    if base < n && unsafe { *ptr.add(base) } < key {
-        base + 1
-    } else {
-        base
-    }
+    if base < n && unsafe { *ptr.add(base) } < key { base + 1 } else { base }
 }
-

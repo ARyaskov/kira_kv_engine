@@ -90,7 +90,9 @@ impl BlockBloom {
         {
             if rayon::current_num_threads() > 1 && hashes.len() >= PARALLEL_MIN_KEYS {
                 match grouped {
-                    Some(g) => build_parallel_ranges(hashes, words.as_mut_slice(), blocks, bit_shift, g),
+                    Some(g) => {
+                        build_parallel_ranges(hashes, words.as_mut_slice(), blocks, bit_shift, g)
+                    }
                     None => {
                         let mut g = crate::hugepage::HugeVec::<u64>::zeroed(hashes.len());
                         build_parallel_ranges(
@@ -373,20 +375,17 @@ fn build_parallel_ranges(
     });
 
     // Pass 3: fill every window from its group. Random writes stay inside the window.
-    words
-        .par_chunks_mut(range_blocks * BLOCK_WORDS)
-        .enumerate()
-        .for_each(|(r, win)| {
-            let blk_lo = r * range_blocks;
-            for &h in &grouped[range_off[r]..range_off[r + 1]] {
-                let (block, mask) = block_and_mask(h, blocks, bit_shift);
-                let base = (block - blk_lo) * BLOCK_WORDS;
-                for w in 0..BLOCK_WORDS {
-                    // SAFETY: `block ∈ [blk_lo, blk_lo + range_blocks)` by grouping.
-                    unsafe { *win.get_unchecked_mut(base + w) |= mask[w] };
-                }
+    words.par_chunks_mut(range_blocks * BLOCK_WORDS).enumerate().for_each(|(r, win)| {
+        let blk_lo = r * range_blocks;
+        for &h in &grouped[range_off[r]..range_off[r + 1]] {
+            let (block, mask) = block_and_mask(h, blocks, bit_shift);
+            let base = (block - blk_lo) * BLOCK_WORDS;
+            for w in 0..BLOCK_WORDS {
+                // SAFETY: `block ∈ [blk_lo, blk_lo + range_blocks)` by grouping.
+                unsafe { *win.get_unchecked_mut(base + w) |= mask[w] };
             }
-        });
+        }
+    });
 }
 
 /// High 32 bits choose the block (multiply-high reduction, unbiased for any block count).
@@ -407,7 +406,13 @@ fn block_and_mask(hash: u64, blocks: usize, bit_shift: u32) -> (usize, [u64; BLO
 fn mask_for(hash: u64, bit_shift: u32) -> [u64; BLOCK_WORDS] {
     let seed = hash as u32;
     const SALT: [u32; 8] = [
-        0x47b6_137b, 0x4476_8924, 0x1820_5237, 0x2384_8965, 0x8e6e_2354, 0x0f7c_c9b6, 0xe43d_5fa5,
+        0x47b6_137b,
+        0x4476_8924,
+        0x1820_5237,
+        0x2384_8965,
+        0x8e6e_2354,
+        0x0f7c_c9b6,
+        0xe43d_5fa5,
         0xa4d5_2dc1,
     ];
     let mut mask = [0u64; BLOCK_WORDS];

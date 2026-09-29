@@ -6,7 +6,9 @@ pub fn prefetch_read<T>(p: *const T) {
     #[cfg(target_arch = "x86_64")]
     {
         // SAFETY: PREFETCHT0 is a hint; it never faults and SSE is baseline on x86_64.
-        unsafe { core::arch::x86_64::_mm_prefetch(p as *const i8, core::arch::x86_64::_MM_HINT_T0) };
+        unsafe {
+            core::arch::x86_64::_mm_prefetch(p as *const i8, core::arch::x86_64::_MM_HINT_T0)
+        };
     }
     #[cfg(target_arch = "aarch64")]
     {

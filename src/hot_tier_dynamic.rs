@@ -216,12 +216,8 @@ impl SpaceSaving {
     /// Return the current top-K (key, estimated_count) sorted by count descending.
     /// `k` is clamped to `len()`.
     pub fn top_k(&self, k: usize) -> Vec<(u64, u64)> {
-        let mut all: Vec<(u64, u64)> = self
-            .keys
-            .iter()
-            .copied()
-            .zip(self.counts.iter().copied())
-            .collect();
+        let mut all: Vec<(u64, u64)> =
+            self.keys.iter().copied().zip(self.counts.iter().copied()).collect();
         all.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         all.truncate(k);
         all

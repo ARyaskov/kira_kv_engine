@@ -43,12 +43,7 @@ fn reinsert_after_delete_gets_new_id() {
 }
 
 fn small_config() -> DynamicConfig {
-    DynamicConfig {
-        flush_threshold: 16,
-        max_tiers: 8,
-        lean_tiers: false,
-        parallel_build: false,
-    }
+    DynamicConfig { flush_threshold: 16, max_tiers: 8, lean_tiers: false, parallel_build: false }
 }
 
 #[test]

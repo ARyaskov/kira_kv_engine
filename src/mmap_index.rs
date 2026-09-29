@@ -95,9 +95,7 @@ impl MmapIndex {
         // Without the `memmap2` crate (avoiding new deps), we fall back to read-into-Vec.
         // The shape stays identical so a memmap2 swap is a one-line change later.
         let bytes = std::fs::read(path)?;
-        Ok(MmapIndex {
-            mmap: Box::new(bytes),
-        })
+        Ok(MmapIndex { mmap: Box::new(bytes) })
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -108,10 +106,7 @@ impl MmapIndex {
     pub fn parse_header(&self) -> std::io::Result<Header> {
         let bytes = self.as_bytes();
         if bytes.len() < std::mem::size_of::<MmapHeader>() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "header too short",
-            ));
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "header too short"));
         }
         // SAFETY: bounds-checked above; the header is plain data and `Vec<u8>` gives no
         // alignment guarantee, so it is copied out with an unaligned read rather than
@@ -119,10 +114,7 @@ impl MmapIndex {
         let header: MmapHeader =
             unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const MmapHeader) };
         if &header.magic != MAGIC {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "bad magic",
-            ));
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad magic"));
         }
         let table_start = std::mem::size_of::<MmapHeader>();
         let entry_size = std::mem::size_of::<SectionEntry>();
@@ -137,12 +129,10 @@ impl MmapIndex {
         for chunk in bytes[table_start..table_start + table_len].chunks_exact(entry_size) {
             // SAFETY: `chunk` holds exactly one plain-data `SectionEntry`; unaligned read
             // for the same reason as the header.
-            sections.push(unsafe { std::ptr::read_unaligned(chunk.as_ptr() as *const SectionEntry) });
+            sections
+                .push(unsafe { std::ptr::read_unaligned(chunk.as_ptr() as *const SectionEntry) });
         }
-        Ok(Header {
-            key_count: header.key_count,
-            sections,
-        })
+        Ok(Header { key_count: header.key_count, sections })
     }
 
     /// Get the byte slice for a section by kind. Returns None if not present.
@@ -171,17 +161,9 @@ pub struct MmapIndexWriter {
 
 impl MmapIndexWriter {
     pub fn create<P: AsRef<Path>>(path: P, key_count: u64) -> std::io::Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(path)?;
-        Ok(Self {
-            file,
-            pending_sections: Vec::new(),
-            key_count,
-        })
+        let file =
+            OpenOptions::new().create(true).truncate(true).read(true).write(true).open(path)?;
+        Ok(Self { file, pending_sections: Vec::new(), key_count })
     }
 
     pub fn add_section(&mut self, kind: SectionKind, bytes: Vec<u8>) {
@@ -252,4 +234,3 @@ impl MmapIndexWriter {
 fn align_up(n: usize, align: usize) -> usize {
     (n + align - 1) & !(align - 1)
 }
-

@@ -52,4 +52,3 @@ pub unsafe fn hash_u64_avx2(keys: &[u64], seed: u64, out: &mut [u64]) {
         out[j] = crate::simd_hash::scalar::mix64(keys[j] ^ seed);
     }
 }
-

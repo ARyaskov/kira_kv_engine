@@ -19,6 +19,7 @@ use thiserror::Error;
 
 use crate::block_bloom::BlockBloom;
 
+use crate::prefetch::prefetch_read;
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::{vceqq_u64, vcgeq_u64, vdupq_n_u64, vgetq_lane_u64, vld1q_u64};
 #[cfg(target_arch = "aarch64")]
@@ -28,7 +29,6 @@ use std::arch::x86_64::{
     __m256i, _mm256_cmpeq_epi64, _mm256_cmpgt_epi64, _mm256_loadu_si256, _mm256_movemask_epi8,
     _mm256_or_si256, _mm256_set1_epi64x, _mm256_xor_si256,
 };
-use crate::prefetch::prefetch_read;
 
 // --------------------------------------------------------------------------------------
 // Wire format version. v1 = legacy (f64 slopes, u32 errors). v2 = current.
@@ -63,11 +63,11 @@ struct SegmentBuild {
 #[repr(align(64))]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SegmentsSoA {
-    pub(crate) slopes: Vec<f32>,           
-    pub(crate) intercepts: Vec<f32>,       
+    pub(crate) slopes: Vec<f32>,
+    pub(crate) intercepts: Vec<f32>,
     pub(crate) min_keys: Vec<u64>,
     pub(crate) max_keys: Vec<u64>,
-    pub(crate) max_errors_u8: Vec<u8>,     // 0xFF sentinel = overflow
+    pub(crate) max_errors_u8: Vec<u8>, // 0xFF sentinel = overflow
     pub(crate) overflow_errors: Vec<(u32, u32)>, // (segment_idx, real_error), sorted
     pub(crate) starts: Vec<u32>,
     pub(crate) ends: Vec<u32>,
@@ -123,7 +123,10 @@ pub enum PgmError {
     /// never the problem).
     #[error("duplicate key in input")]
     DuplicateKeys,
-    #[deprecated(since = "0.7.0", note = "the builder sorts its input; duplicates raise DuplicateKeys")]
+    #[deprecated(
+        since = "0.7.0",
+        note = "the builder sorts its input; duplicates raise DuplicateKeys"
+    )]
     #[error("keys must be sorted and unique")]
     UnsortedKeys,
     #[error("empty key set")]
@@ -188,11 +191,7 @@ impl PgmIndex {
     /// Get the i-th key (O(1) plain, O(1) amortized for EF).
     #[inline]
     fn key_at(&self, i: usize) -> u64 {
-        if let Some(ef) = &self.keys_ef {
-            ef.get(i)
-        } else {
-            self.keys[i]
-        }
+        if let Some(ef) = &self.keys_ef { ef.get(i) } else { self.keys[i] }
     }
 
     /// Number of keys in the index.
@@ -299,10 +298,8 @@ impl PgmIndex {
         if n < CHUNK * 2 {
             return Self::build_segments_greedy(keys, epsilon);
         }
-        let chunks: Vec<(usize, usize)> = (0..n)
-            .step_by(CHUNK)
-            .map(|s| (s, (s + CHUNK).min(n)))
-            .collect();
+        let chunks: Vec<(usize, usize)> =
+            (0..n).step_by(CHUNK).map(|s| (s, (s + CHUNK).min(n))).collect();
 
         let per_chunk: Vec<Vec<SegmentBuild>> = chunks
             .par_iter()
@@ -333,9 +330,10 @@ impl PgmIndex {
     pub fn index(&self, key: u64) -> Result<usize, PgmError> {
         // optional Block-Bloom short-circuit for negative lookups.
         if let Some(bf) = &self.bloom
-            && !bf.contains_u64(key) {
-                return Err(PgmError::KeyNotFound);
-            }
+            && !bf.contains_u64(key)
+        {
+            return Err(PgmError::KeyNotFound);
+        }
         if !self.has_keys() {
             return Err(PgmError::KeyNotFound);
         }
@@ -448,16 +446,11 @@ impl PgmIndex {
     pub fn stats(&self) -> PgmStats {
         let total_keys = self.keys_count();
         let total_segments = self.segments.max_keys.len();
-        let avg_segment_size = if total_segments > 0 {
-            total_keys as f64 / total_segments as f64
-        } else {
-            0.0
-        };
+        let avg_segment_size =
+            if total_segments > 0 { total_keys as f64 / total_segments as f64 } else { 0.0 };
 
-        let max_error = (0..total_segments)
-            .map(|i| self.segments.get_max_error(i))
-            .max()
-            .unwrap_or(0);
+        let max_error =
+            (0..total_segments).map(|i| self.segments.get_max_error(i)).max().unwrap_or(0);
 
         let bloom_mem = self.bloom.as_ref().map(|b| b.memory_usage()).unwrap_or(0);
         let ef_mem = self.keys_ef.as_ref().map(|e| e.memory_usage()).unwrap_or(0);
@@ -553,10 +546,7 @@ impl PgmIndex {
     }
 
     pub(crate) fn read_from(bytes: &[u8], pos: &mut usize) -> Result<Self, PgmError> {
-        let mut cur = Cursor {
-            buf: bytes,
-            pos: *pos,
-        };
+        let mut cur = Cursor { buf: bytes, pos: *pos };
         let ver = cur.read_u8().ok_or(PgmError::CorruptData)?;
         if !(PGM_FORMAT_V2..=PGM_FORMAT_V4).contains(&ver) {
             return Err(PgmError::CorruptData);
@@ -582,11 +572,8 @@ impl PgmIndex {
         let intercepts: Vec<f32> = cur.read_le(seg_len)?;
         let min_keys: Vec<u64> = cur.read_le(seg_len)?;
         let max_keys: Vec<u64> = cur.read_le(seg_len)?;
-        let max_errors_u8 = cur
-            .buf
-            .get(cur.pos..cur.pos + seg_len)
-            .ok_or(PgmError::CorruptData)?
-            .to_vec();
+        let max_errors_u8 =
+            cur.buf.get(cur.pos..cur.pos + seg_len).ok_or(PgmError::CorruptData)?.to_vec();
         cur.pos += seg_len;
         let over_n = cur.read_u64().ok_or(PgmError::CorruptData)? as usize;
         if over_n > remaining(&cur) / 8 {
@@ -781,11 +768,7 @@ impl PgmIndex {
 
     /// Iterate keys in order. Works whether plain or EF-backed.
     pub(crate) fn keys_iter(&self) -> KeysIter<'_> {
-        KeysIter {
-            pgm: self,
-            i: 0,
-            n: self.keys_count(),
-        }
+        KeysIter { pgm: self, i: 0, n: self.keys_count() }
     }
 
     /// Whether this index has the optional Bloom filter for negative-lookup fast path.
@@ -979,11 +962,7 @@ fn predict_pos(segments: &SegmentsSoA, idx: usize, key: u64) -> usize {
     let s = segments.slopes[idx] as f64;
     let b = segments.intercepts[idx] as f64;
     let prediction = s.mul_add(key as f64, b);
-    if prediction <= 0.0 {
-        0
-    } else {
-        prediction as usize
-    }
+    if prediction <= 0.0 { 0 } else { prediction as usize }
 }
 
 /// Largest scan window searched linearly (SIMD); longer windows are bisected.
@@ -1121,12 +1100,7 @@ fn find_first_ge_simd(keys: &[u64], start: usize, end: usize, target: u64) -> Op
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn find_first_ge_avx2(
-    keys: &[u64],
-    start: usize,
-    end: usize,
-    target: u64,
-) -> Option<usize> {
+unsafe fn find_first_ge_avx2(keys: &[u64], start: usize, end: usize, target: u64) -> Option<usize> {
     let mut i = start;
     let sign = _mm256_set1_epi64x(i64::MIN);
     let target_vec = _mm256_set1_epi64x(target as i64);
@@ -1157,12 +1131,7 @@ unsafe fn find_first_ge_avx2(
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[allow(unsafe_op_in_unsafe_fn)]
-unsafe fn find_first_ge_neon(
-    keys: &[u64],
-    start: usize,
-    end: usize,
-    target: u64,
-) -> Option<usize> {
+unsafe fn find_first_ge_neon(keys: &[u64], start: usize, end: usize, target: u64) -> Option<usize> {
     let mut i = start;
     let target_vec = vdupq_n_u64(target);
     while i + 2 <= end {
@@ -1230,11 +1199,7 @@ fn find_segment_branchless(max_keys: &[u64], key: u64) -> usize {
         base = new_base;
         len = new_len;
     }
-    if base < n && unsafe { *ptr.add(base) } < key {
-        base + 1
-    } else {
-        base
-    }
+    if base < n && unsafe { *ptr.add(base) } < key { base + 1 } else { base }
 }
 
 // --------------------------------------------------------------------------------------
@@ -1273,7 +1238,10 @@ impl<'a> Cursor<'a> {
         self.pos += 8;
         Some(u64::from_le_bytes(array))
     }
-    fn read_le<T: crate::wire::LeNum + Default>(&mut self, count: usize) -> Result<Vec<T>, PgmError> {
+    fn read_le<T: crate::wire::LeNum + Default>(
+        &mut self,
+        count: usize,
+    ) -> Result<Vec<T>, PgmError> {
         crate::wire::read_le_at(self.buf, &mut self.pos, count).ok_or(PgmError::CorruptData)
     }
 }
@@ -1307,10 +1275,7 @@ impl PgmStats {
         println!("  Segments: {}", self.total_segments);
         println!("  Avg segment size: {:.1}", self.avg_segment_size);
         println!("  Max error: {}", self.max_error);
-        println!(
-            "  Memory usage: {:.2} MB",
-            self.memory_usage as f64 / 1_048_576.0
-        );
+        println!("  Memory usage: {:.2} MB", self.memory_usage as f64 / 1_048_576.0);
         println!("  Epsilon: {}", self.epsilon);
         println!(
             "  Compression ratio: {:.2}x",
@@ -1415,7 +1380,9 @@ impl PgmBuilder {
             #[cfg(feature = "parallel")]
             {
                 if self.enable_parallel {
-                    crate::build_pool::run(true, || PgmIndex::build_segments_parallel(&sorted, epsilon))
+                    crate::build_pool::run(true, || {
+                        PgmIndex::build_segments_parallel(&sorted, epsilon)
+                    })
                 } else {
                     PgmIndex::build_segments_greedy(&sorted, epsilon)
                 }

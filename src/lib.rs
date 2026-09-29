@@ -33,8 +33,8 @@ mod mini_chd;
 mod mmap_index;
 mod mph_backend;
 mod pgm;
-mod prefetch;
 mod pgm_u128;
+mod prefetch;
 mod ptrhash25;
 mod simd_hash;
 mod wire;
@@ -59,7 +59,9 @@ pub use pgm_u128::{PgmIndexU128, PgmU128Error};
 #[doc(hidden)]
 pub mod __internal {
     pub mod aes_hash {
-        pub use crate::aes_hash::{aes_round_hw, aes_round_soft, hash_bytes, hash_u64, hw_available};
+        pub use crate::aes_hash::{
+            aes_round_hw, aes_round_soft, hash_bytes, hash_u64, hw_available,
+        };
     }
     pub use crate::block_bloom::BlockBloom;
     #[cfg(feature = "parallel")]

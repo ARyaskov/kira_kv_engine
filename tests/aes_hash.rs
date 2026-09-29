@@ -65,7 +65,11 @@ fn software_round_matches_hardware_round() {
     for _ in 0..20_000 {
         let s = rand_block(&mut seed);
         let k = rand_block(&mut seed);
-        assert_eq!(aes_round_hw(s, k).unwrap(), aes_round_soft(s, k), "state={s:02x?} key={k:02x?}");
+        assert_eq!(
+            aes_round_hw(s, k).unwrap(),
+            aes_round_soft(s, k),
+            "state={s:02x?} key={k:02x?}"
+        );
     }
     // FIPS-197 style sanity: all-zero state, zero key → SubBytes(0)=0x63 everywhere,
     // MixColumns of a constant column is the constant itself.
@@ -88,7 +92,10 @@ fn known_answer_vectors_are_platform_independent() {
     for &(key, seed, expected) in KAT {
         let got = hash_bytes(key, seed);
         if got != expected {
-            failures.push(format!("key={:?} seed={seed:#x}: got {got:#018x}, expected {expected:#018x}", String::from_utf8_lossy(key)));
+            failures.push(format!(
+                "key={:?} seed={seed:#x}: got {got:#018x}, expected {expected:#018x}",
+                String::from_utf8_lossy(key)
+            ));
         }
     }
     let got_u64 = hash_u64(0x0123_4567_89AB_CDEF, 0xFEDC_BA98_7654_3210);

@@ -31,9 +31,14 @@ fn mutations(bytes: &[u8], rounds: usize, seed: u64, mut check: impl FnMut(&[u8]
 fn hybrid_roundtrip_all_segment_kinds() {
     let mut s = 0x11u64;
     // Small epsilon → linear segments, large → CHD and PtrHash segments.
-    for (n, eps, lean) in [(3_000usize, 16u32, false), (60_000, 512, true), (120_000, 4096, false)] {
+    for (n, eps, lean) in [(3_000usize, 16u32, false), (60_000, 512, true), (120_000, 4096, false)]
+    {
         let keys: Vec<u64> = (0..n).map(|_| splitmix(&mut s)).collect();
-        let idx = HybridBuilder::new().with_pgm_epsilon(eps).with_lean(lean).build_from_u64(&keys).unwrap();
+        let idx = HybridBuilder::new()
+            .with_pgm_epsilon(eps)
+            .with_lean(lean)
+            .build_from_u64(&keys)
+            .unwrap();
         let st = idx.storage_stats();
         let bytes = idx.to_bytes();
         let back = HybridIndex::from_bytes(&bytes).expect("roundtrip");
@@ -106,7 +111,12 @@ fn pgm_u128_roundtrip_empty_and_duplicates() {
 
 #[test]
 fn dynamic_index_roundtrip_preserves_ids_and_deletes() {
-    let mut idx = DynamicIndex::with_config(DynamicConfig { flush_threshold: 32, max_tiers: 64, lean_tiers: false, parallel_build: false });
+    let mut idx = DynamicIndex::with_config(DynamicConfig {
+        flush_threshold: 32,
+        max_tiers: 64,
+        lean_tiers: false,
+        parallel_build: false,
+    });
     let mut expect = std::collections::HashMap::new();
     for i in 0..500u32 {
         let k = format!("k-{i}").into_bytes();
@@ -149,7 +159,8 @@ fn hot_tier_index_is_constructible_from_the_public_api() {
     for (i, &k) in keys.iter().enumerate() {
         assert_eq!(tier.lookup_u64(k), Some(i as u32));
     }
-    let misses = (1..2_000u64).map(|i| i * 7919 + 1).filter(|&k| tier.lookup_u64(k).is_some()).count();
+    let misses =
+        (1..2_000u64).map(|i| i * 7919 + 1).filter(|&k| tier.lookup_u64(k).is_some()).count();
     assert!(misses < 40, "false positives: {misses}");
     let mut bytes = Vec::new();
     tier.write_to(&mut bytes);

@@ -25,8 +25,7 @@ impl HotTierIndex {
         };
         let mph = MphBuilder::new().with_config(cfg).build(keys).ok()?;
         let slot_space = mph.n as usize;
-        let fingerprints =
-            build_fingerprints_u64(&mph, keys, slot_space).into_boxed_slice();
+        let fingerprints = build_fingerprints_u64(&mph, keys, slot_space).into_boxed_slice();
         // Map slot → original index. Slot space may be larger than keys.len() due
         // to PtrHash25's 1.10× padding; un-used slots stay at u32::MAX.
         let mut indices_vec = vec![u32::MAX; slot_space];
@@ -34,12 +33,7 @@ impl HotTierIndex {
             let slot = mph.index_u64(k) as usize;
             indices_vec[slot] = indices[i];
         }
-        Some(Self {
-            filter,
-            mph,
-            fingerprints,
-            indices: indices_vec.into_boxed_slice(),
-        })
+        Some(Self { filter, mph, fingerprints, indices: indices_vec.into_boxed_slice() })
     }
 
     #[inline]

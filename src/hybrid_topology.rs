@@ -38,13 +38,8 @@ impl Topology {
     }
 
     fn fallback() -> Self {
-        let n = std::thread::available_parallelism()
-            .map(|v| v.get())
-            .unwrap_or(1);
-        Self {
-            performance_cores: (0..n).collect(),
-            is_hybrid: false,
-        }
+        let n = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(1);
+        Self { performance_cores: (0..n).collect(), is_hybrid: false }
     }
 }
 
@@ -98,8 +93,11 @@ mod windows {
         let mut needed: u32 = 0;
         unsafe {
             // First call sizes the buffer.
-            let ok =
-                GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, std::ptr::null_mut(), &mut needed);
+            let ok = GetLogicalProcessorInformationEx(
+                RELATION_PROCESSOR_CORE,
+                std::ptr::null_mut(),
+                &mut needed,
+            );
             if ok == 0 && GetLastError() != ERROR_INSUFFICIENT_BUFFER {
                 return None;
             }
@@ -127,8 +125,7 @@ mod windows {
                 }
                 let efficiency = header.processor.efficiency_class;
                 let group_count = header.processor.group_count as usize;
-                let groups_ptr =
-                    &header.processor.groups as *const GroupAffinity;
+                let groups_ptr = &header.processor.groups as *const GroupAffinity;
                 let mut logical_ids = Vec::new();
                 for g in 0..group_count {
                     let ga = &*groups_ptr.add(g);

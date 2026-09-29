@@ -167,10 +167,7 @@ fn duplicate_key_detected_single_part() {
 fn multi_part_with_inner_fingerprints_rejects_foreign() {
     let n = PART_TARGET_KEYS * 2;
     let keys = keys_u64(n, 0x17);
-    let cfg = BuildConfig {
-        with_fingerprints: true,
-        ..BuildConfig::default()
-    };
+    let cfg = BuildConfig { with_fingerprints: true, ..BuildConfig::default() };
     let mph = Builder::new().with_config(cfg).build(&keys).expect("build failed");
     assert!(mph.num_parts() > 1);
     assert_eq!(mph.fingerprints.len(), mph.slot_capacity());

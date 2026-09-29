@@ -279,10 +279,7 @@ impl Index {
         }
         let engine =
             run_in_build_pool(config.enable_parallel_build, || build_engine(keys, &config))?;
-        Ok(Index {
-            engine: Some(engine),
-            key_count: keys.len(),
-        })
+        Ok(Index { engine: Some(engine), key_count: keys.len() })
     }
 
     #[inline]
@@ -341,26 +338,34 @@ impl Index {
     #[target_feature(enable = "avx2")]
     #[allow(unsafe_op_in_unsafe_fn)]
     #[inline]
-    unsafe fn gather_fp_check_x8(
-        fp_base: *const u16,
-        indices: [u32; 8],
-        expected: [u16; 8],
-    ) -> u8 {
+    unsafe fn gather_fp_check_x8(fp_base: *const u16, indices: [u32; 8], expected: [u16; 8]) -> u8 {
         use core::arch::x86_64::{
             _mm256_and_si256, _mm256_cmpeq_epi32, _mm256_i32gather_epi32, _mm256_movemask_epi8,
-            _mm256_set1_epi32, _mm256_set_epi32,
+            _mm256_set_epi32, _mm256_set1_epi32,
         };
         let vindex = _mm256_set_epi32(
-            indices[7] as i32, indices[6] as i32, indices[5] as i32, indices[4] as i32,
-            indices[3] as i32, indices[2] as i32, indices[1] as i32, indices[0] as i32,
+            indices[7] as i32,
+            indices[6] as i32,
+            indices[5] as i32,
+            indices[4] as i32,
+            indices[3] as i32,
+            indices[2] as i32,
+            indices[1] as i32,
+            indices[0] as i32,
         );
         // scale = 2 bytes per u16 element; gather 8 u32, lower 16 bits = fp value.
         let loaded = _mm256_i32gather_epi32::<2>(fp_base as *const i32, vindex);
         let mask_lo = _mm256_set1_epi32(0x0000_FFFF);
         let loaded_lo = _mm256_and_si256(loaded, mask_lo);
         let expected_v = _mm256_set_epi32(
-            expected[7] as i32, expected[6] as i32, expected[5] as i32, expected[4] as i32,
-            expected[3] as i32, expected[2] as i32, expected[1] as i32, expected[0] as i32,
+            expected[7] as i32,
+            expected[6] as i32,
+            expected[5] as i32,
+            expected[4] as i32,
+            expected[3] as i32,
+            expected[2] as i32,
+            expected[1] as i32,
+            expected[0] as i32,
         );
         let cmp = _mm256_cmpeq_epi32(loaded_lo, expected_v);
         let mm = _mm256_movemask_epi8(cmp) as u32;
@@ -483,20 +488,19 @@ impl Index {
                 Some(bf) => bf.contains_hash(hash),
                 None => true,
             };
-            if bloom_ok
-                && let Some(idx) = engine.backend.lookup(hash) {
-                    let idx = idx as usize;
-                    let ok = match &engine.fingerprints {
-                        Some(fps) => {
-                            let fp = fingerprint16_mph(hash);
-                            unsafe { *fps.get_unchecked(idx) == fp }
-                        }
-                        None => true,
-                    };
-                    if ok {
-                        out[i] = Some(idx);
+            if bloom_ok && let Some(idx) = engine.backend.lookup(hash) {
+                let idx = idx as usize;
+                let ok = match &engine.fingerprints {
+                    Some(fps) => {
+                        let fp = fingerprint16_mph(hash);
+                        unsafe { *fps.get_unchecked(idx) == fp }
                     }
+                    None => true,
+                };
+                if ok {
+                    out[i] = Some(idx);
                 }
+            }
             i += 1;
         }
     }
@@ -515,11 +519,8 @@ impl Index {
         window: usize,
     ) -> usize {
         let n = canon.len();
-        let fp_base = engine
-            .fingerprints
-            .as_ref()
-            .map(|fp| fp.as_ptr())
-            .unwrap_or(std::ptr::null());
+        let fp_base =
+            engine.fingerprints.as_ref().map(|fp| fp.as_ptr()).unwrap_or(std::ptr::null());
         let mut i = 0usize;
         while i + 8 <= n {
             // Lookahead Bloom prefetch.
@@ -784,10 +785,11 @@ impl Index {
 
                     // Wave B: optional Bloom check.
                     if let Some(bf) = filter
-                        && !bf.contains_hash(hash) {
-                            out.push(None);
-                            continue;
-                        }
+                        && !bf.contains_hash(hash)
+                    {
+                        out.push(None);
+                        continue;
+                    }
                     let idx_opt = engine.backend.lookup(hash);
 
                     // Wave C: prefetch fingerprint (only if fingerprints present).
@@ -870,10 +872,7 @@ impl Index {
             }
         });
 
-        let fingerprints = engine
-            .fingerprints
-            .as_ref()
-            .map(|fps| fps[..fps.len() - 1].to_vec());
+        let fingerprints = engine.fingerprints.as_ref().map(|fps| fps[..fps.len() - 1].to_vec());
 
         let parts = mph
             .parts
@@ -937,16 +936,10 @@ impl Index {
         println!("  Engine: {}", stats.engine);
         println!("  Total keys: {}", stats.total_keys);
         if stats.mph_memory > 0 {
-            println!(
-                "  MPH index: {:.2} MB",
-                stats.mph_memory as f64 / 1_048_576.0
-            );
+            println!("  MPH index: {:.2} MB", stats.mph_memory as f64 / 1_048_576.0);
         }
         if stats.pgm_memory > 0 {
-            println!(
-                "  PGM index: {:.2} MB",
-                stats.pgm_memory as f64 / 1_048_576.0
-            );
+            println!("  PGM index: {:.2} MB", stats.pgm_memory as f64 / 1_048_576.0);
         }
     }
 
@@ -1071,8 +1064,8 @@ impl Index {
                     BackendDispatch::read_from(bytes, &mut pos).ok_or(IndexError::CorruptData)?;
                 cursor.pos = pos;
                 let mut bf_pos = cursor.pos;
-                let filter = BlockBloom::read_from(bytes, &mut bf_pos)
-                    .ok_or(IndexError::CorruptData)?;
+                let filter =
+                    BlockBloom::read_from(bytes, &mut bf_pos).ok_or(IndexError::CorruptData)?;
                 cursor.pos = bf_pos;
                 let fingerprints = read_fingerprints(&mut cursor)?;
                 Ok(Index {
@@ -1095,26 +1088,18 @@ impl Index {
                 let has_filter = cursor.read_u8().ok_or(IndexError::CorruptData)?;
                 let filter = if has_filter == 1 {
                     let mut bf_pos = cursor.pos;
-                    let bf = BlockBloom::read_from(bytes, &mut bf_pos)
-                        .ok_or(IndexError::CorruptData)?;
+                    let bf =
+                        BlockBloom::read_from(bytes, &mut bf_pos).ok_or(IndexError::CorruptData)?;
                     cursor.pos = bf_pos;
                     Some(bf)
                 } else {
                     None
                 };
                 let has_fp = cursor.read_u8().ok_or(IndexError::CorruptData)?;
-                let fingerprints = if has_fp == 1 {
-                    Some(read_fingerprints(&mut cursor)?)
-                } else {
-                    None
-                };
+                let fingerprints =
+                    if has_fp == 1 { Some(read_fingerprints(&mut cursor)?) } else { None };
                 Ok(Index {
-                    engine: Some(MphEngine {
-                        backend,
-                        prehash_seed,
-                        filter,
-                        fingerprints,
-                    }),
+                    engine: Some(MphEngine { backend, prehash_seed, filter, fingerprints }),
                     key_count,
                 })
             }
@@ -1220,13 +1205,11 @@ impl Index {
         let canonical = canonical_hash_key(key, engine.prehash_seed);
         // Optional Bloom prefilter (skipped in lean_mph mode).
         if let Some(bf) = &engine.filter
-            && !bf.contains_hash(canonical) {
-                return Err(IndexError::KeyNotFound);
-            }
-        let idx = engine
-            .backend
-            .lookup(canonical)
-            .ok_or(IndexError::KeyNotFound)? as usize;
+            && !bf.contains_hash(canonical)
+        {
+            return Err(IndexError::KeyNotFound);
+        }
+        let idx = engine.backend.lookup(canonical).ok_or(IndexError::KeyNotFound)? as usize;
         // Optional fingerprint verification (skipped in lean_mph mode).
         if let Some(fps) = &engine.fingerprints {
             let fp = fingerprint16_mph(canonical);
@@ -1238,7 +1221,6 @@ impl Index {
         }
         Ok(idx)
     }
-
 }
 
 #[inline(always)]
@@ -1329,21 +1311,18 @@ where
             (Some(filter), part)
         };
         let t2 = std::time::Instant::now();
-        let (backend, fp16) = match PtrHash25Backend::build_from_partitioned(
-            &part,
-            &backend_cfg,
-            !config.lean_mph,
-        ) {
-            Ok(v) => v,
-            Err(MphError::DuplicateKey) => {
-                round += 1;
-                if round >= MAX_PREHASH_ROUNDS {
-                    return Err(IndexError::DuplicateKey);
+        let (backend, fp16) =
+            match PtrHash25Backend::build_from_partitioned(&part, &backend_cfg, !config.lean_mph) {
+                Ok(v) => v,
+                Err(MphError::DuplicateKey) => {
+                    round += 1;
+                    if round >= MAX_PREHASH_ROUNDS {
+                        return Err(IndexError::DuplicateKey);
+                    }
+                    continue;
                 }
-                continue;
-            }
-            Err(e) => return Err(e.into()),
-        };
+                Err(e) => return Err(e.into()),
+            };
         let t3 = std::time::Instant::now();
         // Outer u16 fingerprints were filled per part inside the MPH build; one
         // padding element keeps the batched gather inside the allocation.
@@ -1451,9 +1430,7 @@ pub struct IndexBuilder {
 
 impl IndexBuilder {
     pub fn new() -> Self {
-        Self {
-            config: IndexConfig::default(),
-        }
+        Self { config: IndexConfig::default() }
     }
 
     pub fn with_config(mut self, config: IndexConfig) -> Self {
@@ -1621,8 +1598,8 @@ fn write_u64(out: &mut Vec<u8>, v: u64) {
 
 fn read_fingerprints(cursor: &mut Cursor<'_>) -> Result<Box<[u16]>, IndexError> {
     let len = cursor.read_u64().ok_or(IndexError::CorruptData)? as usize;
-    let mut fps: Vec<u16> = crate::wire::read_le_at(cursor.buf, &mut cursor.pos, len)
-        .ok_or(IndexError::CorruptData)?;
+    let mut fps: Vec<u16> =
+        crate::wire::read_le_at(cursor.buf, &mut cursor.pos, len).ok_or(IndexError::CorruptData)?;
     fps.push(0); // padding element, see `MphEngine::fingerprints`
     Ok(fps.into_boxed_slice())
 }

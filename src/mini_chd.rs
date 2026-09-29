@@ -60,12 +60,7 @@ impl MiniChd {
         Err(MiniChdError::Unresolvable)
     }
 
-    fn try_build_with_salt(
-        keys: &[u64],
-        salt: u64,
-        n: usize,
-        num_buckets: usize,
-    ) -> Option<Self> {
+    fn try_build_with_salt(keys: &[u64], salt: u64, n: usize, num_buckets: usize) -> Option<Self> {
         // Group keys by bucket.
         let mut buckets: Vec<Vec<u64>> = vec![Vec::new(); num_buckets];
         for &k in keys {
@@ -148,4 +143,3 @@ fn splitmix64(mut x: u64) -> u64 {
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
 }
-

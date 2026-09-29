@@ -118,9 +118,7 @@ impl MphBackend for PtrHash25Backend {
             // Duplicate u64 keys: keep the historical behaviour of this low-level entry
             // point (a map that keeps the last occurrence) — `Index` handles duplicates
             // explicitly before ever reaching here.
-            Err(_) => Self {
-                storage: PtrHash25Storage::Map(build_fallback_map_original(keys)),
-            },
+            Err(_) => Self { storage: PtrHash25Storage::Map(build_fallback_map_original(keys)) },
         }
     }
 
@@ -156,17 +154,9 @@ impl PtrHash25Backend {
         outer_fp16: bool,
     ) -> Result<(Self, Option<Vec<u16>>), PtrHash25Error> {
         let cfg = config.mph_config();
-        let outputs = ptrhash25::BuildOutputs {
-            slots: false,
-            fp16: outer_fp16,
-        };
+        let outputs = ptrhash25::BuildOutputs { slots: false, fp16: outer_fp16 };
         match ptrhash25::build_partitioned_with(part, &cfg, outputs) {
-            Ok((mph, _, fp16)) => Ok((
-                Self {
-                    storage: PtrHash25Storage::Mph(mph),
-                },
-                fp16,
-            )),
+            Ok((mph, _, fp16)) => Ok((Self { storage: PtrHash25Storage::Mph(mph) }, fp16)),
             Err(PtrHash25Error::DuplicateKey) => Err(PtrHash25Error::DuplicateKey),
             Err(PtrHash25Error::Unresolvable) => {
                 let n = part.len();
@@ -179,12 +169,7 @@ impl PtrHash25Backend {
                         fp[i] = (key & 0xFFFF) as u16;
                     }
                 }
-                Ok((
-                    Self {
-                        storage: PtrHash25Storage::Map(map),
-                    },
-                    fp16,
-                ))
+                Ok((Self { storage: PtrHash25Storage::Map(map) }, fp16))
             }
         }
     }
@@ -193,9 +178,7 @@ impl PtrHash25Backend {
     pub fn slot_capacity(&self) -> usize {
         match &self.storage {
             PtrHash25Storage::Mph(mph) => mph.slot_capacity(),
-            PtrHash25Storage::Map(map) => {
-                map.values().copied().max().map_or(0, |m| m as usize + 1)
-            }
+            PtrHash25Storage::Map(map) => map.values().copied().max().map_or(0, |m| m as usize + 1),
         }
     }
 }

@@ -200,9 +200,7 @@ fn bucket_for(h1: u64, num_buckets: usize) -> usize {
 #[inline(always)]
 fn slot_for(h2: u64, pilot: u8, n: usize) -> usize {
     let pilot_mix = (pilot as u64).wrapping_mul(0xA24B_1F6F_DA39_2B31);
-    let mixed = (h2 ^ pilot_mix)
-        .rotate_left(31)
-        .wrapping_mul(0xD6E8_FEB8_6659_FD93);
+    let mixed = (h2 ^ pilot_mix).rotate_left(31).wrapping_mul(0xD6E8_FEB8_6659_FD93);
     fast_reduce(mixed, n)
 }
 
@@ -401,8 +399,8 @@ impl PtrHash25Mphf {
         };
         let h2 = h2_from_h1(h1);
         let large = p.large_buckets as usize;
-        let bucket = p.bucket_off as usize
-            + bucket_in_part(h1, large, p.num_buckets as usize - large);
+        let bucket =
+            p.bucket_off as usize + bucket_in_part(h1, large, p.num_buckets as usize - large);
         // SAFETY: `bucket < bucket_off + num_buckets ≤ pilots.len()` — validated on
         // load, guaranteed by construction on build.
         let pilot = unsafe { *self.pilots.as_slice().get_unchecked(bucket) };
@@ -411,9 +409,8 @@ impl PtrHash25Mphf {
         if local >= num_keys {
             // SAFETY: `local - num_keys < num_slots - num_keys = remap_len(p)` and the
             // part's remap range lies inside `remap` (validated on load).
-            local = unsafe {
-                *self.remap.get_unchecked(p.remap_off as usize + (local - num_keys))
-            } as usize;
+            local = unsafe { *self.remap.get_unchecked(p.remap_off as usize + (local - num_keys)) }
+                as usize;
         }
         (p.slot_off as usize + local, h2)
     }
@@ -485,9 +482,7 @@ impl Default for Builder {
 
 impl Builder {
     pub fn new() -> Self {
-        Self {
-            cfg: BuildConfig::default(),
-        }
+        Self { cfg: BuildConfig::default() }
     }
 
     pub fn with_config(mut self, cfg: BuildConfig) -> Self {
@@ -621,12 +616,7 @@ pub fn partition_keys_into(
         for (o, &k) in out.as_mut_slice().iter_mut().zip(keys) {
             *o = k.rotate_left(rot);
         }
-        return Partitioned {
-            keys: out,
-            part_offsets: vec![0, n],
-            part_salt,
-            prerotate,
-        };
+        return Partitioned { keys: out, part_offsets: vec![0, n], part_salt, prerotate };
     }
 
     let ranges = partition_ranges(n);
@@ -644,15 +634,11 @@ pub fn partition_keys_into(
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
-        hist.par_chunks_mut(parts)
-            .enumerate()
-            .for_each(|(r, row)| count_range(r, row));
+        hist.par_chunks_mut(parts).enumerate().for_each(|(r, row)| count_range(r, row));
     }
     #[cfg(not(feature = "parallel"))]
     {
-        hist.chunks_mut(parts)
-            .enumerate()
-            .for_each(|(r, row)| count_range(r, row));
+        hist.chunks_mut(parts).enumerate().for_each(|(r, row)| count_range(r, row));
     }
 
     // Prefix sums: part offsets, then per-range write cursors (in place of `hist`).
@@ -717,23 +703,14 @@ pub fn partition_keys_into(
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
-        hist.par_chunks_mut(parts)
-            .enumerate()
-            .for_each(|(r, row)| scatter_range(r, row));
+        hist.par_chunks_mut(parts).enumerate().for_each(|(r, row)| scatter_range(r, row));
     }
     #[cfg(not(feature = "parallel"))]
     {
-        hist.chunks_mut(parts)
-            .enumerate()
-            .for_each(|(r, row)| scatter_range(r, row));
+        hist.chunks_mut(parts).enumerate().for_each(|(r, row)| scatter_range(r, row));
     }
 
-    Partitioned {
-        keys: out,
-        part_offsets,
-        part_salt,
-        prerotate,
-    }
+    Partitioned { keys: out, part_offsets, part_salt, prerotate }
 }
 
 /// Per-thread scratch buffers for one part build. Grown on demand and reused across
@@ -808,7 +785,13 @@ fn xorshift(state: &mut u64) -> u64 {
 /// Try to place `bucket` with `pilot` into free slots only. On success the slots are
 /// recorded in `trial[..len]` and `true` is returned; nothing is written to the table.
 #[inline(always)]
-fn place_free(bucket: &[u64], pilot: u8, num_slots: usize, slot_bucket: &[u32], trial: &mut [u32]) -> bool {
+fn place_free(
+    bucket: &[u64],
+    pilot: u8,
+    num_slots: usize,
+    slot_bucket: &[u32],
+    trial: &mut [u32],
+) -> bool {
     for (i, &h2) in bucket.iter().enumerate() {
         let slot = slot_for(h2, pilot, num_slots);
         if slot_bucket[slot] != FREE {
@@ -865,7 +848,11 @@ fn eviction_cost(
 
 /// Build one part. On success returns the salt that placed it and fills `job.pilots`,
 /// `job.remap`, `job.slots` (local position per key), `job.fp8` and `job.fp16` (if present).
-fn build_part(job: &mut PartJob<'_>, sc: &mut Scratch, cfg: &BuildConfig) -> Result<u64, PtrHash25Error> {
+fn build_part(
+    job: &mut PartJob<'_>,
+    sc: &mut Scratch,
+    cfg: &BuildConfig,
+) -> Result<u64, PtrHash25Error> {
     let keys = job.keys;
     let m = keys.len();
     let num_slots = job.info.num_slots as usize;
@@ -1031,7 +1018,14 @@ fn build_part(job: &mut PartJob<'_>, sc: &mut Scratch, cfg: &BuildConfig) -> Res
                     let pilot = start_pilot.wrapping_add(i);
                     let limit = best.map_or(usize::MAX, |(c, _)| c);
                     if let Some(cost) = eviction_cost(
-                        bucket, pilot, num_slots, slot_bucket, offsets, &protect, limit, trial,
+                        bucket,
+                        pilot,
+                        num_slots,
+                        slot_bucket,
+                        offsets,
+                        &protect,
+                        limit,
+                        trial,
                     ) {
                         best = Some((cost, pilot));
                         if cost == 0 {
@@ -1400,7 +1394,9 @@ pub fn read_ptrhash25(buf: &[u8], pos: &mut usize) -> Option<PtrHash25Mphf> {
             if num_slots < num_keys {
                 return None;
             }
-            parts.push(PartInfo::new(slot_off, psalt, bucket_off, num_keys, num_slots, nb, remap_off));
+            parts.push(PartInfo::new(
+                slot_off, psalt, bucket_off, num_keys, num_slots, nb, remap_off,
+            ));
         }
         let remap_len = rd_u64(buf, pos)? as usize;
         let remap: Vec<u32> = crate::wire::read_le_at(buf, pos, remap_len)?;
