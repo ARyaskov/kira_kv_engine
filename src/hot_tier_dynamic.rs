@@ -8,15 +8,27 @@
 //!   - Space-Saving directly stores the *candidate* top-K keys — no separate
 //!     reservoir is needed to enumerate them at rebuild time.
 //!   - It has tight error bounds (overestimation only) and `O(K)` memory.
-//!   - All operations are O(1) amortized.
+//!   - Every operation is `O(log K)` here (a binary min-heap over the counters;
+//!     the paper's Stream-Summary list is O(1) but pointer-heavy).
 //!
 //! At `rebuild_threshold` observations, callers can request a rebuild via
-//! [`take_top_k`] which atomically swaps out the inner tracker, returns its
-//! top-K (key, est_count) pairs, and resets the counters to zero. Building a
-//! new [`HotTierIndex`] from those keys is the caller's responsibility — that
-//! way the rebuild can be off-loaded to a background thread.
+//! [`DynamicHotTier::take_top_k`] which atomically swaps out the inner tracker,
+//! returns its top-K (key, est_count) pairs, and resets the counters to zero.
+//! Building a new [`HotTierIndex`] from those keys is the caller's
+//! responsibility — that way the rebuild can be off-loaded to a background thread.
+//!
+//! ## Concurrency
+//!
+//! Lookups take a *read* lock on the installed index, so any number of threads
+//! query concurrently; `install` takes the write lock for a pointer swap. The
+//! frequency tracker is a single mutable structure behind a `Mutex`, but lookups
+//! only `try_lock` it: under contention the observation is dropped (and counted in
+//! [`DynamicHotTier::dropped_observations`]) instead of serializing the readers.
+//! Space-Saving is a sampling estimator anyway, so dropped observations only cost
+//! a little accuracy.
 
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::hot_tier::HotTierIndex;
 
@@ -26,31 +38,33 @@ use crate::hot_tier::HotTierIndex;
 #[derive(Debug)]
 pub struct SpaceSaving {
     capacity: usize,
-    /// (key, estimated_count, error_bound). Kept as parallel vectors for SoA
-    /// cache locality.
+    /// (key, estimated_count, error_bound) per slot; SoA for locality.
     keys: Vec<u64>,
     counts: Vec<u64>,
     errors: Vec<u64>,
-    /// Index of the slot with the minimum count (maintained lazily).
-    min_idx: usize,
-    /// For O(1) lookups: maps key → slot index. We use a simple linear-probed
-    /// open-addressed hash table to avoid the overhead of HashMap allocation
-    /// on every observe.
-    probe: Vec<i32>,        // -1 = empty, else slot index
-    probe_keys: Vec<u64>,   // mirrors probe; lets us check key without indirection
+    /// Binary min-heap of slot indices ordered by `counts`, so the eviction
+    /// victim is `heap[0]` and a counter increment is one sift-down.
+    heap: Vec<u32>,
+    /// Position of every slot in `heap`.
+    heap_pos: Vec<u32>,
+    /// key → slot: linear-probed open addressing (no per-observe allocation).
+    probe: Vec<i32>, // -1 = empty, else slot index
+    probe_keys: Vec<u64>,
     probe_mask: usize,
     total_observed: u64,
 }
 
 impl SpaceSaving {
     pub fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
         let probe_size = (capacity * 4).next_power_of_two().max(64);
         Self {
             capacity,
             keys: Vec::with_capacity(capacity),
             counts: Vec::with_capacity(capacity),
             errors: Vec::with_capacity(capacity),
-            min_idx: 0,
+            heap: Vec::with_capacity(capacity),
+            heap_pos: Vec::with_capacity(capacity),
             probe: vec![-1; probe_size],
             probe_keys: vec![0u64; probe_size],
             probe_mask: probe_size - 1,
@@ -66,6 +80,10 @@ impl SpaceSaving {
         self.keys.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
     #[inline]
     fn hash(key: u64) -> u64 {
         // splitmix64
@@ -75,10 +93,10 @@ impl SpaceSaving {
         z ^ (z >> 31)
     }
 
-    /// Find probe slot for `key`. Returns `(slot, occupant)` where `occupant`
-    /// is `Some(slot_idx)` if the slot already holds `key`, else `None`.
+    /// Probe slot for `key`: `(probe index, Some(slot))` if present, else the
+    /// empty probe index where it would go.
     #[inline]
-    fn probe_for(&self, key: u64) -> (usize, Option<i32>) {
+    fn probe_for(&self, key: u64) -> (usize, Option<usize>) {
         let mut idx = (Self::hash(key) as usize) & self.probe_mask;
         loop {
             let v = self.probe[idx];
@@ -86,53 +104,89 @@ impl SpaceSaving {
                 return (idx, None);
             }
             if self.probe_keys[idx] == key {
-                return (idx, Some(v));
+                return (idx, Some(v as usize));
             }
             idx = (idx + 1) & self.probe_mask;
         }
     }
 
-    /// Record one observation of `key`. O(1) amortized for the common case
-    /// (`key` already in slots); O(K) on eviction due to a full `recompute_min`.
-    /// At K ≤ 2× hot_set this is well under 1 µs even for K=1024.
+    /// Record one observation of `key`. O(log K).
     pub fn observe(&mut self, key: u64) {
         self.total_observed = self.total_observed.saturating_add(1);
         let (probe_idx, occ) = self.probe_for(key);
         if let Some(slot) = occ {
-            // Increment existing counter — always recompute_min because in the
-            // dense case (lots of duplicate counts) lazy update would miss
-            // valid min changes.
-            let s = slot as usize;
-            self.counts[s] += 1;
-            self.recompute_min();
+            self.counts[slot] += 1;
+            let pos = self.heap_pos[slot] as usize;
+            self.sift_down(pos);
             return;
         }
         if self.keys.len() < self.capacity {
             // Free slot available — admit the new key with count=1.
-            let slot = self.keys.len() as i32;
+            let slot = self.keys.len();
             self.keys.push(key);
             self.counts.push(1);
             self.errors.push(0);
-            self.probe[probe_idx] = slot;
+            self.heap.push(slot as u32);
+            self.heap_pos.push(self.heap.len() as u32 - 1);
+            self.probe[probe_idx] = slot as i32;
             self.probe_keys[probe_idx] = key;
-            self.recompute_min();
+            self.sift_up(self.heap.len() - 1);
             return;
         }
-        // Evict the minimum slot; the new key inherits its count.
-        let evict_idx = self.min_idx;
-        let old_key = self.keys[evict_idx];
-        let old_count = self.counts[evict_idx];
-        // Remove old key from probe table.
+        // Evict the minimum; the new key inherits its count (+1) and the old
+        // count becomes its error bound.
+        let victim = self.heap[0] as usize;
+        let old_key = self.keys[victim];
+        let old_count = self.counts[victim];
         self.remove_from_probe(old_key);
-        // Insert new key into probe table — re-probe because `probe_idx` was
-        // computed for an empty path and remove_from_probe shifted entries.
-        self.keys[evict_idx] = key;
-        self.counts[evict_idx] = old_count + 1;
-        self.errors[evict_idx] = old_count; // error bound = pre-eviction count
+        self.keys[victim] = key;
+        self.counts[victim] = old_count + 1;
+        self.errors[victim] = old_count;
+        // Re-probe: `remove_from_probe` may have shifted the chain.
         let (new_probe_idx, _) = self.probe_for(key);
-        self.probe[new_probe_idx] = evict_idx as i32;
+        self.probe[new_probe_idx] = victim as i32;
         self.probe_keys[new_probe_idx] = key;
-        self.recompute_min();
+        self.sift_down(0);
+    }
+
+    #[inline]
+    fn heap_swap(&mut self, a: usize, b: usize) {
+        self.heap.swap(a, b);
+        self.heap_pos[self.heap[a] as usize] = a as u32;
+        self.heap_pos[self.heap[b] as usize] = b as u32;
+    }
+
+    fn sift_down(&mut self, mut pos: usize) {
+        let n = self.heap.len();
+        loop {
+            let l = 2 * pos + 1;
+            if l >= n {
+                return;
+            }
+            let r = l + 1;
+            let mut m = l;
+            if r < n && self.counts[self.heap[r] as usize] < self.counts[self.heap[l] as usize] {
+                m = r;
+            }
+            if self.counts[self.heap[m] as usize] < self.counts[self.heap[pos] as usize] {
+                self.heap_swap(m, pos);
+                pos = m;
+            } else {
+                return;
+            }
+        }
+    }
+
+    fn sift_up(&mut self, mut pos: usize) {
+        while pos > 0 {
+            let parent = (pos - 1) / 2;
+            if self.counts[self.heap[pos] as usize] < self.counts[self.heap[parent] as usize] {
+                self.heap_swap(pos, parent);
+                pos = parent;
+            } else {
+                return;
+            }
+        }
     }
 
     fn remove_from_probe(&mut self, key: u64) {
@@ -159,18 +213,6 @@ impl SpaceSaving {
         }
     }
 
-    fn recompute_min(&mut self) {
-        let mut m = self.counts[0];
-        let mut mi = 0usize;
-        for i in 1..self.counts.len() {
-            if self.counts[i] < m {
-                m = self.counts[i];
-                mi = i;
-            }
-        }
-        self.min_idx = mi;
-    }
-
     /// Return the current top-K (key, estimated_count) sorted by count descending.
     /// `k` is clamped to `len()`.
     pub fn top_k(&self, k: usize) -> Vec<(u64, u64)> {
@@ -180,7 +222,7 @@ impl SpaceSaving {
             .copied()
             .zip(self.counts.iter().copied())
             .collect();
-        all.sort_by(|a, b| b.1.cmp(&a.1));
+        all.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         all.truncate(k);
         all
     }
@@ -191,34 +233,27 @@ impl SpaceSaving {
     /// to the *next* rebuild window).
     pub fn take_top_k_and_reset(&mut self, k: usize) -> Vec<(u64, u64)> {
         let out = self.top_k(k);
-        // Reset.
         self.keys.clear();
         self.counts.clear();
         self.errors.clear();
+        self.heap.clear();
+        self.heap_pos.clear();
         self.probe.fill(-1);
         self.probe_keys.fill(0);
-        self.min_idx = 0;
         self.total_observed = 0;
         out
     }
 }
 
 /// Dynamic hot-tier holding a `HotTierIndex` plus a frequency tracker. The
-/// inner index is replaced atomically by [`install`] after a rebuild.
-///
-/// Concurrency: `observe` takes a read-style lock on the inner index (None
-/// blocking — uses `Mutex`); `install` takes a write lock. Callers driving
-/// many concurrent lookups should clone the wrapper into an `Arc` and call
-/// `observe` per lookup.
+/// inner index is replaced atomically by [`DynamicHotTier::install`] after a
+/// rebuild. Share it between threads behind an `Arc`.
 pub struct DynamicHotTier {
-    inner: Mutex<HotTierState>,
-}
-
-struct HotTierState {
-    index: Option<HotTierIndex>,
-    tracker: SpaceSaving,
+    index: RwLock<Option<Arc<HotTierIndex>>>,
+    tracker: Mutex<SpaceSaving>,
     rebuild_every: u64,
-    pending_rebuild: bool,
+    pending_rebuild: AtomicBool,
+    dropped: AtomicU64,
 }
 
 impl DynamicHotTier {
@@ -226,63 +261,74 @@ impl DynamicHotTier {
     /// statically-built tier from the index's first build). `top_k_capacity` is
     /// the Space-Saving counter capacity (typical: 2× expected hot-set size).
     /// `rebuild_every` is the number of observations between automatic rebuild
-    /// hints.
+    /// hints (0 = never).
     pub fn new(initial: Option<HotTierIndex>, top_k_capacity: usize, rebuild_every: u64) -> Self {
         Self {
-            inner: Mutex::new(HotTierState {
-                index: initial,
-                tracker: SpaceSaving::new(top_k_capacity.max(16)),
-                rebuild_every,
-                pending_rebuild: false,
-            }),
+            index: RwLock::new(initial.map(Arc::new)),
+            tracker: Mutex::new(SpaceSaving::new(top_k_capacity.max(16))),
+            rebuild_every,
+            pending_rebuild: AtomicBool::new(false),
+            dropped: AtomicU64::new(0),
         }
     }
 
-    /// Look up a key in the current hot tier. Returns `Some(idx)` on hit. Always
-    /// records the observation in the tracker, regardless of hit/miss — the
-    /// frequency information is what drives the next rebuild.
+    /// Look up a key in the current hot tier. Returns `Some(idx)` on hit. Records
+    /// the observation in the tracker (hit or miss) unless another thread holds
+    /// the tracker at this instant, in which case the observation is dropped.
     pub fn lookup_u64(&self, key: u64) -> Option<u32> {
-        let mut guard = self.inner.lock().ok()?;
-        guard.tracker.observe(key);
-        let total = guard.tracker.total_observed();
-        let rebuild_every = guard.rebuild_every;
-        if rebuild_every > 0 && total >= rebuild_every {
-            guard.pending_rebuild = true;
+        self.observe(key);
+        let guard = self.index.read().unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().and_then(|h| h.lookup_u64(key))
+    }
+
+    /// Record an observation without a lookup (e.g. for keys served from the
+    /// static index). Non-blocking.
+    pub fn observe(&self, key: u64) {
+        match self.tracker.try_lock() {
+            Ok(mut t) => {
+                t.observe(key);
+                if self.rebuild_every > 0 && t.total_observed() >= self.rebuild_every {
+                    self.pending_rebuild.store(true, Ordering::Relaxed);
+                }
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(std::sync::TryLockError::Poisoned(p)) => {
+                let mut t = p.into_inner();
+                t.observe(key);
+            }
         }
-        guard.index.as_ref().and_then(|h| h.lookup_u64(key))
+    }
+
+    /// Observations dropped because the tracker was busy. Diagnostic only.
+    pub fn dropped_observations(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     /// `true` if the tracker has observed enough lookups to suggest a rebuild.
     /// Polled by background workers.
     pub fn should_rebuild(&self) -> bool {
-        self.inner.lock().map(|g| g.pending_rebuild).unwrap_or(false)
+        self.pending_rebuild.load(Ordering::Relaxed)
     }
 
     /// Drain top-K observed keys and clear the rebuild flag. Caller uses these
-    /// keys to build a new `HotTierIndex`, then installs it via [`install`].
+    /// keys to build a new `HotTierIndex`, then installs it via [`DynamicHotTier::install`].
     pub fn take_top_k(&self, k: usize) -> Vec<(u64, u64)> {
-        match self.inner.lock() {
-            Ok(mut g) => {
-                g.pending_rebuild = false;
-                g.tracker.take_top_k_and_reset(k)
-            }
-            Err(_) => Vec::new(),
-        }
+        self.pending_rebuild.store(false, Ordering::Relaxed);
+        let mut t = self.tracker.lock().unwrap_or_else(|e| e.into_inner());
+        t.take_top_k_and_reset(k)
     }
 
-    /// Install a freshly-built `HotTierIndex`. The old one is dropped.
+    /// Install a freshly-built `HotTierIndex`. Readers in flight keep the old one
+    /// until they finish; it is dropped when the last reference goes away.
     pub fn install(&self, new_index: HotTierIndex) {
-        if let Ok(mut g) = self.inner.lock() {
-            g.index = Some(new_index);
-        }
+        let mut g = self.index.write().unwrap_or_else(|e| e.into_inner());
+        *g = Some(Arc::new(new_index));
     }
 
     pub fn current_memory(&self) -> usize {
-        self.inner
-            .lock()
-            .ok()
-            .and_then(|g| g.index.as_ref().map(|h| h.memory_usage()))
-            .unwrap_or(0)
+        let g = self.index.read().unwrap_or_else(|e| e.into_inner());
+        g.as_ref().map(|h| h.memory_usage()).unwrap_or(0)
     }
 }
-
