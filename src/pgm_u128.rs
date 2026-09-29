@@ -351,7 +351,9 @@ impl LinReg128 {
             let kf = (k as f64) * (2.0f64).powi(-64);
             let pred = slope.mul_add(kf, intercept);
             let actual = (start + offset) as f64;
-            let e = (pred - actual).abs() as u32;
+            // Rounded up: lookups truncate the prediction, so a truncated error would
+            // leave the true position outside the `[pos - err, pos + err]` window.
+            let e = (pred - actual).abs().ceil() as u32;
             if e > err {
                 err = e;
             }

@@ -131,3 +131,42 @@ fn write_read_v2_roundtrip() {
     }
     assert!(pgm2.has_bloom());
 }
+
+fn splitmix(seed: &mut u64) -> u64 {
+    *seed = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *seed;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Regression: the per-segment error used to be truncated (`3.9 → 3`) while the
+/// predicted position was also truncated, so keys whose prediction fell below the
+/// true position by a fractional amount were outside the scan window and reported
+/// as missing. Every built key must be found, for every epsilon and key shape.
+#[test]
+fn every_built_key_is_found_random_and_sequential() {
+    let mut seed = 42u64;
+    for &(n, eps) in &[(10_000usize, 8u32), (200_000, 16), (200_000, 64), (100_000, 1)] {
+        let mut keys: Vec<u64> = (0..n).map(|_| splitmix(&mut seed)).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        for parallel in [false, true] {
+            let pgm = PgmBuilder::new()
+                .with_epsilon(eps)
+                .with_parallel(parallel)
+                .build(keys.clone())
+                .unwrap();
+            for (i, &k) in keys.iter().enumerate() {
+                assert_eq!(pgm.index(k).ok(), Some(i), "n={n} eps={eps} miss at #{i}");
+                assert_eq!(pgm.lower_bound(k), i, "n={n} eps={eps} lower_bound at #{i}");
+            }
+        }
+    }
+    // Near-linear keys with sub-integer jitter: the case that lost 1/3 of all keys.
+    let keys: Vec<u64> = (0..500_000u64).map(|i| i * 7 + (i % 3)).collect();
+    let pgm = PgmBuilder::new().with_epsilon(32).build(keys.clone()).unwrap();
+    for (i, &k) in keys.iter().enumerate() {
+        assert_eq!(pgm.index(k).ok(), Some(i), "sequential miss at #{i}");
+    }
+}

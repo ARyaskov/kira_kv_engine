@@ -698,11 +698,14 @@ impl PgmIndex {
             let sq = seg.slope as f32;
             let iq = seg.intercept as f32;
             // Recompute max_error against quantized predictions over [start, end).
+            // The error must be rounded *up*: lookups truncate the prediction to an
+            // integer position and scan `[pos - err, pos + err]`, so a truncated error
+            // (3.9 → 3) would leave the true position just outside the window.
             let mut err = 0u32;
             for i in seg.start..seg.end {
                 let pred = (sq as f64).mul_add(keys[i] as f64, iq as f64);
                 let actual = i as f64;
-                let e = (pred - actual).abs() as u32;
+                let e = (pred - actual).abs().ceil() as u32;
                 if e > err {
                     err = e;
                 }
@@ -1096,7 +1099,8 @@ impl LinReg {
         for (offset, &key) in keys[start..end].iter().enumerate() {
             let pred = sq.mul_add(key as f64, iq);
             let actual = (start + offset) as f64;
-            let err = (pred - actual).abs() as u32;
+            // Round up — see `segments_to_soa` for why truncation loses keys.
+            let err = (pred - actual).abs().ceil() as u32;
             if err > max_err {
                 max_err = err;
             }
@@ -1112,6 +1116,9 @@ impl LinReg {
 // and zero branches.
 // --------------------------------------------------------------------------------------
 
+/// Truncated position prediction. With `max_error` rounded up at build time,
+/// `|pred - actual| ≤ err` implies `actual ∈ [floor(pred) - err, floor(pred) + err]`,
+/// so the `[pos - err, pos + err]` scan window of the callers is always sufficient.
 #[inline]
 fn predict_pos(segments: &SegmentsSoA, idx: usize, key: u64) -> usize {
     // f32 mul_add for cache-friendly hot path; if intermediate precision matters
