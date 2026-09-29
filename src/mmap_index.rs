@@ -115,9 +115,11 @@ impl MmapIndex {
                 "header too short",
             ));
         }
-        let header_ptr = bytes.as_ptr() as *const MmapHeader;
-        // SAFETY: bounds-checked above, header is POD.
-        let header = unsafe { &*header_ptr };
+        // SAFETY: bounds-checked above; the header is plain data and `Vec<u8>` gives no
+        // alignment guarantee, so it is copied out with an unaligned read rather than
+        // referenced in place.
+        let header: MmapHeader =
+            unsafe { std::ptr::read_unaligned(bytes.as_ptr() as *const MmapHeader) };
         if &header.magic != MAGIC {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -125,19 +127,23 @@ impl MmapIndex {
             ));
         }
         let table_start = std::mem::size_of::<MmapHeader>();
-        let table_len = header.section_count as usize * std::mem::size_of::<SectionEntry>();
-        if table_start + table_len > bytes.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "section table overflow",
-            ));
+        let entry_size = std::mem::size_of::<SectionEntry>();
+        let count = header.section_count as usize;
+        let table_len = count
+            .checked_mul(entry_size)
+            .filter(|len| table_start + len <= bytes.len())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "section table overflow")
+            })?;
+        let mut sections = Vec::with_capacity(count);
+        for chunk in bytes[table_start..table_start + table_len].chunks_exact(entry_size) {
+            // SAFETY: `chunk` holds exactly one plain-data `SectionEntry`; unaligned read
+            // for the same reason as the header.
+            sections.push(unsafe { std::ptr::read_unaligned(chunk.as_ptr() as *const SectionEntry) });
         }
-        let table_ptr = unsafe { bytes.as_ptr().add(table_start) as *const SectionEntry };
-        let sections =
-            unsafe { std::slice::from_raw_parts(table_ptr, header.section_count as usize) };
         Ok(Header {
             key_count: header.key_count,
-            sections: sections.to_vec(),
+            sections,
         })
     }
 
@@ -145,12 +151,10 @@ impl MmapIndex {
     pub fn section(&self, header: &Header, kind: SectionKind) -> Option<&[u8]> {
         let entry = header.sections.iter().find(|e| e.kind == kind as u32)?;
         let bytes = self.as_bytes();
-        let start = entry.offset as usize;
-        let end = start + entry.length as usize;
-        if end > bytes.len() {
-            return None;
-        }
-        Some(&bytes[start..end])
+        let start = usize::try_from(entry.offset).ok()?;
+        let len = usize::try_from(entry.length).ok()?;
+        let end = start.checked_add(len)?;
+        bytes.get(start..end)
     }
 }
 
