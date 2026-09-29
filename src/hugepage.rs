@@ -18,25 +18,28 @@
 
 #![allow(dead_code)]
 
-use std::alloc::{dealloc, Layout};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::alloc::{Layout, dealloc};
 use std::sync::OnceLock;
 
-/// One-time message flag so we don't spam stderr per allocation.
-static HUGEPAGE_MSG_SHOWN: AtomicBool = AtomicBool::new(false);
-
-/// Lazy detection of hugepage availability. Returns Some(()) if hugepages CAN be
-/// allocated, None otherwise. Caches the result and prints a one-time message on
-/// the first attempt if unavailable.
-fn hugepage_available() -> bool {
+/// Whether 2 MB hugepages can be allocated in this process (probed once, cached).
+///
+/// Large index tables (≥ 1 MB) are placed in hugepages when this is `true`,
+/// which removes nearly all TLB misses on random lookups (~10-20 ns per lookup
+/// on 100M-key indexes). When it is `false` the crate silently uses 4 KB pages;
+/// nothing is printed. To enable hugepages:
+///
+/// - **Linux**: reserve pages, e.g. `sudo sysctl vm.nr_hugepages=1024`.
+/// - **Windows**: grant the account the *Lock pages in memory* privilege
+///   (`secpol.msc` → Local Policies → User Rights Assignment) and log in again;
+///   running as Administrator alone is not enough.
+/// - **macOS and others**: not supported.
+pub fn hugepages_available() -> bool {
     static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        let ok = check_hugepage_permission();
-        if !ok && !HUGEPAGE_MSG_SHOWN.swap(true, Ordering::Relaxed) {
-            print_hugepage_help();
-        }
-        ok
-    })
+    *AVAILABLE.get_or_init(check_hugepage_permission)
+}
+
+fn hugepage_available() -> bool {
+    hugepages_available()
 }
 
 fn check_hugepage_permission() -> bool {
@@ -52,30 +55,6 @@ fn check_hugepage_permission() -> bool {
     {
         false
     }
-}
-
-fn print_hugepage_help() {
-    #[cfg(target_os = "windows")]
-    eprintln!(
-        "[kira_kv_engine] Large pages unavailable; falling back to 4 KB pages.\n  \
-         Note: running as Administrator alone is NOT enough — Windows requires the\n  \
-         'Lock pages in memory' privilege to be explicitly granted AND a new logon\n  \
-         session for it to take effect. To enable:\n  \
-           1. Win+R → secpol.msc → enter\n  \
-           2. Local Policies → User Rights Assignment → 'Lock pages in memory'\n  \
-           3. Add your user account (or BUILTIN\\Administrators)\n  \
-           4. Log out and log back in (privilege only applies to new sessions)\n  \
-         On a 100M-key index this saves ~10-20 ns per lookup by eliminating TLB misses."
-    );
-    #[cfg(target_os = "linux")]
-    eprintln!(
-        "[kira_kv_engine] Hugepages unavailable; falling back to 4 KB pages.\n  \
-         Reserve some 2 MB pages first, e.g.:\n  \
-           sudo sysctl vm.nr_hugepages=1024\n  \
-         to cut TLB misses by ~99% on 50M-100M-key indexes."
-    );
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-    eprintln!("[kira_kv_engine] Hugepages not supported on this OS; using 4 KB pages.");
 }
 
 /// 2 MB hugepage size.

@@ -40,6 +40,7 @@ pub use mph_backend::{BackendKind, BuildConfig as BackendBuildConfig, BuildProfi
 pub use dynamic_index::{DynamicConfig, DynamicIndex, StableId};
 pub use elias_fano::EliasFano;
 pub use hot_tier_dynamic::{DynamicHotTier, SpaceSaving};
+pub use hugepage::hugepages_available;
 pub use hybrid_engine::{HybridBuilder, HybridError, HybridIndex, HybridStorageStats};
 pub use pgm::{PgmBuilder, PgmIndex, PgmStats};
 pub use pgm_u128::{PgmIndexU128, PgmU128Error};
