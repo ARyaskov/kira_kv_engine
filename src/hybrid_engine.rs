@@ -62,6 +62,7 @@ use thiserror::Error;
 
 use crate::block_bloom::BlockBloom;
 use crate::pgm::{PgmBuilder, PgmIndex};
+use crate::prefetch::prefetch_read;
 use crate::ptrhash25::{
     BuildConfig as MphConfig, Builder as MphBuilder, PtrHash25Error as MphError, PtrHash25Mphf,
 };
@@ -569,41 +570,24 @@ impl HybridIndex {
         let max_keys_ptr = self.pgm.max_keys_ptr();
         let num_segs = self.pgm.num_segments();
 
-        #[cfg(target_arch = "x86_64")]
-        for i in 0..WINDOW.min(hashes.len()) {
-            unsafe {
-                if let Some(bf) = &self.bloom {
-                    let p = bf.block_ptr(hashes[i]);
-                    std::arch::x86_64::_mm_prefetch(
-                        p as *const i8,
-                        std::arch::x86_64::_MM_HINT_T0,
-                    );
-                }
-                // Prefetch the middle of the max_keys array — first binary
-                // search step will land near there.
-                if num_segs > 0 {
-                    let mid = num_segs / 2;
-                    std::arch::x86_64::_mm_prefetch(
-                        max_keys_ptr.add(mid) as *const i8,
-                        std::arch::x86_64::_MM_HINT_T0,
-                    );
-                }
+        for &h in &hashes[..WINDOW.min(hashes.len())] {
+            if let Some(bf) = &self.bloom {
+                prefetch_read(bf.block_ptr(h));
+            }
+            // Prefetch the middle of the max_keys array — first binary
+            // search step will land near there.
+            if num_segs > 0 {
+                // SAFETY: `num_segs / 2 < num_segs`; a prefetch is a hint.
+                prefetch_read(unsafe { max_keys_ptr.add(num_segs / 2) });
             }
         }
 
         for i in 0..hashes.len() {
             // Issue prefetch for i+WINDOW.
-            #[cfg(target_arch = "x86_64")]
-            if i + WINDOW < hashes.len() {
-                unsafe {
-                    if let Some(bf) = &self.bloom {
-                        let p = bf.block_ptr(hashes[i + WINDOW]);
-                        std::arch::x86_64::_mm_prefetch(
-                            p as *const i8,
-                            std::arch::x86_64::_MM_HINT_T0,
-                        );
-                    }
-                }
+            if let Some(bf) = &self.bloom
+                && i + WINDOW < hashes.len()
+            {
+                prefetch_read(bf.block_ptr(hashes[i + WINDOW]));
             }
 
             let hash = hashes[i];
@@ -627,30 +611,16 @@ impl HybridIndex {
         let mut out = vec![None; hashes.len()];
         const WINDOW: usize = 16;
 
-        #[cfg(target_arch = "x86_64")]
-        for i in 0..WINDOW.min(hashes.len()) {
-            if let Some(bf) = &self.bloom {
-                unsafe {
-                    let p = bf.block_ptr(hashes[i]);
-                    std::arch::x86_64::_mm_prefetch(
-                        p as *const i8,
-                        std::arch::x86_64::_MM_HINT_T0,
-                    );
-                }
+        if let Some(bf) = &self.bloom {
+            for &h in &hashes[..WINDOW.min(hashes.len())] {
+                prefetch_read(bf.block_ptr(h));
             }
         }
         for i in 0..hashes.len() {
-            #[cfg(target_arch = "x86_64")]
-            if i + WINDOW < hashes.len() {
-                if let Some(bf) = &self.bloom {
-                    unsafe {
-                        let p = bf.block_ptr(hashes[i + WINDOW]);
-                        std::arch::x86_64::_mm_prefetch(
-                            p as *const i8,
-                            std::arch::x86_64::_MM_HINT_T0,
-                        );
-                    }
-                }
+            if let Some(bf) = &self.bloom
+                && i + WINDOW < hashes.len()
+            {
+                prefetch_read(bf.block_ptr(hashes[i + WINDOW]));
             }
             out[i] = self.lookup_hash(hashes[i]);
         }

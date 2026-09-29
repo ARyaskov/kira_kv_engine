@@ -26,8 +26,9 @@ use std::arch::is_aarch64_feature_detected;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{
     __m256i, _mm256_cmpeq_epi64, _mm256_cmpgt_epi64, _mm256_loadu_si256, _mm256_movemask_epi8,
-    _mm256_or_si256, _mm256_set1_epi64x, _mm256_xor_si256, _mm_prefetch, _MM_HINT_T0,
+    _mm256_or_si256, _mm256_set1_epi64x, _mm256_xor_si256,
 };
+use crate::prefetch::prefetch_read;
 
 // --------------------------------------------------------------------------------------
 // Wire format version. v1 = legacy (f64 slopes, u32 errors). v2 = current.
@@ -1429,13 +1430,11 @@ fn find_segment_branchless(max_keys: &[u64], key: u64) -> usize {
         // cache lines while we compute the comparison; only the chosen one is
         // actually used, the other is wasted bandwidth — but at large N the
         // win from hiding the next miss vastly outweighs the wasted prefetch.
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            if half > 4 {
-                let nq = half / 2;
-                _mm_prefetch(ptr.add(base + nq) as *const i8, _MM_HINT_T0);
-                _mm_prefetch(ptr.add(mid + nq) as *const i8, _MM_HINT_T0);
-            }
+        if half > 4 {
+            let nq = half / 2;
+            // SAFETY: both offsets are below `n`; a prefetch is a hint.
+            prefetch_read(unsafe { ptr.add(base + nq) });
+            prefetch_read(unsafe { ptr.add(mid + nq) });
         }
         let m = unsafe { *ptr.add(mid) };
         // Branchless update:

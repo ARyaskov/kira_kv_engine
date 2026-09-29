@@ -13,6 +13,7 @@
 //! typically only `2ε+1` ≤ 257 elements anyway, so a tight scalar loop with
 //! prefetch lands at ~30–60 ns per lookup with full L1 residency.
 
+use crate::prefetch::prefetch_read;
 use thiserror::Error;
 
 /// PGM Index for sorted unique 16-byte keys.
@@ -207,12 +208,9 @@ impl PgmIndexU128 {
         // Tight scalar scan with cache-line prefetch.
         let mut i = s;
         while i < e {
-            #[cfg(target_arch = "x86_64")]
-            unsafe {
-                use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-                if i + 8 < e {
-                    _mm_prefetch(self.keys.as_ptr().add(i + 8) as *const i8, _MM_HINT_T0);
-                }
+            if i + 8 < e {
+                // SAFETY: `i + 8 < e ≤ len`; a prefetch is a hint.
+                prefetch_read(unsafe { self.keys.as_ptr().add(i + 8) });
             }
             if self.keys[i] == key {
                 return Ok(i);
@@ -388,14 +386,11 @@ fn find_segment_u128(max_keys: &[u128], key: u128) -> usize {
     while len > 1 {
         let half = len / 2;
         let mid = base + half;
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-            if half > 4 {
-                let nq = half / 2;
-                _mm_prefetch(ptr.add(base + nq) as *const i8, _MM_HINT_T0);
-                _mm_prefetch(ptr.add(mid + nq) as *const i8, _MM_HINT_T0);
-            }
+        if half > 4 {
+            let nq = half / 2;
+            // SAFETY: both offsets are below `n`; a prefetch is a hint.
+            prefetch_read(unsafe { ptr.add(base + nq) });
+            prefetch_read(unsafe { ptr.add(mid + nq) });
         }
         let m = unsafe { *ptr.add(mid) };
         let less = (m < key) as usize;

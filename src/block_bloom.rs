@@ -164,20 +164,21 @@ impl BlockBloom {
         let (block, mask) = block_and_mask(hash, blocks, self.bit_shift);
         let base = block * BLOCK_WORDS;
         // 64 bytes — one cache line — touched per query.
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-        unsafe {
-            return contains_hash_avx2(words.as_ptr().add(base), &mask);
-        }
-        #[allow(unreachable_code)]
+        #[cfg(target_arch = "x86_64")]
         {
-            for w in 0..BLOCK_WORDS {
-                let word = unsafe { *words.get_unchecked(base + w) };
-                if word & mask[w] != mask[w] {
-                    return false;
-                }
+            if cfg!(target_feature = "avx2") || std::arch::is_x86_feature_detected!("avx2") {
+                // SAFETY: AVX2 verified at compile time or by the cached runtime probe;
+                // `base + 8 ≤ words.len()` by construction of `block_of`.
+                return unsafe { contains_hash_avx2(words.as_ptr().add(base), &mask) };
             }
-            true
         }
+        for w in 0..BLOCK_WORDS {
+            let word = unsafe { *words.get_unchecked(base + w) };
+            if word & mask[w] != mask[w] {
+                return false;
+            }
+        }
+        true
     }
 
     #[inline]
@@ -399,7 +400,7 @@ fn mask_for(hash: u64, bit_shift: u32) -> [u64; BLOCK_WORDS] {
     mask
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[cfg(target_arch = "x86_64")]
 #[allow(unsafe_op_in_unsafe_fn)]
 #[inline]
 #[target_feature(enable = "avx2")]

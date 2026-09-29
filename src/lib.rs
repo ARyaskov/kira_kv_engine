@@ -26,6 +26,7 @@ mod mini_chd;
 mod mmap_index;
 mod mph_backend;
 mod pgm;
+mod prefetch;
 mod pgm_u128;
 mod ptrhash25;
 mod simd_hash;

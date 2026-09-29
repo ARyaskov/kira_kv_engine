@@ -6,12 +6,7 @@ use crate::pgm::PgmError;
 use crate::ptrhash25::{BuildConfig as MphConfig, PtrHash25Error as MphError};
 use thiserror::Error;
 
-#[cfg(target_arch = "aarch64")]
-use std::arch::aarch64::{
-    vaeseq_u8, vdupq_n_u64, vgetq_lane_u64, vld1q_u8, vreinterpretq_u8_u64, vreinterpretq_u64_u8,
-};
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+use crate::prefetch::prefetch_read;
 
 #[derive(Debug)]
 struct MphEngine {
@@ -285,21 +280,6 @@ impl Index {
         }
     }
 
-    #[inline(always)]
-    fn simd_touch(key: &[u8]) {
-        // On aarch64 we used to issue a NEON load as a soft TLB/cache-line touch.
-        // On x86_64 the equivalent is _mm_prefetch already called in prefetch_key_batch.
-        // For short keys (≤16 B) both arches handle it via a regular load anyway.
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            if key.len() >= 16 {
-                let _ = vld1q_u8(key.as_ptr());
-            }
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        let _ = key;
-    }
-
     pub fn lookup(&self, key: &[u8]) -> Result<usize, IndexError> {
         let Some(engine) = self.engine.as_ref() else {
             return Err(IndexError::KeyNotFound);
@@ -442,93 +422,33 @@ impl Index {
 
         // Pre-prefetch the first WINDOW Bloom blocks (only when filter present).
         const WINDOW: usize = 16;
-        #[cfg(target_arch = "x86_64")]
         if let Some(bf) = &engine.filter {
-            for i in 0..WINDOW.min(n) {
-                unsafe {
-                    let p = bf.block_ptr(canon[i]);
-                    _mm_prefetch(p as *const i8, _MM_HINT_T0);
-                }
+            for &h in &canon[..WINDOW.min(n)] {
+                prefetch_read(bf.block_ptr(h));
             }
         }
 
-        // Main loop: process 8 keys per iteration when possible. For each chunk:
-        //  - Bloom check (scalar — already cheap with prefetch in flight)
-        //  - backend.lookup for each (gathers pilot)
-        //  - AVX2 gather_fp_check_x8 for the fingerprint stage (1 instruction vs 8 scalar loads)
+        // Main loop: 8 keys per iteration with an AVX2 gather for the fingerprint
+        // stage (one instruction instead of 8 scalar loads). Dispatched at runtime so
+        // dependents built without `-C target-cpu` get it too; the gather takes i32
+        // lane indices, so it is skipped for slot counts beyond 2^31.
         let mut i = 0usize;
-        let fp_base = engine
-            .fingerprints
-            .as_ref()
-            .map(|fp| fp.as_ptr())
-            .unwrap_or(std::ptr::null());
-        // The gather takes i32 lane indices; beyond 2^31 slots use the scalar tail.
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-        let gather_ok = engine.backend.slot_capacity() <= i32::MAX as usize;
-
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-        while gather_ok && i + 8 <= n {
-            // Lookahead Bloom prefetch.
-            #[cfg(target_arch = "x86_64")]
-            if let Some(bf) = &engine.filter {
-                for k in 0..8 {
-                    if i + WINDOW + k < n {
-                        unsafe {
-                            let p = bf.block_ptr(canon[i + WINDOW + k]);
-                            _mm_prefetch(p as *const i8, _MM_HINT_T0);
-                        }
-                    }
-                }
+        #[cfg(target_arch = "x86_64")]
+        {
+            let avx2 = cfg!(target_feature = "avx2") || std::arch::is_x86_feature_detected!("avx2");
+            if avx2 && engine.backend.slot_capacity() <= i32::MAX as usize {
+                // SAFETY: AVX2 presence checked above.
+                i = unsafe { Self::batch_u64_avx2(engine, canon, out, WINDOW) };
             }
-
-            // Bloom + backend.lookup for 8 keys, collecting (idx, expected_fp) pairs.
-            let mut indices = [0u32; 8];
-            let mut expected = [0u16; 8];
-            let mut alive = [false; 8];
-            for k in 0..8 {
-                let hash = canon[i + k];
-                if let Some(bf) = &engine.filter {
-                    if !bf.contains_hash(hash) {
-                        continue;
-                    }
-                }
-                if let Some(idx) = engine.backend.lookup(hash) {
-                    indices[k] = idx;
-                    expected[k] = fingerprint16_mph(hash);
-                    alive[k] = true;
-                }
-            }
-            if !fp_base.is_null() {
-                // Single gather for fingerprint validation. Dead lanes carry index 0;
-                // the last live slot's 32-bit load ends in the padding element.
-                let bitmask = unsafe { Self::gather_fp_check_x8(fp_base, indices, expected) };
-                for k in 0..8 {
-                    if alive[k] && (bitmask & (1 << k)) != 0 {
-                        out[i + k] = Some(indices[k] as usize);
-                    }
-                }
-            } else {
-                // Lean mode: trust the MPH result.
-                for k in 0..8 {
-                    if alive[k] {
-                        out[i + k] = Some(indices[k] as usize);
-                    }
-                }
-            }
-            i += 8;
         }
 
-        // Tail: scalar.
+        // Tail (and the whole batch on non-AVX2 hosts): scalar with the same prefetch wave.
         while i < n {
             let hash = canon[i];
-            #[cfg(target_arch = "x86_64")]
-            if let Some(bf) = &engine.filter {
-                if i + WINDOW < n {
-                    unsafe {
-                        let p = bf.block_ptr(canon[i + WINDOW]);
-                        _mm_prefetch(p as *const i8, _MM_HINT_T0);
-                    }
-                }
+            if let Some(bf) = &engine.filter
+                && i + WINDOW < n
+            {
+                prefetch_read(bf.block_ptr(canon[i + WINDOW]));
             }
             let bloom_ok = match &engine.filter {
                 Some(bf) => bf.contains_hash(hash),
@@ -551,6 +471,74 @@ impl Index {
             }
             i += 1;
         }
+    }
+
+    /// 8-wide body of [`Index::lookup_batch_u64_simd_into`]. Processes whole groups
+    /// of 8 and returns the number of keys handled.
+    ///
+    /// # Safety
+    /// AVX2 must be available; `engine.backend.slot_capacity() <= i32::MAX`.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn batch_u64_avx2(
+        engine: &MphEngine,
+        canon: &[u64],
+        out: &mut [Option<usize>],
+        window: usize,
+    ) -> usize {
+        let n = canon.len();
+        let fp_base = engine
+            .fingerprints
+            .as_ref()
+            .map(|fp| fp.as_ptr())
+            .unwrap_or(std::ptr::null());
+        let mut i = 0usize;
+        while i + 8 <= n {
+            // Lookahead Bloom prefetch.
+            if let Some(bf) = &engine.filter {
+                for k in 0..8 {
+                    if i + window + k < n {
+                        prefetch_read(bf.block_ptr(canon[i + window + k]));
+                    }
+                }
+            }
+
+            // Bloom + backend.lookup for 8 keys, collecting (idx, expected_fp) pairs.
+            let mut indices = [0u32; 8];
+            let mut expected = [0u16; 8];
+            let mut alive = [false; 8];
+            for k in 0..8 {
+                let hash = canon[i + k];
+                if let Some(bf) = &engine.filter
+                    && !bf.contains_hash(hash)
+                {
+                    continue;
+                }
+                if let Some(idx) = engine.backend.lookup(hash) {
+                    indices[k] = idx;
+                    expected[k] = fingerprint16_mph(hash);
+                    alive[k] = true;
+                }
+            }
+            if !fp_base.is_null() {
+                // Single gather for fingerprint validation. Dead lanes carry index 0;
+                // the last live slot's 32-bit load ends in the padding element.
+                let bitmask = unsafe { Self::gather_fp_check_x8(fp_base, indices, expected) };
+                for k in 0..8 {
+                    if alive[k] && (bitmask & (1 << k)) != 0 {
+                        out[i + k] = Some(indices[k] as usize);
+                    }
+                }
+            } else {
+                for k in 0..8 {
+                    if alive[k] {
+                        out[i + k] = Some(indices[k] as usize);
+                    }
+                }
+            }
+            i += 8;
+        }
+        i
     }
 
     /// Fast-path lookup for u64 keys on PtrHash25-backed Mph engines. Skips the
@@ -675,7 +663,6 @@ impl Index {
         };
         let mut out = Vec::with_capacity(keys.len());
         let mut i = 0usize;
-        #[cfg(target_arch = "x86_64")]
         while i + 16 <= keys.len() {
             prefetch_key_batch(keys, i, 16);
             for j in 0..16 {
@@ -683,7 +670,6 @@ impl Index {
             }
             i += 16;
         }
-        #[cfg(target_arch = "x86_64")]
         while i + 8 <= keys.len() {
             prefetch_key_batch(keys, i, 8);
             for j in 0..8 {
@@ -691,30 +677,8 @@ impl Index {
             }
             i += 8;
         }
-        #[cfg(target_arch = "aarch64")]
-        while i + 8 <= keys.len() {
-            for j in 0..8 {
-                let key = keys[i + j];
-                Self::simd_touch(key);
-            }
-            for j in 0..8 {
-                let key = keys[i + j];
-                out.push(self.lookup_mph(engine, key).ok());
-            }
-            i += 8;
-        }
-        while i + 4 <= keys.len() {
-            for j in 0..4 {
-                let key = keys[i + j];
-                Self::simd_touch(key);
-                out.push(self.lookup_mph(engine, key).ok());
-            }
-            i += 4;
-        }
         while i < keys.len() {
-            let key = keys[i];
-            Self::simd_touch(key);
-            out.push(self.lookup_mph(engine, key).ok());
+            out.push(self.lookup_mph(engine, keys[i]).ok());
             i += 1;
         }
         out
@@ -764,12 +728,8 @@ impl Index {
                 for slot in 0..WINDOW {
                     let h = canonical_hash_key(keys[slot], engine.prehash_seed);
                     canon[slot] = h;
-                    #[cfg(target_arch = "x86_64")]
                     if let Some(bf) = filter {
-                        unsafe {
-                            let bloom_ptr = bf.block_ptr(h);
-                            _mm_prefetch(bloom_ptr as *const i8, _MM_HINT_T0);
-                        }
+                        prefetch_read(bf.block_ptr(h));
                     }
                 }
 
@@ -783,12 +743,8 @@ impl Index {
                         let next_pos = hash_head % (WINDOW * 2);
                         let h = canonical_hash_key(keys[hash_head], engine.prehash_seed);
                         canon[next_pos] = h;
-                        #[cfg(target_arch = "x86_64")]
                         if let Some(bf) = filter {
-                            unsafe {
-                                let bloom_ptr = bf.block_ptr(h);
-                                _mm_prefetch(bloom_ptr as *const i8, _MM_HINT_T0);
-                            }
+                            prefetch_read(bf.block_ptr(h));
                         }
                         hash_head += 1;
                     }
@@ -803,12 +759,9 @@ impl Index {
                     let idx_opt = engine.backend.lookup(hash);
 
                     // Wave C: prefetch fingerprint (only if fingerprints present).
-                    #[cfg(target_arch = "x86_64")]
                     if let (Some(fps), Some(idx)) = (fingerprints, idx_opt) {
-                        unsafe {
-                            let fp_ptr = fps.as_ptr().add(idx as usize);
-                            _mm_prefetch(fp_ptr as *const i8, _MM_HINT_T0);
-                        }
+                        // SAFETY: `idx < slot_capacity() < fps.len()`; a prefetch is a hint.
+                        prefetch_read(unsafe { fps.as_ptr().add(idx as usize) });
                     }
 
                     let res = match idx_opt {
@@ -1423,7 +1376,6 @@ fn canonical_hash_key(key: &[u8], seed: u64) -> u64 {
     crate::canonical_hash::canonical_hash_bytes(key, seed)
 }
 
-#[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn prefetch_key_batch(keys: &[&[u8]], i: usize, window: usize) {
     // Distance 8 keeps the prefetched line in L1 for ~50-100 cycles before use,
@@ -1436,8 +1388,7 @@ fn prefetch_key_batch(keys: &[&[u8]], i: usize, window: usize) {
             let slice = unsafe { *keys.get_unchecked(pf + j) };
             if !slice.is_empty() {
                 // Prefetch the actual key bytes, not the &[u8] header (which is already in L1).
-                // SAFETY: prefetch is a hint; pointer is derived from valid slice with len > 0.
-                unsafe { _mm_prefetch(slice.as_ptr() as *const i8, _MM_HINT_T0) };
+                prefetch_read(slice.as_ptr());
             }
         }
     }
@@ -1554,54 +1505,6 @@ impl Default for IndexBuilder {
 #[inline]
 fn fingerprint16_mph(canonical: u64) -> u16 {
     (canonical & 0xFFFF) as u16
-}
-
-#[inline]
-fn splitmix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = x;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "crc")]
-unsafe fn hash_u64_crc(key: u64, seed: u64) -> u64 {
-    use std::arch::aarch64::__crc32d;
-    let mut crc = seed as u32;
-    crc = __crc32d(crc, key);
-    let mixed = ((crc as u64) << 32) ^ (seed.rotate_left(17) ^ key);
-    splitmix64(mixed)
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "crc")]
-unsafe fn hash_bytes_crc(key: &[u8], seed: u64) -> u64 {
-    use std::arch::aarch64::{__crc32b, __crc32d};
-    let mut crc = seed as u32;
-    let mut i = 0usize;
-    while i + 8 <= key.len() {
-        let chunk = u64::from_le_bytes(key[i..i + 8].try_into().unwrap());
-        crc = __crc32d(crc, chunk);
-        i += 8;
-    }
-    while i < key.len() {
-        crc = __crc32b(crc, key[i]);
-        i += 1;
-    }
-    let mixed = ((crc as u64) << 32) ^ seed.wrapping_add(key.len() as u64);
-    splitmix64(mixed)
-}
-
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "aes")]
-unsafe fn aes_mix_u64(hash: u64, seed: u64) -> u64 {
-    let block = vdupq_n_u64(hash ^ seed);
-    let key = vdupq_n_u64(seed.rotate_left(23) ^ 0xA5A5_A5A5_A5A5_A5A5);
-    let mixed = vaeseq_u8(vreinterpretq_u8_u64(block), vreinterpretq_u8_u64(key));
-    let out = vreinterpretq_u64_u8(mixed);
-    vgetq_lane_u64(out, 0) ^ vgetq_lane_u64(out, 1)
 }
 
 struct Cursor<'a> {
