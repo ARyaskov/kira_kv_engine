@@ -189,21 +189,20 @@ impl PgmIndexU128 {
         }
         let pred = predict_pos_u128(&self.segments, seg, key);
         let err = self.segments.get_max_error(seg) as usize;
-        let s = pred.saturating_sub(err);
-        let e = (pred + err + 1).min(self.keys.len());
-        // Tight scalar scan with cache-line prefetch.
-        let mut i = s;
-        while i < e {
-            if i + 8 < e {
-                // SAFETY: `i + 8 < e ≤ len`; a prefetch is a hint.
-                prefetch_read(unsafe { self.keys.as_ptr().add(i + 8) });
-            }
-            if self.keys[i] == key {
-                return Ok(i);
-            }
-            i += 1;
+        let s = pred.saturating_sub(err).min(self.keys.len());
+        let e = (pred + err + 1).min(self.keys.len()).max(s);
+        // Sorted window: bisect it (branchless). 16-byte keys make a linear scan
+        // of 2ε+1 entries several cache lines of work; 7 dependent loads are not.
+        let w = &self.keys[s..e];
+        let mut base = 0usize;
+        let mut len = w.len();
+        while len > 1 {
+            let half = len / 2;
+            let m = w[base + half];
+            base += if m <= key { half } else { 0 };
+            len -= half;
         }
-        Err(PgmU128Error::KeyNotFound)
+        if len == 1 && w[base] == key { Ok(s + base) } else { Err(PgmU128Error::KeyNotFound) }
     }
 
     /// Convenience wrapper accepting a 16-byte big-endian slice.
@@ -227,16 +226,10 @@ impl PgmIndexU128 {
         }
         let pred = predict_pos_u128(&self.segments, seg, target);
         let err = self.segments.get_max_error(seg) as usize;
-        let s = pred.saturating_sub(err);
-        let e = (pred + err + 1).min(self.keys.len());
-        let mut i = s;
-        while i < e {
-            if self.keys[i] >= target {
-                return i;
-            }
-            i += 1;
-        }
-        self.keys.len()
+        let s = pred.saturating_sub(err).min(self.keys.len());
+        let e = (pred + err + 1).min(self.keys.len()).max(s);
+        let p = self.keys[s..e].partition_point(|&k| k < target);
+        if p < e - s { s + p } else { e }
     }
 
     pub fn upper_bound(&self, target: u128) -> usize {
