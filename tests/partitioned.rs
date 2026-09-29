@@ -283,3 +283,27 @@ fn gpu_export_carries_parts() {
     let total_slots: u64 = export.parts.iter().map(|p| p.num_slots as u64).sum();
     assert_eq!(total_slots, export.num_slots);
 }
+
+/// `contains()` is a filter-level answer. Without a filter (lean mode) it cannot
+/// reject anything, and the API must say so instead of pretending to be exact.
+#[test]
+fn contains_semantics_lean_vs_full() {
+    let keys = byte_keys(20_000, 0x8E);
+    let foreign = byte_keys(20_000, 0x8F);
+    let mut lean_cfg = IndexConfig::default();
+    lean_cfg.lean_mph = true;
+    let lean = IndexBuilder::new().with_config(lean_cfg).build_index_ref(&keys).expect("build");
+    assert!(!lean.supports_negative_lookups());
+    assert!(keys.iter().all(|k| lean.contains(k)));
+    // Documented behaviour: no membership information at all in lean mode.
+    assert!(foreign.iter().all(|k| lean.contains(k)));
+
+    let full = IndexBuilder::new().build_index_ref(&keys).expect("build");
+    assert!(full.supports_negative_lookups());
+    assert!(keys.iter().all(|k| full.contains(k)));
+    let fp = foreign.iter().filter(|k| full.contains(k)).count();
+    assert!(fp < 400, "Bloom false positives too high: {fp}/20000");
+    let refs: Vec<&[u8]> = foreign.iter().map(|k| k.as_slice()).collect();
+    assert_eq!(full.contains_batch(&refs).iter().filter(|&&b| b).count(), fp);
+    assert!(Index::empty().supports_negative_lookups());
+}

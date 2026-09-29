@@ -581,6 +581,27 @@ impl Index {
         self.range(min_key, max_key)
     }
 
+    /// Whether this index can reject keys that were not in the build set.
+    ///
+    /// `false` for `lean_mph` indexes: they carry neither a Bloom filter nor
+    /// fingerprints, so `lookup` returns an arbitrary in-range position for a
+    /// foreign key and [`Index::contains`] can only answer `true`.
+    #[inline]
+    pub fn supports_negative_lookups(&self) -> bool {
+        match &self.engine {
+            Some(engine) => engine.filter.is_some() || engine.fingerprints.is_some(),
+            // An empty index rejects every key exactly.
+            None => true,
+        }
+    }
+
+    /// Probabilistic membership test: `false` means the key is definitely absent,
+    /// `true` means it is present with the Bloom filter's false-positive rate
+    /// (~0.5% at 11 bits/key). For an exact answer use `lookup(..).is_ok()`.
+    ///
+    /// **Lean mode** (`lean_mph = true`): there is no membership information at
+    /// all, so this always returns `true` for a non-empty index. Check
+    /// [`Index::supports_negative_lookups`] before relying on this method.
     pub fn contains(&self, key: &[u8]) -> bool {
         let Some(engine) = self.engine.as_ref() else {
             return false;
@@ -588,9 +609,10 @@ impl Index {
         let canonical = canonical_hash_key(key, engine.prehash_seed);
         match &engine.filter {
             Some(bf) => bf.contains_hash(canonical),
-            // Lean mode has no Bloom — fall back to full lookup (slower but
-            // correctness preserved). For high-throughput contains() calls,
-            // disable lean_mph.
+            // Fingerprints without a filter never happen for indexes built by
+            // this crate; go through the full lookup so the answer stays exact
+            // if such a combination is ever loaded. In lean mode the lookup
+            // cannot fail, so this is the documented always-`true`.
             None => self.lookup_mph(engine, key).is_ok(),
         }
     }
@@ -603,6 +625,8 @@ impl Index {
         self.contains(key)
     }
 
+    /// Batched [`Index::contains`]; same probabilistic semantics and the same
+    /// always-`true` answer in lean mode.
     pub fn contains_batch(&self, keys: &[&[u8]]) -> Vec<bool> {
         let Some(engine) = self.engine.as_ref() else {
             return vec![false; keys.len()];
