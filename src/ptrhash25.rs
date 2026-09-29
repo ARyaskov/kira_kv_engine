@@ -1434,7 +1434,7 @@ pub fn read_ptrhash25(buf: &[u8], pos: &mut usize) -> Option<PtrHash25Mphf> {
         let n32 = u32::try_from(n).ok()?;
         (0, vec![PartInfo::new(0, salt, 0, n32, n32, num_buckets, 0)], Vec::new())
     };
-    Some(PtrHash25Mphf {
+    let mph = PtrHash25Mphf {
         n,
         num_buckets,
         salt,
@@ -1445,5 +1445,56 @@ pub fn read_ptrhash25(buf: &[u8], pos: &mut usize) -> Option<PtrHash25Mphf> {
         prerotate,
         part_salt,
         parts: parts.into_boxed_slice(),
-    })
+    };
+    mph.validate().then_some(mph)
+}
+
+impl PtrHash25Mphf {
+    /// Check every invariant the unchecked lookup path relies on. Called on every
+    /// deserialization so a corrupt or hostile file can only be rejected, never read
+    /// out of bounds.
+    pub fn validate(&self) -> bool {
+        let n = self.n;
+        let pilots = self.pilots.len() as u64;
+        if n == 0 || n > u32::MAX as u64 || self.parts.is_empty() {
+            return false;
+        }
+        if self.num_buckets as u64 != pilots {
+            return false;
+        }
+        if !self.fingerprints.is_empty() && self.fingerprints.len() as u64 != n {
+            return false;
+        }
+        if self.prerotate >= 64 {
+            return false;
+        }
+        let remap_len = self.remap.len() as u64;
+        for p in self.parts.iter() {
+            if p.num_slots < p.num_keys || p.num_slots == 0 || p.num_buckets == 0 {
+                return false;
+            }
+            if p.large_buckets > p.num_buckets {
+                return false;
+            }
+            if p.bucket_off as u64 + p.num_buckets as u64 > pilots {
+                return false;
+            }
+            // Every reachable output position must be < n: the keys' own range and,
+            // through the remap, the tail.
+            if p.slot_off + p.num_keys as u64 > n || p.slot_off >= n {
+                return false;
+            }
+            let tail = (p.num_slots - p.num_keys) as u64;
+            if p.remap_off as u64 + tail > remap_len {
+                return false;
+            }
+            let lo = p.remap_off as usize;
+            let hi = lo + tail as usize;
+            let limit = if p.num_keys == 0 { 1 } else { p.num_keys };
+            if self.remap[lo..hi].iter().any(|&r| r >= limit) {
+                return false;
+            }
+        }
+        true
+    }
 }

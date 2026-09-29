@@ -238,7 +238,14 @@ impl BlockBloom {
         let bit_shift = if raw_len & LEN_FLAG_V2 != 0 { BIT_SHIFT_V2 } else { BIT_SHIFT_LEGACY };
         let len = (raw_len & !LEN_FLAG_V2) as usize;
         *pos += 16;
-        if len % BLOCK_WORDS != 0 || *pos + len * 8 > buf.len() {
+        // At least one block (the lookup indexes block 0 unconditionally), whole
+        // blocks only, and the payload must fit — with overflow-safe arithmetic so a
+        // huge length word cannot slip past the check and trigger a giant allocation.
+        if len < BLOCK_WORDS || len % BLOCK_WORDS != 0 {
+            return None;
+        }
+        let payload = len.checked_mul(8)?;
+        if payload > buf.len() - *pos {
             return None;
         }
         let mut words = crate::hugepage::HugeVec::<u64>::zeroed(len);

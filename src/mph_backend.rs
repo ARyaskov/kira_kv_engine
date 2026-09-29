@@ -274,7 +274,10 @@ fn read_ptrhash25_storage(buf: &[u8], pos: &mut usize) -> Option<PtrHash25Storag
         0 => ptrhash25::read_ptrhash25(buf, pos).map(PtrHash25Storage::Mph),
         1 => {
             let len = read_u64(buf, pos)? as usize;
-            let mut map = HashMap::with_capacity(len * 2);
+            if len > (buf.len() - *pos) / 12 {
+                return None;
+            }
+            let mut map = HashMap::with_capacity(len);
             for _ in 0..len {
                 let k = read_u64(buf, pos)?;
                 let v = read_u32(buf, pos)?;

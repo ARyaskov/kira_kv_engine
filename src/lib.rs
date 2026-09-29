@@ -13,6 +13,7 @@ mod build_arena;
 mod build_hasher;
 mod build_pool;
 mod canonical_hash;
+mod checksum;
 mod cpu;
 mod dynamic_index;
 mod elias_fano;

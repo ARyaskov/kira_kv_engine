@@ -286,29 +286,58 @@ impl EliasFano {
             Some(u32::from_le_bytes(a))
         }
 
+        // Allocation sizes are capped by the bytes actually present; structural
+        // invariants are checked so decoding can never index out of bounds.
         let n = rd_u64(bytes, pos)? as usize;
         let universe = rd_u64(bytes, pos)?;
         let low_bits = rd_u8(bytes, pos)?;
+        if low_bits > 56 || n == 0 {
+            return None;
+        }
         let low_mask = if low_bits == 0 {
             0
         } else {
             (1u64 << low_bits) - 1
         };
         let low_len = rd_u64(bytes, pos)? as usize;
+        if low_len > (bytes.len() - *pos) / 8 {
+            return None;
+        }
         let mut low = Vec::with_capacity(low_len);
         for _ in 0..low_len {
             low.push(rd_u64(bytes, pos)?);
         }
         let high_len = rd_u64(bytes, pos)?;
         let high_count = rd_u64(bytes, pos)? as usize;
+        if high_count > (bytes.len() - *pos) / 8 {
+            return None;
+        }
         let mut high = Vec::with_capacity(high_count);
         for _ in 0..high_count {
             high.push(rd_u64(bytes, pos)?);
         }
         let sample_count = rd_u64(bytes, pos)? as usize;
+        if sample_count > (bytes.len() - *pos) / 4 {
+            return None;
+        }
         let mut select_sample = Vec::with_capacity(sample_count);
         for _ in 0..sample_count {
             select_sample.push(rd_u32(bytes, pos)?);
+        }
+        // low: n * low_bits bits must fit; high: high_len bits must fit and hold
+        // exactly n set bits; samples: one per SAMPLE_RATE keys, each inside `high`.
+        let need_low = (n as u64 * low_bits as u64).div_ceil(64) as usize;
+        if low.len() < need_low || (high.len() as u64) < high_len.div_ceil(64) {
+            return None;
+        }
+        let ones: u64 = high.iter().map(|w| w.count_ones() as u64).sum();
+        if ones != n as u64 || high_len < n as u64 {
+            return None;
+        }
+        if select_sample.len() != n.div_ceil(SAMPLE_RATE)
+            || select_sample.iter().any(|&s| s as u64 >= high_len)
+        {
+            return None;
         }
         Some(EliasFano {
             n,

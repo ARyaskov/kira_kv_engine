@@ -81,9 +81,16 @@ impl HotTierIndex {
         let mut cur = LocalCursor { buf: bytes, pos: *pos };
         let fingerprints = read_fingerprints(&mut cur)?;
         let len = cur.read_u64()? as usize;
+        if len > (bytes.len() - cur.pos) / 4 {
+            return None;
+        }
         let mut indices = Vec::with_capacity(len);
         for _ in 0..len {
             indices.push(read_u32(&mut cur)?);
+        }
+        // Both side tables are indexed by the MPH slot without bounds checks.
+        if fingerprints.len() != mph.slot_capacity() || indices.len() != mph.slot_capacity() {
+            return None;
         }
         *pos = cur.pos;
         Some(Self {
@@ -174,6 +181,9 @@ fn write_fingerprints(out: &mut Vec<u8>, fps: &[u16]) {
 
 fn read_fingerprints(cursor: &mut LocalCursor<'_>) -> Option<Vec<u16>> {
     let len = cursor.read_u64()? as usize;
+    if len > (cursor.buf.len() - cursor.pos) / 2 {
+        return None;
+    }
     let mut fps = Vec::with_capacity(len);
     for _ in 0..len {
         let mut array = [0u8; 2];

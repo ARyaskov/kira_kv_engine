@@ -988,34 +988,43 @@ impl Index {
         Self::from_bytes(bytes)
     }
 
+    /// Serialize to a self-contained byte vector.
+    ///
+    /// Layout (tag 4, written by this version):
+    /// `[tag=4][magic "KIRA"][format u16][hash_id u8][reserved u8][key_count u64]`
+    /// then either nothing (empty index) or
+    /// `[prehash_seed u64][backend][has_filter u8][filter?][has_fp u8][fp?]`,
+    /// and always a trailing `[checksum u64]` over everything before it.
+    /// Tags 0, 2 and 3 written by earlier versions are still readable (without
+    /// checksum verification).
     pub fn to_bytes(&self) -> Result<Vec<u8>, IndexError> {
         let mut out = Vec::new();
-        let Some(engine) = self.engine.as_ref() else {
-            // Tag 3: empty index. [tag=3][key_count=0u64].
-            write_u8(&mut out, 3);
-            write_u64(&mut out, 0);
-            return Ok(out);
-        };
-        // Tag 2: MPH v2 (presence flags before filter/fingerprints).
-        // Tag 0 (legacy v1, always-present filter/fps) still readable.
-        write_u8(&mut out, 2);
+        write_u8(&mut out, TAG_V3);
+        out.extend_from_slice(FORMAT_MAGIC);
+        write_u16(&mut out, FORMAT_VERSION);
+        write_u8(&mut out, HASH_ID_CANONICAL);
+        write_u8(&mut out, 0);
         write_u64(&mut out, self.key_count as u64);
-        write_u64(&mut out, engine.prehash_seed);
-        engine.backend.write_to(&mut out);
-        match &engine.filter {
-            Some(bf) => {
-                write_u8(&mut out, 1);
-                bf.write_to(&mut out);
+        if let Some(engine) = self.engine.as_ref() {
+            write_u64(&mut out, engine.prehash_seed);
+            engine.backend.write_to(&mut out);
+            match &engine.filter {
+                Some(bf) => {
+                    write_u8(&mut out, 1);
+                    bf.write_to(&mut out);
+                }
+                None => write_u8(&mut out, 0),
             }
-            None => write_u8(&mut out, 0),
-        }
-        match &engine.fingerprints {
-            Some(fp) => {
-                write_u8(&mut out, 1);
-                write_fingerprints(&mut out, fp.as_ref());
+            match &engine.fingerprints {
+                Some(fp) => {
+                    write_u8(&mut out, 1);
+                    write_fingerprints(&mut out, fp.as_ref());
+                }
+                None => write_u8(&mut out, 0),
             }
-            None => write_u8(&mut out, 0),
         }
+        let sum = crate::checksum::checksum(&out);
+        write_u64(&mut out, sum);
         Ok(out)
     }
 
@@ -1023,9 +1032,15 @@ impl Index {
         self.to_bytes()
     }
 
+    /// Deserialize from [`Index::to_bytes`] output. Every structural invariant the
+    /// unchecked lookup path relies on is verified, and for tag-4 data the checksum
+    /// as well, so corrupt or hostile input is rejected rather than read out of bounds.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, IndexError> {
         let mut cursor = Cursor::new(bytes);
         let tag = cursor.read_u8().ok_or(IndexError::CorruptData)?;
+        if tag == TAG_V3 {
+            return Self::from_bytes_v3(bytes);
+        }
         let key_count = cursor.read_u64().ok_or(IndexError::CorruptData)? as usize;
         match tag {
             0 => {
@@ -1092,6 +1107,88 @@ impl Index {
             // Tag 1 (legacy PGM engine) removed in v0.6.
             _ => Err(IndexError::CorruptData),
         }
+        .and_then(|idx| if idx.validate() { Ok(idx) } else { Err(IndexError::CorruptData) })
+    }
+
+    fn from_bytes_v3(bytes: &[u8]) -> Result<Self, IndexError> {
+        // Checksum first: everything else is only parsed from verified bytes.
+        if bytes.len() < 8 {
+            return Err(IndexError::CorruptData);
+        }
+        let (body, trailer) = bytes.split_at(bytes.len() - 8);
+        let stored = u64::from_le_bytes(trailer.try_into().unwrap());
+        if crate::checksum::checksum(body) != stored {
+            return Err(IndexError::CorruptData);
+        }
+        let mut cursor = Cursor::new(body);
+        let _tag = cursor.read_u8().ok_or(IndexError::CorruptData)?;
+        let magic = body.get(cursor.pos..cursor.pos + 4).ok_or(IndexError::CorruptData)?;
+        if magic != FORMAT_MAGIC {
+            return Err(IndexError::CorruptData);
+        }
+        cursor.pos += 4;
+        let version = cursor.read_u16().ok_or(IndexError::CorruptData)?;
+        if version != FORMAT_VERSION {
+            return Err(IndexError::CorruptData);
+        }
+        let hash_id = cursor.read_u8().ok_or(IndexError::CorruptData)?;
+        if hash_id != HASH_ID_CANONICAL {
+            return Err(IndexError::CorruptData);
+        }
+        let _reserved = cursor.read_u8().ok_or(IndexError::CorruptData)?;
+        let key_count = cursor.read_u64().ok_or(IndexError::CorruptData)? as usize;
+        if cursor.pos == body.len() {
+            return if key_count == 0 { Ok(Index::empty()) } else { Err(IndexError::CorruptData) };
+        }
+        let prehash_seed = cursor.read_u64().ok_or(IndexError::CorruptData)?;
+        let mut pos = cursor.pos;
+        let backend = BackendDispatch::read_from(body, &mut pos).ok_or(IndexError::CorruptData)?;
+        cursor.pos = pos;
+        let has_filter = cursor.read_u8().ok_or(IndexError::CorruptData)?;
+        let filter = match has_filter {
+            1 => {
+                let mut bf_pos = cursor.pos;
+                let bf = BlockBloom::read_from(body, &mut bf_pos).ok_or(IndexError::CorruptData)?;
+                cursor.pos = bf_pos;
+                Some(bf)
+            }
+            0 => None,
+            _ => return Err(IndexError::CorruptData),
+        };
+        let has_fp = cursor.read_u8().ok_or(IndexError::CorruptData)?;
+        let fingerprints = match has_fp {
+            1 => Some(read_fingerprints(&mut cursor)?),
+            0 => None,
+            _ => return Err(IndexError::CorruptData),
+        };
+        if cursor.pos != body.len() {
+            return Err(IndexError::CorruptData);
+        }
+        let idx = Index {
+            engine: Some(MphEngine { backend, prehash_seed, filter, fingerprints }),
+            key_count,
+        };
+        if idx.validate() { Ok(idx) } else { Err(IndexError::CorruptData) }
+    }
+
+    /// Invariants shared by every format: key count within the slot range and the
+    /// fingerprint table covering exactly the slot range (it is indexed unchecked).
+    fn validate(&self) -> bool {
+        match &self.engine {
+            None => self.key_count == 0,
+            Some(engine) => {
+                let cap = engine.backend.slot_capacity();
+                if self.key_count == 0 || self.key_count > cap {
+                    return false;
+                }
+                if let Some(fp) = &engine.fingerprints
+                    && fp.len() != cap
+                {
+                    return false;
+                }
+                true
+            }
+        }
     }
 
     pub fn deserialize(bytes: &[u8]) -> Result<Self, IndexError> {
@@ -1140,6 +1237,15 @@ fn make_backend_cfg(config: &IndexConfig) -> BackendConfig {
         },
     }
 }
+
+/// First byte of indexes written by this version (tags 0, 2, 3 are legacy).
+const TAG_V3: u8 = 4;
+const FORMAT_MAGIC: &[u8; 4] = b"KIRA";
+const FORMAT_VERSION: u16 = 1;
+/// Identifier of the canonical key hash: mix64 for 8-byte keys, AES-round hash for
+/// everything else (see `canonical_hash`). A different id means the file was built
+/// with a hash this version cannot reproduce.
+const HASH_ID_CANONICAL: u8 = 1;
 
 /// Number of canonical-hash seeds tried before concluding that two input keys are
 /// byte-identical. Equal canonical hashes are detected exactly by the MPH build (equal
@@ -1547,6 +1653,9 @@ fn write_fingerprints(out: &mut Vec<u8>, fps: &[u16]) {
 
 fn read_fingerprints(cursor: &mut Cursor<'_>) -> Result<Box<[u16]>, IndexError> {
     let len = cursor.read_u64().ok_or(IndexError::CorruptData)? as usize;
+    if len > (cursor.buf.len() - cursor.pos) / 2 {
+        return Err(IndexError::CorruptData);
+    }
     let mut fps = Vec::with_capacity(len);
     for _ in 0..len {
         fps.push(cursor.read_u16().ok_or(IndexError::CorruptData)?);

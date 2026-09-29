@@ -377,11 +377,8 @@ impl PgmIndex {
         if key < min_key || key > max_key {
             return Err(PgmError::KeyNotFound);
         }
-        let predicted_pos = predict_pos(&self.segments, segment_idx, key);
         let n = self.keys_count();
-        let max_error = self.segments.get_max_error(segment_idx) as usize;
-        let search_start = predicted_pos.saturating_sub(max_error);
-        let search_end = (predicted_pos + max_error + 1).min(n);
+        let (search_start, search_end) = self.scan_window(segment_idx, key, n);
 
         // Fast path: keys live in plain `Vec<u64>`. SIMD search directly.
         if self.keys_ef.is_none() {
@@ -407,6 +404,18 @@ impl PgmIndex {
         } else {
             Err(PgmError::KeyNotFound)
         }
+    }
+
+    /// `[start, end)` of positions to scan for `key` in `segment_idx`. Clamped to
+    /// `[0, n]` with `start ≤ end`, so even a segment with nonsense slope (corrupt
+    /// input) yields an empty window instead of a panic.
+    #[inline(always)]
+    fn scan_window(&self, segment_idx: usize, key: u64, n: usize) -> (usize, usize) {
+        let predicted_pos = predict_pos(&self.segments, segment_idx, key);
+        let max_error = self.segments.get_max_error(segment_idx) as usize;
+        let start = predicted_pos.saturating_sub(max_error).min(n);
+        let end = predicted_pos.saturating_add(max_error).saturating_add(1).min(n);
+        (start, end.max(start))
     }
 
     /// Range query: find all positions with keys in [min_key, max_key].
@@ -436,10 +445,7 @@ impl PgmIndex {
         if segment_idx >= self.segments.max_keys.len() {
             return n;
         }
-        let predicted_pos = predict_pos(&self.segments, segment_idx, target);
-        let max_error = self.segments.get_max_error(segment_idx) as usize;
-        let search_start = predicted_pos.saturating_sub(max_error);
-        let search_end = (predicted_pos + max_error + 1).min(n);
+        let (search_start, search_end) = self.scan_window(segment_idx, target, n);
 
         if self.keys_ef.is_none() {
             if let Some(pos) = find_first_ge_simd(&self.keys, search_start, search_end, target) {
@@ -602,12 +608,20 @@ impl PgmIndex {
             return Err(PgmError::CorruptData);
         }
         let epsilon = cur.read_u32().ok_or(PgmError::CorruptData)?;
+        // Every count is capped by the bytes actually present before allocating.
+        let remaining = |cur: &Cursor<'_>| cur.buf.len() - cur.pos;
         let keys_len = cur.read_u64().ok_or(PgmError::CorruptData)? as usize;
+        if keys_len > remaining(&cur) / 8 {
+            return Err(PgmError::CorruptData);
+        }
         let mut keys = Vec::with_capacity(keys_len);
         for _ in 0..keys_len {
             keys.push(cur.read_u64().ok_or(PgmError::CorruptData)?);
         }
         let seg_len = cur.read_u64().ok_or(PgmError::CorruptData)? as usize;
+        if seg_len > remaining(&cur) / 41 {
+            return Err(PgmError::CorruptData);
+        }
 
         let mut slopes = Vec::with_capacity(seg_len);
         for _ in 0..seg_len {
@@ -630,6 +644,9 @@ impl PgmIndex {
             max_errors_u8.push(cur.read_u8().ok_or(PgmError::CorruptData)?);
         }
         let over_n = cur.read_u64().ok_or(PgmError::CorruptData)? as usize;
+        if over_n > remaining(&cur) / 8 {
+            return Err(PgmError::CorruptData);
+        }
         let mut overflow_errors = Vec::with_capacity(over_n);
         for _ in 0..over_n {
             let si = cur.read_u32().ok_or(PgmError::CorruptData)?;
@@ -658,7 +675,7 @@ impl PgmIndex {
         } else {
             None
         };
-        Ok(PgmIndex {
+        let idx = PgmIndex {
             keys,
             keys_ef: None,
             segments: SegmentsSoA {
@@ -674,7 +691,62 @@ impl PgmIndex {
             },
             epsilon,
             bloom,
-        })
+        };
+        if !idx.validate() {
+            return Err(PgmError::CorruptData);
+        }
+        Ok(idx)
+    }
+
+    /// Structural invariants of a deserialized index: parallel segment arrays of one
+    /// length, keys sorted and unique, segment ranges inside the key array, key
+    /// bounds consistent with the ranges. Lookups index by these without checks.
+    pub(crate) fn validate(&self) -> bool {
+        let s = &self.segments;
+        let m = s.max_keys.len();
+        if s.slopes.len() != m
+            || s.intercepts.len() != m
+            || s.min_keys.len() != m
+            || s.max_errors_u8.len() != m
+            || s.filters.len() != m
+            || s.starts.len() != m
+            || s.ends.len() != m
+        {
+            return false;
+        }
+        let n = self.keys_count();
+        if n == 0 {
+            return m == 0;
+        }
+        if m == 0 {
+            return false;
+        }
+        if self.keys.windows(2).any(|w| w[0] >= w[1]) {
+            return false;
+        }
+        let mut prev_end = 0u32;
+        for i in 0..m {
+            let (st, en) = (s.starts[i], s.ends[i]);
+            if st != prev_end || en <= st || en as usize > n {
+                return false;
+            }
+            if s.min_keys[i] > s.max_keys[i] || (i > 0 && s.min_keys[i] <= s.max_keys[i - 1]) {
+                return false;
+            }
+            if !s.slopes[i].is_finite() || !s.intercepts[i].is_finite() {
+                return false;
+            }
+            prev_end = en;
+        }
+        if prev_end as usize != n {
+            return false;
+        }
+        if s.overflow_errors.windows(2).any(|w| w[0].0 >= w[1].0)
+            || s.overflow_errors.iter().any(|&(si, _)| si as usize >= m)
+        {
+            return false;
+        }
+        true
     }
 
     /// Convert `Vec<SegmentBuild>` (f64 working storage) into the SoA layout with
@@ -910,7 +982,7 @@ impl PgmIndex {
         } else {
             None
         };
-        Some(PgmIndex {
+        let idx = PgmIndex {
             keys,
             keys_ef: None,
             segments: SegmentsSoA {
@@ -926,7 +998,8 @@ impl PgmIndex {
             },
             epsilon,
             bloom,
-        })
+        };
+        idx.validate().then_some(idx)
     }
 }
 
