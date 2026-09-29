@@ -144,9 +144,9 @@ pub struct IndexStats {
 ///
 /// * `prehash_seed`: seed for the outer canonical hash.
 ///   Lookup formula: `canonical = mix64(key ^ prehash_seed)`.
-/// * `mph_salt`, `num_buckets`, `num_slots`, `prerotate`, `pilots`:
+/// * `mph_salt`, `num_buckets`, `num_slots`, `prerotate`, `pilots`, `remap`:
 ///   PtrHash25 constants. See `ptrhash25::PtrHash25Mphf::index_u64`
-///   for the lookup formula.
+///   and [`GpuPart`] for the lookup formula.
 /// * `bloom`: optional Bloom filter (present for non-lean indexes).
 ///   Reject early if `!bloom.contains(canonical)`.
 /// * `fingerprints`: optional 16-bit fingerprint table for negative-query
@@ -160,10 +160,13 @@ pub struct GpuExport {
     pub mph_salt: u64,
     /// Total buckets across all parts (`pilots.len()`).
     pub num_buckets: u32,
-    /// Total slots across all parts.
+    /// Size of the output range: every lookup result is `< num_slots`. Equals the
+    /// key count for indexes built by this version.
     pub num_slots: u64,
     pub prerotate: u8,
     pub pilots: Vec<u8>,
+    /// Tail redirection table shared by all parts (see [`GpuPart::remap_off`]).
+    pub remap: Vec<u32>,
     pub bloom: Option<BloomExport>,
     pub fingerprints: Option<Vec<u16>>,
     /// Salt of the part selector:
@@ -183,17 +186,24 @@ pub struct GpuExport {
 /// h1     = parts.len() > 1 ? (base ^ p.salt) * 0xBF58476D1CE4E5B9 : base
 /// h2     = rotl(h1, 23) ^ 0xA24B1F6FDA392B31
 /// bucket = p.bucket_off + bucket_for(h1, p.num_buckets, p.large_buckets)
-/// slot   = p.slot_off + slot_for(h2, pilots[bucket], p.num_slots)
+/// local  = slot_for(h2, pilots[bucket], p.num_slots)
+/// if local >= p.num_keys { local = remap[p.remap_off + local - p.num_keys] }
+/// slot   = p.slot_off + local
 /// ```
 #[derive(Debug, Clone, Copy)]
 pub struct GpuPart {
     pub slot_off: u64,
     pub salt: u64,
     pub bucket_off: u32,
+    /// Output positions owned by this part. Equal to `num_slots` for 0.6 files.
+    pub num_keys: u32,
+    /// Slots the pilot search hashes into.
     pub num_slots: u32,
     pub num_buckets: u32,
     /// `floor(num_buckets × 0.30)` — size of the dense "large" zone.
     pub large_buckets: u32,
+    /// Offset of this part's `num_slots - num_keys` entries in `GpuExport::remap`.
+    pub remap_off: u32,
 }
 
 /// Bloom filter snapshot for GPU export. The Bloom uses
@@ -259,9 +269,10 @@ impl Index {
         self.key_count == 0
     }
 
-    /// Upper bound on `lookup`'s return value. For non-empty indexes this is
-    /// `~1.1 * len()` (PtrHash25 over-provisions by `1/gamma`); zero for empty.
-    /// Side arrays indexed by `lookup` results must be sized to this, not `len()`.
+    /// Upper bound on `lookup`'s return value. Equal to `len()` for indexes built by
+    /// this version (the MPH is minimal); `~1.1 * len()` for indexes loaded from 0.6
+    /// files; zero for empty. Side arrays indexed by `lookup` results must be sized
+    /// to this.
     #[inline]
     pub fn slot_capacity(&self) -> usize {
         match &self.engine {
@@ -855,11 +866,7 @@ impl Index {
             return None;
         }
 
-        // Materialise pilots to a flat byte array regardless of in-memory
-        // representation. CompressedV2 (the typical on-disk form for huge
-        // indexes) gets unpacked into a contiguous Vec<u8> — the kernel
-        // wants a direct array lookup.
-        let pilots_flat: Vec<u8> = (0..mph.pilots.len()).map(|b| mph.pilots.get(b)).collect();
+        let pilots_flat: Vec<u8> = mph.pilots.as_slice().to_vec();
 
         let bloom_export = engine.filter.as_ref().map(|bf| {
             let words = bf.export_words();
@@ -882,9 +889,11 @@ impl Index {
                 slot_off: p.slot_off,
                 salt: p.salt,
                 bucket_off: p.bucket_off,
+                num_keys: p.num_keys,
                 num_slots: p.num_slots,
                 num_buckets: p.num_buckets,
                 large_buckets: p.large_buckets,
+                remap_off: p.remap_off,
             })
             .collect();
 
@@ -895,6 +904,7 @@ impl Index {
             num_slots: mph.n,
             prerotate: mph.prerotate,
             pilots: pilots_flat,
+            remap: mph.remap.to_vec(),
             bloom: bloom_export,
             fingerprints,
             part_salt: mph.part_salt,
@@ -1120,7 +1130,8 @@ fn make_backend_cfg(config: &IndexConfig) -> BackendConfig {
         backend: config.backend,
         enable_parallel_build: config.enable_parallel_build,
         seed: config.mph_config.seed,
-        gamma: config.mph_config.gamma,
+        lambda: config.mph_config.lambda,
+        alpha: config.mph_config.alpha,
         rehash_limit: config.mph_config.max_rehash,
         build_profile: if config.build_fast_profile {
             BuildProfile::Fast

@@ -1,9 +1,10 @@
 //! kira_kv_engine — PtrHash-style MPH + PGM index.
 //!
 //! - Build once on a set of **unique** keys (bytes/str).
-//! - O(1) lookups: key → position in `[0..Index::slot_capacity())`. Note this
-//!   is *not* `[0..len())` — PtrHash25 over-provisions slot space by `1/gamma`.
-//!   Size parallel side arrays to `slot_capacity()`.
+//! - O(1) lookups: key → position in `[0..Index::slot_capacity())`, which equals
+//!   `[0..len())` for indexes built by this version (minimal perfect hashing);
+//!   indexes written by 0.6 keep their 1.1× padded range. Size parallel side
+//!   arrays to `slot_capacity()`.
 //! - Empty input is supported (0.6.1+): produces a no-op instance.
 
 mod aes_hash;
@@ -12,7 +13,6 @@ mod build_arena;
 mod build_hasher;
 mod build_pool;
 mod canonical_hash;
-mod compressed_pilots;
 mod cpu;
 mod dynamic_index;
 mod elias_fano;
@@ -52,14 +52,13 @@ pub mod __internal {
     pub use crate::block_bloom::BlockBloom;
     pub use crate::build_arena::BuildArena;
     pub use crate::build_pool::{pool, radix_sort_u64_pairs};
-    pub use crate::compressed_pilots::{CompressedPilots, CompressedPilotsV2};
     pub use crate::hugepage::HugepageBuf;
     pub use crate::mini_chd::{MiniChd, MiniChdError};
     pub use crate::mmap_index::{Header, MmapIndex, MmapIndexWriter, SectionKind};
     pub use crate::ptrhash25::{
         BuildConfig, BuildOutputs, Builder, PART_TARGET_KEYS, PartInfo, Partitioned,
-        PilotTable, PtrHash25Error, PtrHash25Mphf, build_partitioned, build_partitioned_with,
-        partition_keys, read_ptrhash25, write_ptrhash25,
+        PtrHash25Error, PtrHash25Mphf, build_partitioned, build_partitioned_with, partition_keys,
+        read_ptrhash25, write_ptrhash25,
     };
     pub mod simd_hash {
         pub fn hash_u64_scalar(keys: &[u64], seed: u64, out: &mut [u64]) {

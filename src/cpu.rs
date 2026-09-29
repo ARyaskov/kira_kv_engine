@@ -79,7 +79,8 @@ impl CpuFeatures {
 
     pub fn optimal_config(&self) -> BuildConfig {
         BuildConfig {
-            gamma: 0.5,
+            lambda: crate::ptrhash25::DEFAULT_LAMBDA,
+            alpha: crate::ptrhash25::DEFAULT_ALPHA,
             max_rehash: 16,
             with_fingerprints: false,
             seed: 0xC0FF_EE00_D15E_A5E,

@@ -110,7 +110,7 @@ enum SegmentStorage {
         slot_hashes: Vec<u64>,
     },
     /// Large segment (> 4096 keys) — full PtrHash25 with 2-level bucketing
-    /// and compressed pilots. ~1.1 B/key with optional fingerprints.
+    /// and eviction. ~0.4 B/key of pilots plus optional 1 B/key fingerprints.
     MiniMph {
         mph: PtrHash25Mphf,
         positions: Vec<u32>,
@@ -434,7 +434,8 @@ impl HybridBuilder {
             // Tier 3 — PtrHash25 for big segments. with_fingerprints controlled
             // by lean mode (lean drops them for ~8 bits/key win).
             let cfg = MphConfig {
-                gamma: 0.5,
+                lambda: crate::ptrhash25::DEFAULT_LAMBDA,
+                alpha: crate::ptrhash25::DEFAULT_ALPHA,
                 max_rehash: 8,
                 with_fingerprints: !lean,
                 seed: 0x9E37_79B9_7F4A_7C15 ^ (start as u64),
@@ -702,8 +703,7 @@ impl HybridIndex {
                 }
                 SegmentStorage::MiniMph { positions, .. } => {
                     mini_mph += 1;
-                    // mph.n includes PtrHash25's 1.10× padding — count only
-                    // occupied positions to get the true key count.
+                    // Count occupied positions (the sentinel marks unused ones).
                     mph_keys += positions.iter().filter(|&&p| p != u32::MAX).count();
                 }
             }

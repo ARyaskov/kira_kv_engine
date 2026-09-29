@@ -16,7 +16,8 @@ impl HotTierIndex {
         }
         let filter = BlockBloom::build_from_u64(keys, 0xC1B5_4A32_D192_ED03);
         let cfg = crate::ptrhash25::BuildConfig {
-            gamma: 0.5,
+            lambda: crate::ptrhash25::DEFAULT_LAMBDA,
+            alpha: crate::ptrhash25::DEFAULT_ALPHA,
             max_rehash: 16,
             with_fingerprints: false,
             seed,

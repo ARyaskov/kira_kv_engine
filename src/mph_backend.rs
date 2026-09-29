@@ -2,7 +2,7 @@
 //!
 //! Historically this module hosted several MPH algorithms (PTHash, CHD, RecSplit,
 //! BBHash, plus the legacy PtrHash2025). They were removed in v0.5 — PtrHash25
-//! (`ptrhash25.rs`, u8 pilots + 2-level bucketing + CompressedPilotsV2) consistently
+//! (`ptrhash25.rs`, u8 pilots + 2-level bucketing + eviction) consistently
 //! beat all the alternatives on both build (4× faster) and lookup (1.5-3× faster)
 //! while using 2.5× less memory. The other backends added complexity and confusion
 //! without any workload where they won.
@@ -18,9 +18,9 @@ use hashbrown::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendKind {
-    /// The only MPH algorithm. u8 pilots + 2-level bucketing + CompressedPilotsV2
-    /// (3-tier zero/nibble/overflow) + hugepage-backed storage + partitioned,
-    /// parallel, AVX2-vectorized build. See `src/ptrhash25.rs`.
+    /// The only MPH algorithm. u8 pilots + 2-level bucketing + cuckoo-style
+    /// eviction + tail remap (minimal output) + hugepage-backed storage +
+    /// partitioned, parallel, AVX2-vectorized build. See `src/ptrhash25.rs`.
     PtrHash25,
 }
 
@@ -35,7 +35,10 @@ pub struct BuildConfig {
     pub backend: BackendKind,
     pub enable_parallel_build: bool,
     pub seed: u64,
-    pub gamma: f64,
+    /// Keys per bucket of the MPH (see `ptrhash25::BuildConfig::lambda`).
+    pub lambda: f64,
+    /// Load factor of the MPH (see `ptrhash25::BuildConfig::alpha`).
+    pub alpha: f64,
     pub rehash_limit: u32,
     pub build_profile: BuildProfile,
 }
@@ -46,7 +49,8 @@ impl Default for BuildConfig {
             backend: BackendKind::PtrHash25,
             enable_parallel_build: true,
             seed: 0xC0FF_EE00_D15E_A5E,
-            gamma: 0.5, // sparse layout — required for u8-pilot convergence
+            lambda: ptrhash25::DEFAULT_LAMBDA,
+            alpha: ptrhash25::DEFAULT_ALPHA,
             rehash_limit: 16,
             build_profile: BuildProfile::Fast,
         }
@@ -58,7 +62,8 @@ impl BuildConfig {
     /// `Index` layer adds its own fingerprint table, so inner fingerprints are off.
     pub(crate) fn mph_config(&self) -> ptrhash25::BuildConfig {
         ptrhash25::BuildConfig {
-            gamma: self.gamma,
+            lambda: self.lambda,
+            alpha: self.alpha,
             max_rehash: self.rehash_limit.max(8),
             with_fingerprints: false,
             seed: self.seed,
@@ -77,7 +82,7 @@ pub trait MphBackend {
     fn memory_usage_bytes(&self) -> usize;
 }
 
-/// PtrHash 2025 backend — u8 pilots, 2-level bucketing, 3-tier compressed pilots,
+/// PtrHash 2025 backend — u8 pilots, 2-level bucketing, eviction, tail remap,
 /// hugepage-backed storage, partitioned parallel build. The default and currently
 /// only backend.
 ///

@@ -69,8 +69,7 @@ fn multi_part_is_bijective() {
     let keys = keys_u64(n, 0xA1);
     let mph = Builder::new().build(&keys).expect("build failed");
     assert!(mph.num_parts() > 1, "expected a multi-part build for {n} keys");
-    assert!(mph.slot_capacity() >= n);
-    assert!(mph.slot_capacity() <= n + n / 8);
+    assert_eq!(mph.slot_capacity(), n, "the MPH must be minimal");
     assert_bijective(&mph, &keys);
     for &k in &keys {
         assert!(mph.lookup_u64(k).is_some());
@@ -280,8 +279,12 @@ fn gpu_export_carries_parts() {
     let export = idx.gpu_export().expect("export");
     assert!(export.parts.len() > 1);
     assert_eq!(export.pilots.len() as u32, export.num_buckets);
-    let total_slots: u64 = export.parts.iter().map(|p| p.num_slots as u64).sum();
-    assert_eq!(total_slots, export.num_slots);
+    let total_keys: u64 = export.parts.iter().map(|p| p.num_keys as u64).sum();
+    assert_eq!(total_keys, export.num_slots);
+    assert_eq!(export.num_slots as usize, idx.len());
+    let total_remap: usize = export.parts.iter().map(|p| (p.num_slots - p.num_keys) as usize).sum();
+    assert_eq!(total_remap, export.remap.len());
+    assert!(export.remap.iter().all(|&r| (r as u64) < export.num_slots));
 }
 
 /// `contains()` is a filter-level answer. Without a filter (lean mode) it cannot
