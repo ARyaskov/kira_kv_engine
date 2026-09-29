@@ -214,3 +214,18 @@ fn bloom_reader_bounds_its_allocation() {
     let _ = HugepageBuf::alloc_zeroed(16); // keep the import meaningful across features
     let _ = MmapIndex::open("/definitely/not/here").is_err();
 }
+
+#[test]
+fn save_and_load_roundtrip_streaming() {
+    let keys = byte_keys(30_000);
+    let idx = IndexBuilder::new().build_index_ref(&keys).unwrap();
+    let path = std::env::temp_dir().join(format!("kira_save_{}.idx", std::process::id()));
+    idx.save(&path).unwrap();
+    let streamed = std::fs::read(&path).unwrap();
+    assert_eq!(streamed, idx.to_bytes().unwrap(), "streaming and in-memory forms differ");
+    let back = Index::load(&path).unwrap();
+    for k in &keys {
+        assert_eq!(back.lookup(k).ok(), idx.lookup(k).ok());
+    }
+    let _ = std::fs::remove_file(&path);
+}

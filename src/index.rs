@@ -959,34 +959,62 @@ impl Index {
     /// Tags 0, 2 and 3 written by earlier versions are still readable (without
     /// checksum verification).
     pub fn to_bytes(&self) -> Result<Vec<u8>, IndexError> {
-        let mut out = Vec::new();
-        write_u8(&mut out, TAG_V3);
-        out.extend_from_slice(FORMAT_MAGIC);
-        write_u16(&mut out, FORMAT_VERSION);
-        write_u8(&mut out, HASH_ID_CANONICAL);
-        write_u8(&mut out, 0);
-        write_u64(&mut out, self.key_count as u64);
+        let mut out = Vec::with_capacity(self.stats().total_memory + 64);
+        self.write_to(&mut out).map_err(|_| IndexError::CorruptData)?;
+        Ok(out)
+    }
+
+    /// Stream the serialized index (same format as [`Index::to_bytes`]) to `w`.
+    /// The Bloom words and the fingerprint table are written straight from their
+    /// in-memory arrays, so the only transient buffer is the MPH backend (~0.5 B/key).
+    pub fn write_to<W: std::io::Write>(&self, w: W) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut w = crate::wire::ChecksumWriter::new(std::io::BufWriter::new(w));
+        let mut head = Vec::with_capacity(32);
+        write_u8(&mut head, TAG_V3);
+        head.extend_from_slice(FORMAT_MAGIC);
+        write_u16(&mut head, FORMAT_VERSION);
+        write_u8(&mut head, HASH_ID_CANONICAL);
+        write_u8(&mut head, 0);
+        write_u64(&mut head, self.key_count as u64);
+        w.write_all(&head)?;
         if let Some(engine) = self.engine.as_ref() {
-            write_u64(&mut out, engine.prehash_seed);
-            engine.backend.write_to(&mut out);
+            let mut backend = Vec::new();
+            write_u64(&mut backend, engine.prehash_seed);
+            engine.backend.write_to(&mut backend);
+            w.write_all(&backend)?;
+            drop(backend);
             match &engine.filter {
                 Some(bf) => {
-                    write_u8(&mut out, 1);
-                    bf.write_to(&mut out);
+                    w.write_all(&[1])?;
+                    bf.write_into(&mut w)?;
                 }
-                None => write_u8(&mut out, 0),
+                None => w.write_all(&[0])?,
             }
             match &engine.fingerprints {
                 Some(fp) => {
-                    write_u8(&mut out, 1);
-                    write_fingerprints(&mut out, fp.as_ref());
+                    w.write_all(&[1])?;
+                    let real = &fp[..fp.len() - 1];
+                    w.write_all(&(real.len() as u64).to_le_bytes())?;
+                    crate::wire::write_le(&mut w, real)?;
                 }
-                None => write_u8(&mut out, 0),
+                None => w.write_all(&[0])?,
             }
         }
-        let sum = crate::checksum::checksum(&out);
-        write_u64(&mut out, sum);
-        Ok(out)
+        let mut inner = w.finish()?;
+        inner.flush()
+    }
+
+    /// Write the index to a file (streaming, see [`Index::write_to`]).
+    pub fn save<P: AsRef<std::path::Path>>(&self, path: P) -> std::io::Result<()> {
+        let file = std::fs::File::create(path)?;
+        self.write_to(file)
+    }
+
+    /// Read an index written by [`Index::save`] / [`Index::write_to`].
+    pub fn load<P: AsRef<std::path::Path>>(path: P) -> Result<Self, IndexError> {
+        let bytes = std::fs::read(path).map_err(|_| IndexError::CorruptData)?;
+        Self::from_bytes(&bytes)
     }
 
     pub fn serialize(&self) -> Result<Vec<u8>, IndexError> {
@@ -1559,24 +1587,10 @@ fn write_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
-/// Writes the `slot_capacity()` real entries; the padding element is not stored.
-fn write_fingerprints(out: &mut Vec<u8>, fps: &[u16]) {
-    let real = &fps[..fps.len() - 1];
-    write_u64(out, real.len() as u64);
-    for &fp in real {
-        write_u16(out, fp);
-    }
-}
-
 fn read_fingerprints(cursor: &mut Cursor<'_>) -> Result<Box<[u16]>, IndexError> {
     let len = cursor.read_u64().ok_or(IndexError::CorruptData)? as usize;
-    if len > (cursor.buf.len() - cursor.pos) / 2 {
-        return Err(IndexError::CorruptData);
-    }
-    let mut fps = Vec::with_capacity(len + 1);
-    for _ in 0..len {
-        fps.push(cursor.read_u16().ok_or(IndexError::CorruptData)?);
-    }
+    let mut fps: Vec<u16> = crate::wire::read_le_at(cursor.buf, &mut cursor.pos, len)
+        .ok_or(IndexError::CorruptData)?;
     fps.push(0); // padding element, see `MphEngine::fingerprints`
     Ok(fps.into_boxed_slice())
 }

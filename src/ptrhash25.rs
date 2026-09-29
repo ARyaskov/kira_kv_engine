@@ -1329,9 +1329,7 @@ pub fn write_ptrhash25(mph: &PtrHash25Mphf, out: &mut Vec<u8>) {
         out.extend_from_slice(&p.remap_off.to_le_bytes());
     }
     out.extend_from_slice(&(mph.remap.len() as u64).to_le_bytes());
-    for &r in mph.remap.iter() {
-        out.extend_from_slice(&r.to_le_bytes());
-    }
+    crate::wire::extend_le(out, &mph.remap);
 }
 
 pub fn read_ptrhash25(buf: &[u8], pos: &mut usize) -> Option<PtrHash25Mphf> {
@@ -1405,13 +1403,7 @@ pub fn read_ptrhash25(buf: &[u8], pos: &mut usize) -> Option<PtrHash25Mphf> {
             parts.push(PartInfo::new(slot_off, psalt, bucket_off, num_keys, num_slots, nb, remap_off));
         }
         let remap_len = rd_u64(buf, pos)? as usize;
-        if remap_len.checked_mul(4)? > buf.len() - *pos {
-            return None;
-        }
-        let mut remap = Vec::with_capacity(remap_len);
-        for _ in 0..remap_len {
-            remap.push(rd_u32(buf, pos)?);
-        }
+        let remap: Vec<u32> = crate::wire::read_le_at(buf, pos, remap_len)?;
         (part_salt, parts, remap)
     } else if rot_byte & FLAG_LEGACY_MULTI != 0 {
         let part_salt = rd_u64(buf, pos)?;

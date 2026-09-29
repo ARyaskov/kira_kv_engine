@@ -30,6 +30,7 @@ mod prefetch;
 mod pgm_u128;
 mod ptrhash25;
 mod simd_hash;
+mod wire;
 pub use index::{
     BloomExport, GpuExport, GpuPart, Index, IndexBuilder, IndexConfig, IndexError, IndexStats,
 };

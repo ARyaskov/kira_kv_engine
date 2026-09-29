@@ -244,18 +244,12 @@ impl EliasFano {
         out.extend_from_slice(&self.universe.to_le_bytes());
         out.push(self.low_bits);
         out.extend_from_slice(&(self.low.len() as u64).to_le_bytes());
-        for &w in &self.low {
-            out.extend_from_slice(&w.to_le_bytes());
-        }
+        crate::wire::extend_le(out, &self.low);
         out.extend_from_slice(&self.high_len.to_le_bytes());
         out.extend_from_slice(&(self.high.len() as u64).to_le_bytes());
-        for &w in &self.high {
-            out.extend_from_slice(&w.to_le_bytes());
-        }
+        crate::wire::extend_le(out, &self.high);
         out.extend_from_slice(&(self.select_sample.len() as u64).to_le_bytes());
-        for &s in &self.select_sample {
-            out.extend_from_slice(&s.to_le_bytes());
-        }
+        crate::wire::extend_le(out, &self.select_sample);
     }
 
     pub fn read_from(bytes: &[u8], pos: &mut usize) -> Option<Self> {
@@ -276,16 +270,6 @@ impl EliasFano {
             *p += 1;
             Some(v)
         }
-        fn rd_u32(b: &[u8], p: &mut usize) -> Option<u32> {
-            if *p + 4 > b.len() {
-                return None;
-            }
-            let mut a = [0u8; 4];
-            a.copy_from_slice(&b[*p..*p + 4]);
-            *p += 4;
-            Some(u32::from_le_bytes(a))
-        }
-
         // Allocation sizes are capped by the bytes actually present; structural
         // invariants are checked so decoding can never index out of bounds.
         let n = rd_u64(bytes, pos)? as usize;
@@ -300,30 +284,12 @@ impl EliasFano {
             (1u64 << low_bits) - 1
         };
         let low_len = rd_u64(bytes, pos)? as usize;
-        if low_len > (bytes.len() - *pos) / 8 {
-            return None;
-        }
-        let mut low = Vec::with_capacity(low_len);
-        for _ in 0..low_len {
-            low.push(rd_u64(bytes, pos)?);
-        }
+        let low: Vec<u64> = crate::wire::read_le_at(bytes, pos, low_len)?;
         let high_len = rd_u64(bytes, pos)?;
         let high_count = rd_u64(bytes, pos)? as usize;
-        if high_count > (bytes.len() - *pos) / 8 {
-            return None;
-        }
-        let mut high = Vec::with_capacity(high_count);
-        for _ in 0..high_count {
-            high.push(rd_u64(bytes, pos)?);
-        }
+        let high: Vec<u64> = crate::wire::read_le_at(bytes, pos, high_count)?;
         let sample_count = rd_u64(bytes, pos)? as usize;
-        if sample_count > (bytes.len() - *pos) / 4 {
-            return None;
-        }
-        let mut select_sample = Vec::with_capacity(sample_count);
-        for _ in 0..sample_count {
-            select_sample.push(rd_u32(bytes, pos)?);
-        }
+        let select_sample: Vec<u32> = crate::wire::read_le_at(bytes, pos, sample_count)?;
         // low: n * low_bits bits must fit; high: high_len bits must fit and hold
         // exactly n set bits; samples: one per SAMPLE_RATE keys, each inside `high`.
         let need_low = (n as u64 * low_bits as u64).div_ceil(64) as usize;

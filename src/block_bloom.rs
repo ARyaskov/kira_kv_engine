@@ -222,9 +222,15 @@ impl BlockBloom {
         out.extend_from_slice(&self.seed.to_le_bytes());
         let flag = if self.bit_shift == BIT_SHIFT_V2 { LEN_FLAG_V2 } else { 0 };
         out.extend_from_slice(&((self.words.len() as u64) | flag).to_le_bytes());
-        for &w in self.words.as_slice() {
-            out.extend_from_slice(&w.to_le_bytes());
-        }
+        crate::wire::extend_le(out, self.words.as_slice());
+    }
+
+    /// Streaming form of [`BlockBloom::write_to`].
+    pub fn write_into<W: std::io::Write + ?Sized>(&self, w: &mut W) -> std::io::Result<()> {
+        w.write_all(&self.seed.to_le_bytes())?;
+        let flag = if self.bit_shift == BIT_SHIFT_V2 { LEN_FLAG_V2 } else { 0 };
+        w.write_all(&((self.words.len() as u64) | flag).to_le_bytes())?;
+        crate::wire::write_le(w, self.words.as_slice())
     }
 
     pub fn read_from(buf: &[u8], pos: &mut usize) -> Option<Self> {
@@ -252,11 +258,23 @@ impl BlockBloom {
         let mut words = crate::hugepage::HugeVec::<u64>::zeroed(len);
         {
             let slice = words.as_mut_slice();
-            for w in slice.iter_mut() {
-                a.copy_from_slice(&buf[*pos..*pos + 8]);
-                *w = u64::from_le_bytes(a);
-                *pos += 8;
+            #[cfg(target_endian = "little")]
+            {
+                // SAFETY: `payload == len * 8` bytes are in bounds (checked above) and
+                // the destination holds `len` u64s; every bit pattern is a valid u64.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        buf.as_ptr().add(*pos),
+                        slice.as_mut_ptr() as *mut u8,
+                        payload,
+                    );
+                }
             }
+            #[cfg(not(target_endian = "little"))]
+            for (w, chunk) in slice.iter_mut().zip(buf[*pos..*pos + payload].chunks_exact(8)) {
+                *w = u64::from_le_bytes(chunk.try_into().unwrap());
+            }
+            *pos += payload;
         }
         Some(Self { seed, words, bit_shift })
     }

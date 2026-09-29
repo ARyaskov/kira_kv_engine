@@ -539,41 +539,23 @@ impl PgmIndex {
                 write_u64(out, k);
             }
         } else {
-            for k in &self.keys {
-                write_u64(out, *k);
-            }
+            crate::wire::extend_le(out, &self.keys);
         }
         let s = &self.segments;
         write_u64(out, s.len() as u64);
-        for &v in &s.slopes {
-            write_f32(out, v);
-        }
-        for &v in &s.intercepts {
-            write_f32(out, v);
-        }
-        for &v in &s.min_keys {
-            write_u64(out, v);
-        }
-        for &v in &s.max_keys {
-            write_u64(out, v);
-        }
-        for &v in &s.max_errors_u8 {
-            out.push(v);
-        }
+        crate::wire::extend_le(out, &s.slopes);
+        crate::wire::extend_le(out, &s.intercepts);
+        crate::wire::extend_le(out, &s.min_keys);
+        crate::wire::extend_le(out, &s.max_keys);
+        out.extend_from_slice(&s.max_errors_u8);
         write_u64(out, s.overflow_errors.len() as u64);
         for &(si, er) in &s.overflow_errors {
             write_u32(out, si);
             write_u32(out, er);
         }
-        for &v in &s.filters {
-            write_u64(out, v);
-        }
-        for &v in &s.starts {
-            write_u32(out, v);
-        }
-        for &v in &s.ends {
-            write_u32(out, v);
-        }
+        crate::wire::extend_le(out, &s.filters);
+        crate::wire::extend_le(out, &s.starts);
+        crate::wire::extend_le(out, &s.ends);
         match &self.bloom {
             Some(bf) => {
                 out.push(1);
@@ -598,38 +580,21 @@ impl PgmIndex {
         // Every count is capped by the bytes actually present before allocating.
         let remaining = |cur: &Cursor<'_>| cur.buf.len() - cur.pos;
         let keys_len = cur.read_u64().ok_or(PgmError::CorruptData)? as usize;
-        if keys_len > remaining(&cur) / 8 {
-            return Err(PgmError::CorruptData);
-        }
-        let mut keys = Vec::with_capacity(keys_len);
-        for _ in 0..keys_len {
-            keys.push(cur.read_u64().ok_or(PgmError::CorruptData)?);
-        }
+        let keys: Vec<u64> = cur.read_le(keys_len)?;
         let seg_len = cur.read_u64().ok_or(PgmError::CorruptData)? as usize;
         if seg_len > remaining(&cur) / 41 {
             return Err(PgmError::CorruptData);
         }
-
-        let mut slopes = Vec::with_capacity(seg_len);
-        for _ in 0..seg_len {
-            slopes.push(cur.read_f32().ok_or(PgmError::CorruptData)?);
-        }
-        let mut intercepts = Vec::with_capacity(seg_len);
-        for _ in 0..seg_len {
-            intercepts.push(cur.read_f32().ok_or(PgmError::CorruptData)?);
-        }
-        let mut min_keys = Vec::with_capacity(seg_len);
-        for _ in 0..seg_len {
-            min_keys.push(cur.read_u64().ok_or(PgmError::CorruptData)?);
-        }
-        let mut max_keys = Vec::with_capacity(seg_len);
-        for _ in 0..seg_len {
-            max_keys.push(cur.read_u64().ok_or(PgmError::CorruptData)?);
-        }
-        let mut max_errors_u8 = Vec::with_capacity(seg_len);
-        for _ in 0..seg_len {
-            max_errors_u8.push(cur.read_u8().ok_or(PgmError::CorruptData)?);
-        }
+        let slopes: Vec<f32> = cur.read_le(seg_len)?;
+        let intercepts: Vec<f32> = cur.read_le(seg_len)?;
+        let min_keys: Vec<u64> = cur.read_le(seg_len)?;
+        let max_keys: Vec<u64> = cur.read_le(seg_len)?;
+        let max_errors_u8 = cur
+            .buf
+            .get(cur.pos..cur.pos + seg_len)
+            .ok_or(PgmError::CorruptData)?
+            .to_vec();
+        cur.pos += seg_len;
         let over_n = cur.read_u64().ok_or(PgmError::CorruptData)? as usize;
         if over_n > remaining(&cur) / 8 {
             return Err(PgmError::CorruptData);
@@ -640,18 +605,9 @@ impl PgmIndex {
             let er = cur.read_u32().ok_or(PgmError::CorruptData)?;
             overflow_errors.push((si, er));
         }
-        let mut filters = Vec::with_capacity(seg_len);
-        for _ in 0..seg_len {
-            filters.push(cur.read_u64().ok_or(PgmError::CorruptData)?);
-        }
-        let mut starts = Vec::with_capacity(seg_len);
-        for _ in 0..seg_len {
-            starts.push(cur.read_u32().ok_or(PgmError::CorruptData)?);
-        }
-        let mut ends = Vec::with_capacity(seg_len);
-        for _ in 0..seg_len {
-            ends.push(cur.read_u32().ok_or(PgmError::CorruptData)?);
-        }
+        let filters: Vec<u64> = cur.read_le(seg_len)?;
+        let starts: Vec<u32> = cur.read_le(seg_len)?;
+        let ends: Vec<u32> = cur.read_le(seg_len)?;
         let has_bloom = cur.read_u8().ok_or(PgmError::CorruptData)?;
         *pos = cur.pos;
         let bloom = if has_bloom == 1 {
@@ -1026,25 +982,19 @@ impl<'a> ExactSizeIterator for KeysIter<'a> {}
 
 fn bytes_of_u64(v: &[u64]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 8);
-    for &x in v {
-        out.extend_from_slice(&x.to_le_bytes());
-    }
+    crate::wire::extend_le(&mut out, v);
     out
 }
 
 fn bytes_of_u32(v: &[u32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 4);
-    for &x in v {
-        out.extend_from_slice(&x.to_le_bytes());
-    }
+    crate::wire::extend_le(&mut out, v);
     out
 }
 
 fn bytes_of_f32(v: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 4);
-    for &x in v {
-        out.extend_from_slice(&x.to_le_bytes());
-    }
+    crate::wire::extend_le(&mut out, v);
     out
 }
 
@@ -1058,36 +1008,15 @@ fn bytes_of_u32_pairs(v: &[(u32, u32)]) -> Vec<u8> {
 }
 
 fn u64_vec_from_section(bytes: &[u8]) -> Vec<u64> {
-    let n = bytes.len() / 8;
-    let mut out = Vec::with_capacity(n);
-    for chunk in bytes.chunks_exact(8) {
-        let mut a = [0u8; 8];
-        a.copy_from_slice(chunk);
-        out.push(u64::from_le_bytes(a));
-    }
-    out
+    crate::wire::read_le(bytes, bytes.len() / 8).unwrap_or_default()
 }
 
 fn u32_vec_from_section(bytes: &[u8]) -> Vec<u32> {
-    let n = bytes.len() / 4;
-    let mut out = Vec::with_capacity(n);
-    for chunk in bytes.chunks_exact(4) {
-        let mut a = [0u8; 4];
-        a.copy_from_slice(chunk);
-        out.push(u32::from_le_bytes(a));
-    }
-    out
+    crate::wire::read_le(bytes, bytes.len() / 4).unwrap_or_default()
 }
 
 fn f32_vec_from_section(bytes: &[u8]) -> Vec<f32> {
-    let n = bytes.len() / 4;
-    let mut out = Vec::with_capacity(n);
-    for chunk in bytes.chunks_exact(4) {
-        let mut a = [0u8; 4];
-        a.copy_from_slice(chunk);
-        out.push(f32::from_le_bytes(a));
-    }
-    out
+    crate::wire::read_le(bytes, bytes.len() / 4).unwrap_or_default()
 }
 
 fn u32_pairs_from_section(bytes: &[u8]) -> Vec<(u32, u32)> {
@@ -1411,14 +1340,8 @@ impl<'a> Cursor<'a> {
         self.pos += 8;
         Some(u64::from_le_bytes(array))
     }
-    fn read_f32(&mut self) -> Option<f32> {
-        if self.pos + 4 > self.buf.len() {
-            return None;
-        }
-        let mut array = [0u8; 4];
-        array.copy_from_slice(&self.buf[self.pos..self.pos + 4]);
-        self.pos += 4;
-        Some(f32::from_le_bytes(array))
+    fn read_le<T: crate::wire::LeNum + Default>(&mut self, count: usize) -> Result<Vec<T>, PgmError> {
+        crate::wire::read_le_at(self.buf, &mut self.pos, count).ok_or(PgmError::CorruptData)
     }
 }
 
@@ -1426,9 +1349,6 @@ fn write_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 fn write_u64(out: &mut Vec<u8>, v: u64) {
-    out.extend_from_slice(&v.to_le_bytes());
-}
-fn write_f32(out: &mut Vec<u8>, v: f32) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 

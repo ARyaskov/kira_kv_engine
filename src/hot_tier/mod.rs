@@ -70,9 +70,7 @@ impl HotTierIndex {
         crate::ptrhash25::write_ptrhash25(&self.mph, out);
         write_fingerprints(out, &self.fingerprints);
         write_u64(out, self.indices.len() as u64);
-        for &v in self.indices.iter() {
-            write_u32(out, v);
-        }
+        crate::wire::extend_le(out, &self.indices);
     }
 
     pub fn read_from(bytes: &[u8], pos: &mut usize) -> Option<Self> {
@@ -81,13 +79,7 @@ impl HotTierIndex {
         let mut cur = LocalCursor { buf: bytes, pos: *pos };
         let fingerprints = read_fingerprints(&mut cur)?;
         let len = cur.read_u64()? as usize;
-        if len > (bytes.len() - cur.pos) / 4 {
-            return None;
-        }
-        let mut indices = Vec::with_capacity(len);
-        for _ in 0..len {
-            indices.push(read_u32(&mut cur)?);
-        }
+        let indices: Vec<u32> = crate::wire::read_le_at(bytes, &mut cur.pos, len)?;
         // Both side tables are indexed by the MPH slot without bounds checks.
         if fingerprints.len() != mph.slot_capacity() || indices.len() != mph.slot_capacity() {
             return None;
@@ -118,15 +110,6 @@ impl<'a> LocalCursor<'a> {
         a.copy_from_slice(&self.buf[self.pos..self.pos + 8]);
         self.pos += 8;
         Some(u64::from_le_bytes(a))
-    }
-
-    fn read_bytes(&mut self, out: &mut [u8]) -> Option<()> {
-        if self.pos + out.len() > self.buf.len() {
-            return None;
-        }
-        out.copy_from_slice(&self.buf[self.pos..self.pos + out.len()]);
-        self.pos += out.len();
-        Some(())
     }
 }
 
@@ -164,37 +147,16 @@ fn splitmix64(mut x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-fn write_u32(out: &mut Vec<u8>, v: u32) {
-    out.extend_from_slice(&v.to_le_bytes());
-}
-
 fn write_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
 fn write_fingerprints(out: &mut Vec<u8>, fps: &[u16]) {
     write_u64(out, fps.len() as u64);
-    for &fp in fps {
-        out.extend_from_slice(&fp.to_le_bytes());
-    }
+    crate::wire::extend_le(out, fps);
 }
 
 fn read_fingerprints(cursor: &mut LocalCursor<'_>) -> Option<Vec<u16>> {
     let len = cursor.read_u64()? as usize;
-    if len > (cursor.buf.len() - cursor.pos) / 2 {
-        return None;
-    }
-    let mut fps = Vec::with_capacity(len);
-    for _ in 0..len {
-        let mut array = [0u8; 2];
-        cursor.read_bytes(&mut array)?;
-        fps.push(u16::from_le_bytes(array));
-    }
-    Some(fps)
-}
-
-fn read_u32(cursor: &mut LocalCursor<'_>) -> Option<u32> {
-    let mut array = [0u8; 4];
-    cursor.read_bytes(&mut array)?;
-    Some(u32::from_le_bytes(array))
+    crate::wire::read_le_at(cursor.buf, &mut cursor.pos, len)
 }
