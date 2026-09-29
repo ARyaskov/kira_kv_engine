@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [dev, main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: fmt + clippy + docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings
+      - run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --release
+      - run: cargo test --release --no-default-features
+
+  portable-x86:
+    name: test without target-cpu (x86-64 baseline)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The repo's .cargo/config.toml sets -C target-cpu=x86-64-v3; dependents do
+      # not get that. Override it so the AVX2/AES paths are reached only through
+      # runtime detection, exactly as in a dependent crate.
+      - run: cargo test --release
+        env:
+          RUSTFLAGS: -C target-cpu=x86-64
+
+  sanitizer:
+    name: address sanitizer (nightly)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --target x86_64-unknown-linux-gnu -Zbuild-std --tests
+        env:
+          RUSTFLAGS: -Zsanitizer=address -C target-cpu=x86-64-v3
+          ASAN_OPTIONS: detect_leaks=0
+
+  fuzz-smoke:
+    name: fuzz targets (60 s each)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo install cargo-fuzz --locked
+      - run: |
+          for t in index_from_bytes hybrid_from_bytes pgm_from_bytes pgm_u128_from_bytes dynamic_from_bytes; do
+            cargo fuzz run "$t" -- -max_total_time=60 -rss_limit_mb=4096
+          done

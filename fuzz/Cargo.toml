@@ -1,0 +1,45 @@
+[package]
+name = "kira_kv_engine-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+kira_kv_engine = { path = ".." }
+
+# Own workspace root so the parent crate does not pick it up as a member.
+[workspace]
+
+[[bin]]
+name = "index_from_bytes"
+path = "fuzz_targets/index_from_bytes.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "hybrid_from_bytes"
+path = "fuzz_targets/hybrid_from_bytes.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "pgm_from_bytes"
+path = "fuzz_targets/pgm_from_bytes.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "pgm_u128_from_bytes"
+path = "fuzz_targets/pgm_u128_from_bytes.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "dynamic_from_bytes"
+path = "fuzz_targets/dynamic_from_bytes.rs"
+test = false
+doc = false
