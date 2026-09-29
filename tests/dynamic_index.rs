@@ -60,7 +60,7 @@ fn flush_and_lookup_across_tier() {
         let id = idx.insert(key.clone());
         expected.push((key, id));
     }
-    idx.flush();
+    idx.flush().unwrap();
     for (key, id) in &expected {
         assert_eq!(idx.lookup(key), Some(*id), "miss for {key:?}");
     }
@@ -75,11 +75,11 @@ fn delete_persists_across_flush() {
     for i in 0..20u32 {
         idx.insert(format!("k-{i}").into_bytes());
     }
-    idx.flush();
+    idx.flush().unwrap();
     idx.delete(b"k-7");
     assert_eq!(idx.lookup(b"k-7"), None);
     let new_id = idx.insert(b"k-7".to_vec());
-    idx.flush();
+    idx.flush().unwrap();
     assert_eq!(idx.lookup(b"k-7"), Some(new_id));
 }
 
@@ -92,9 +92,9 @@ fn compact_collapses_tiers_into_one() {
     for i in 0..200u32 {
         idx.insert(format!("k-{i}").into_bytes());
     }
-    idx.flush();
+    idx.flush().unwrap();
     assert!(idx.tier_count() > 1);
-    idx.compact();
+    idx.compact().unwrap();
     assert_eq!(idx.tier_count(), 1);
     for i in 0..200u32 {
         assert!(idx.lookup(format!("k-{i}").as_bytes()).is_some());
@@ -112,9 +112,75 @@ fn stable_ids_survive_flush_and_compact() {
         let key = format!("k-{i}").into_bytes();
         ids.insert(key.clone(), idx.insert(key));
     }
-    idx.flush();
-    idx.compact();
+    idx.flush().unwrap();
+    idx.compact().unwrap();
     for (key, &expected_id) in &ids {
         assert_eq!(idx.lookup(key), Some(expected_id), "id changed for {key:?}");
     }
+}
+
+#[test]
+fn len_is_exact_across_promote_delete_and_revive() {
+    let mut cfg = small_config();
+    cfg.flush_threshold = 8;
+    let mut idx = DynamicIndex::with_config(cfg);
+    for i in 0..40u32 {
+        idx.insert(format!("k-{i}").into_bytes());
+    }
+    idx.flush().unwrap();
+    assert_eq!(idx.len(), 40);
+    // Re-inserting a tiered key promotes it but must not double count.
+    idx.insert(k("k-3"));
+    assert_eq!(idx.len(), 40);
+    assert_eq!(idx.delete(b"k-3"), Some(3));
+    assert_eq!(idx.len(), 39);
+    assert_eq!(idx.delete(b"k-3"), None);
+    assert_eq!(idx.len(), 39);
+    let revived = idx.insert(k("k-3"));
+    assert_ne!(revived, 3);
+    assert_eq!(idx.len(), 40);
+    assert_eq!(idx.lookup(b"k-3"), Some(revived));
+    idx.compact().unwrap();
+    assert_eq!(idx.len(), 40);
+    assert_eq!(idx.lookup(b"k-3"), Some(revived));
+    assert_eq!(idx.tombstone_count(), 0);
+}
+
+/// Lean tiers have no filter, so the static index maps every foreign key to
+/// *some* slot. The tier must verify the stored key instead of trusting it.
+#[test]
+fn lean_tiers_never_return_foreign_ids() {
+    let mut cfg = small_config();
+    cfg.flush_threshold = 64;
+    cfg.max_tiers = 64;
+    cfg.lean_tiers = true;
+    let mut idx = DynamicIndex::with_config(cfg);
+    for i in 0..1_000u32 {
+        idx.insert(format!("present-{i}").into_bytes());
+    }
+    idx.flush().unwrap();
+    assert!(idx.tier_count() > 1);
+    for i in 0..5_000u32 {
+        assert_eq!(idx.lookup(format!("absent-{i}").as_bytes()), None, "foreign key #{i}");
+    }
+    for i in 0..1_000u32 {
+        assert_eq!(idx.lookup(format!("present-{i}").as_bytes()), Some(i));
+    }
+    // A key that lives in a deep tier must not be shadowed by a younger tier's
+    // arbitrary slot.
+    idx.delete(b"present-10");
+    assert_eq!(idx.lookup(b"present-10"), None);
+}
+
+#[test]
+fn flush_and_compact_report_success_and_keep_state() {
+    let mut idx = DynamicIndex::with_config(small_config());
+    assert!(idx.flush().is_ok());
+    assert!(idx.compact().is_ok());
+    assert_eq!(idx.tier_count(), 0);
+    idx.insert(k("x"));
+    idx.flush().unwrap();
+    idx.flush().unwrap();
+    assert_eq!(idx.tier_count(), 1);
+    assert_eq!(idx.buffer_len(), 0);
 }

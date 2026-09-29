@@ -123,13 +123,13 @@ fn bench_bulk_insert(keys: &[Vec<u8>]) {
 
     // Forced flush — show timing.
     let t = Instant::now();
-    idx.flush();
+    idx.flush().expect("flush");
     let flush_ms = t.elapsed().as_secs_f64() * 1000.0;
     println!("  forced flush: {:.1} ms → {} tiers", flush_ms, idx.tier_count());
 
     // Compact — measure cost of merging all tiers.
     let t = Instant::now();
-    idx.compact();
+    idx.compact().expect("compact");
     let compact_ms = t.elapsed().as_secs_f64() * 1000.0;
     println!(
         "  compact: {:.1} ms → {} tiers, memory now {:.2} MB",
@@ -150,7 +150,7 @@ fn bench_steady_state(initial: &[Vec<u8>], extra: &[Vec<u8>]) {
     for k in initial {
         idx.insert(k.clone());
     }
-    idx.compact();
+    idx.compact().expect("compact");
 
     // Insert STEADY_OPS new keys.
     let n = STEADY_OPS.min(extra.len());
@@ -202,7 +202,7 @@ fn bench_lookup_tiered(initial: &[Vec<u8>], extra: &[Vec<u8>], lookup_keys: &[Ve
     for k in extra.iter().take(STEADY_OPS) {
         idx.insert(k.clone());
     }
-    idx.flush();
+    idx.flush().expect("flush");
     let pre_tiers = idx.tier_count();
 
     // Warm: pre-iterate once.
@@ -217,7 +217,7 @@ fn bench_lookup_tiered(initial: &[Vec<u8>], extra: &[Vec<u8>], lookup_keys: &[Ve
 
     // Compact and re-measure.
     let t = Instant::now();
-    idx.compact();
+    idx.compact().expect("compact");
     let compact_ms = t.elapsed().as_secs_f64() * 1000.0;
     let post_tiers = idx.tier_count();
     let _ = lookup_pass(&idx, lookup_keys);
@@ -246,7 +246,7 @@ fn bench_mixed_workload(initial: &[Vec<u8>], extra: &[Vec<u8>], rng: &mut StdRng
     for k in initial {
         idx.insert(k.clone());
     }
-    idx.compact();
+    idx.compact().expect("compact");
     let baseline_mem = idx.memory_usage();
     let baseline_keys = initial.len();
 
