@@ -1,12 +1,13 @@
 //! PGM index for fixed-size 16-byte keys (`u128`) — typically UUID/SHA-128/IPv6
 //! addresses.
 //!
-//! Architecturally similar to `PgmIndex<u64>`: linear-regression segments over
-//! the sorted key sequence, predicted position + local search. We use `i128`
-//! intermediate arithmetic for slope/intercept (with f64 widening for the LR
-//! fit) and accept a slightly larger memory footprint per segment (32 B of
-//! min/max + 8 B slope + 8 B intercept + 4 B errors = 52 B/segment vs 40 B in
-//! the u64 variant).
+//! Architecturally similar to `PgmIndex<u64>`: linear segments over the sorted
+//! key sequence, predicted position + local search. Each segment's line is
+//! fitted on `key - min_key` (the u128 difference converted to f64), so the
+//! 53-bit mantissa covers the segment's span rather than the whole 2^128
+//! universe — the earlier absolute-key fit lost every bit below 2^75 and
+//! produced segments of a handful of keys for random UUIDs. Per segment:
+//! 32 B min/max + 8 B slope + 1 B error + 8 B start/end.
 //!
 //! No SIMD on the local-search step — AVX2 doesn't have 128-bit equality
 //! compare and AVX-512 isn't always available. The local-scan window is
@@ -26,10 +27,10 @@ pub struct PgmIndexU128 {
 
 #[derive(Debug, Clone, Default)]
 struct SegmentsSoA {
-    /// f64 here — for u128 universes the slope is typically very small (∼N/2^128)
-    /// and quantizing to f32 immediately overflows the f32 dynamic range.
+    /// Positions per key unit, relative to the segment's `min_key`:
+    /// `pos = slope * (key - min_key) + start`. f64 because for u128 universes the
+    /// slope is ∼N/2^128, outside the f32 range.
     slopes: Vec<f64>,
-    intercepts: Vec<f64>,
     min_keys: Vec<u128>,
     max_keys: Vec<u128>,
     max_errors_u8: Vec<u8>,
@@ -96,68 +97,51 @@ impl PgmIndexU128 {
         Self::build(u128_keys, epsilon)
     }
 
+    /// Linear-time slope-window segmentation (same algorithm as the u64 index),
+    /// fitted on `key - segment_min_key` so a segment's line keeps full f64
+    /// precision however large the absolute keys are.
     fn build_segments(keys: &[u128], epsilon: u32) -> SegmentsSoA {
         let n = keys.len();
+        let eps = epsilon as f64;
         let mut raw = Vec::with_capacity(n / 32 + 1);
         let mut start = 0usize;
         while start < n {
-            let mut reg = LinReg128::new();
-            let mut last_good: Option<RawSeg> = None;
-            let mut end = start;
+            let base = keys[start];
+            let mut lo = f64::NEG_INFINITY;
+            let mut hi = f64::INFINITY;
+            let mut end = start + 1;
             while end < n {
-                reg.add(keys[end], end);
-                end += 1;
-                if reg.n < 2.0 {
-                    last_good = Some(RawSeg {
-                        slope: 0.0,
-                        intercept: start as f64,
-                        min_key: keys[start],
-                        max_key: keys[start],
-                        max_error: 0,
-                        start,
-                        end,
-                    });
-                    continue;
-                }
-                if let Some((slope, intercept)) = reg.slope_intercept() {
-                    let me = reg.max_error(slope, intercept, keys, start);
-                    if me <= epsilon {
-                        last_good = Some(RawSeg {
-                            slope,
-                            intercept,
-                            min_key: keys[start],
-                            max_key: keys[end - 1],
-                            max_error: me,
-                            start,
-                            end,
-                        });
-                    } else {
-                        end -= 1;
-                        break;
-                    }
-                } else {
+                let dx = (keys[end] - base) as f64;
+                if dx <= 0.0 {
                     break;
                 }
-            }
-            match last_good {
-                Some(seg) => {
-                    let advance = seg.end;
-                    raw.push(seg);
-                    start = advance;
+                let dy = (end - start) as f64;
+                let new_lo = lo.max((dy - eps) / dx);
+                let new_hi = hi.min((dy + eps) / dx);
+                if new_lo > new_hi {
+                    break;
                 }
-                None => {
-                    raw.push(RawSeg {
-                        slope: 0.0,
-                        intercept: start as f64,
-                        min_key: keys[start],
-                        max_key: keys[start],
-                        max_error: 0,
-                        start,
-                        end: start + 1,
-                    });
-                    start += 1;
-                }
+                lo = new_lo;
+                hi = new_hi;
+                end += 1;
             }
+            let slope = if end == start + 1 { 0.0 } else { 0.5 * (lo + hi) };
+            // Measure the real error of the stored line once (O(L)).
+            let mut max_error = 0u32;
+            for (i, &k) in keys[start..end].iter().enumerate() {
+                let pred = slope * ((k - base) as f64) + start as f64;
+                let e = (pred - (start + i) as f64).abs().ceil() as u32;
+                max_error = max_error.max(e);
+            }
+            raw.push(RawSeg {
+                slope,
+                min_key: base,
+                max_key: keys[end - 1],
+                max_error,
+                start,
+                end,
+            });
+            start = end;
         }
         Self::pack(raw)
     }
@@ -166,7 +150,6 @@ impl PgmIndexU128 {
         let n = raw.len();
         let mut s = SegmentsSoA {
             slopes: Vec::with_capacity(n),
-            intercepts: Vec::with_capacity(n),
             min_keys: Vec::with_capacity(n),
             max_keys: Vec::with_capacity(n),
             max_errors_u8: Vec::with_capacity(n),
@@ -176,7 +159,6 @@ impl PgmIndexU128 {
         };
         for (i, seg) in raw.into_iter().enumerate() {
             s.slopes.push(seg.slope);
-            s.intercepts.push(seg.intercept);
             s.min_keys.push(seg.min_key);
             s.max_keys.push(seg.max_key);
             if seg.max_error <= 254 {
@@ -272,7 +254,6 @@ impl PgmIndexU128 {
         std::mem::size_of_val(&self.keys)
             + self.keys.len() * std::mem::size_of::<u128>()
             + s.slopes.len() * 8
-            + s.intercepts.len() * 8
             + s.min_keys.len() * 16
             + s.max_keys.len() * 16
             + s.max_errors_u8.len()
@@ -289,7 +270,6 @@ impl PgmIndexU128 {
 #[derive(Debug, Clone)]
 struct RawSeg {
     slope: f64,
-    intercept: f64,
     min_key: u128,
     max_key: u128,
     max_error: u32,
@@ -297,78 +277,13 @@ struct RawSeg {
     end: usize,
 }
 
-struct LinReg128 {
-    n: f64,
-    // Use f64; for u128 keys at full universe range (~3.4e38) we lose precision
-    // in slope, so we scale by 2^-64. For practical keys (UUIDs are random across
-    // the full u128 space) the predicted positions are still within ε of truth.
-    sum_x: f64,
-    sum_y: f64,
-    sum_xy: f64,
-    sum_xx: f64,
-}
-
-impl LinReg128 {
-    fn new() -> Self {
-        Self {
-            n: 0.0,
-            sum_x: 0.0,
-            sum_y: 0.0,
-            sum_xy: 0.0,
-            sum_xx: 0.0,
-        }
-    }
-
-    #[inline]
-    fn add(&mut self, key: u128, pos: usize) {
-        // Scale by 2^-64 so the f64 representation of huge u128 keys doesn't
-        // lose all precision in slope. We divide back at predict time.
-        let kf = (key as f64) * (2.0f64).powi(-64);
-        let pf = pos as f64;
-        self.n += 1.0;
-        self.sum_x += kf;
-        self.sum_y += pf;
-        self.sum_xy += kf * pf;
-        self.sum_xx += kf * kf;
-    }
-
-    fn slope_intercept(&self) -> Option<(f64, f64)> {
-        let denom = self.n * self.sum_xx - self.sum_x * self.sum_x;
-        if denom.abs() < 1e-20 {
-            return None;
-        }
-        let slope = (self.n * self.sum_xy - self.sum_x * self.sum_y) / denom;
-        let intercept = (self.sum_y - slope * self.sum_x) / self.n;
-        Some((slope, intercept))
-    }
-
-    fn max_error(&self, slope: f64, intercept: f64, keys: &[u128], start: usize) -> u32 {
-        let mut err = 0u32;
-        let end = start + self.n as usize;
-        for (offset, &k) in keys[start..end].iter().enumerate() {
-            let kf = (k as f64) * (2.0f64).powi(-64);
-            let pred = slope.mul_add(kf, intercept);
-            let actual = (start + offset) as f64;
-            // Rounded up: lookups truncate the prediction, so a truncated error would
-            // leave the true position outside the `[pos - err, pos + err]` window.
-            let e = (pred - actual).abs().ceil() as u32;
-            if e > err {
-                err = e;
-            }
-        }
-        err
-    }
-}
-
+/// Truncated position prediction; with the error rounded up at build time the
+/// `[pos - err, pos + err]` window of the callers always contains the key.
 #[inline]
 fn predict_pos_u128(seg: &SegmentsSoA, idx: usize, key: u128) -> usize {
-    let kf = (key as f64) * (2.0f64).powi(-64);
-    let p = seg.slopes[idx].mul_add(kf, seg.intercepts[idx]);
-    if p <= 0.0 {
-        0
-    } else {
-        p as usize
-    }
+    let dx = key.saturating_sub(seg.min_keys[idx]) as f64;
+    let p = seg.slopes[idx].mul_add(dx, seg.starts[idx] as f64);
+    if p <= 0.0 { 0 } else { p as usize }
 }
 
 #[inline]
