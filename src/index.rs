@@ -26,6 +26,10 @@ struct MphEngine {
     filter: Option<BlockBloom>,
     /// u16 fingerprint per slot — distinguishes real hits from MPH collisions
     /// of foreign keys. `None` in Lean mode (~16 bits/key saved).
+    ///
+    /// Invariant: `len() == slot_capacity() + 1`. The trailing element is padding
+    /// so the AVX2 gather (a 32-bit load at every `u16`) never reads past the
+    /// allocation for the last slot; it is neither serialized nor exported.
     fingerprints: Option<Box<[u16]>>,
 }
 
@@ -458,9 +462,12 @@ impl Index {
             .as_ref()
             .map(|fp| fp.as_ptr())
             .unwrap_or(std::ptr::null());
+        // The gather takes i32 lane indices; beyond 2^31 slots use the scalar tail.
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        let gather_ok = engine.backend.slot_capacity() <= i32::MAX as usize;
 
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-        while i + 8 <= n {
+        while gather_ok && i + 8 <= n {
             // Lookahead Bloom prefetch.
             #[cfg(target_arch = "x86_64")]
             if let Some(bf) = &engine.filter {
@@ -492,7 +499,8 @@ impl Index {
                 }
             }
             if !fp_base.is_null() {
-                // Single gather for fingerprint validation.
+                // Single gather for fingerprint validation. Dead lanes carry index 0;
+                // the last live slot's 32-bit load ends in the padding element.
                 let bitmask = unsafe { Self::gather_fp_check_x8(fp_base, indices, expected) };
                 for k in 0..8 {
                     if alive[k] && (bitmask & (1 << k)) != 0 {
@@ -880,7 +888,7 @@ impl Index {
         let fingerprints = engine
             .fingerprints
             .as_ref()
-            .map(|fps| fps.iter().copied().collect::<Vec<u16>>());
+            .map(|fps| fps[..fps.len() - 1].to_vec());
 
         let parts = mph
             .parts
@@ -927,7 +935,7 @@ impl Index {
         let fp_memory = engine
             .fingerprints
             .as_ref()
-            .map(|fp| fp.len() * std::mem::size_of::<u16>())
+            .map(|fp| (fp.len() - 1) * std::mem::size_of::<u16>())
             .unwrap_or(0);
         IndexStats {
             engine: "mph",
@@ -1182,7 +1190,7 @@ impl Index {
                     return false;
                 }
                 if let Some(fp) = &engine.fingerprints
-                    && fp.len() != cap
+                    && fp.len() != cap + 1
                 {
                     return false;
                 }
@@ -1334,8 +1342,12 @@ where
             Err(e) => return Err(e.into()),
         };
         let t3 = std::time::Instant::now();
-        // Outer u16 fingerprints were filled per part inside the MPH build.
-        let fingerprints = fp16.map(Vec::into_boxed_slice);
+        // Outer u16 fingerprints were filled per part inside the MPH build; one
+        // padding element keeps the batched gather inside the allocation.
+        let fingerprints = fp16.map(|mut v| {
+            v.push(0);
+            v.into_boxed_slice()
+        });
         if trace {
             eprintln!(
                 "[kira_kv_engine build] n={} parts={} | canonical {:?} | bloom+partition {:?} | mph+fingerprints {:?} | total {:?}",
@@ -1644,9 +1656,11 @@ fn write_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
+/// Writes the `slot_capacity()` real entries; the padding element is not stored.
 fn write_fingerprints(out: &mut Vec<u8>, fps: &[u16]) {
-    write_u64(out, fps.len() as u64);
-    for &fp in fps {
+    let real = &fps[..fps.len() - 1];
+    write_u64(out, real.len() as u64);
+    for &fp in real {
         write_u16(out, fp);
     }
 }
@@ -1656,9 +1670,10 @@ fn read_fingerprints(cursor: &mut Cursor<'_>) -> Result<Box<[u16]>, IndexError> 
     if len > (cursor.buf.len() - cursor.pos) / 2 {
         return Err(IndexError::CorruptData);
     }
-    let mut fps = Vec::with_capacity(len);
+    let mut fps = Vec::with_capacity(len + 1);
     for _ in 0..len {
         fps.push(cursor.read_u16().ok_or(IndexError::CorruptData)?);
     }
+    fps.push(0); // padding element, see `MphEngine::fingerprints`
     Ok(fps.into_boxed_slice())
 }
