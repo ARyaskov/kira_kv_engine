@@ -468,7 +468,7 @@ impl HybridBuilder {
             {
                 if self.enable_parallel {
                     use rayon::prelude::*;
-                    seg_ranges.par_iter().map(build_one).collect()
+                    crate::build_pool::run(true, || seg_ranges.par_iter().map(build_one).collect())
                 } else {
                     seg_ranges.iter().map(build_one).collect()
                 }

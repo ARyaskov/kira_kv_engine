@@ -9,9 +9,19 @@
 //! `pool()` we initialize a single hybrid-aware pool once and reuse it for
 //! every subsequent build/flush.
 //!
-//! On Intel 12th-gen+ hybrid hardware we pin the workers to the P-cores
-//! (returned by `Topology::detect`) so the build hot loop doesn't get
-//! scheduled onto the lower-IPC E-cores.
+//! Thread count: `available_parallelism()` on homogeneous hosts, the number of
+//! P-cores on hybrid ones (Intel 12th-gen+, Apple M-series). Override with
+//! `KIRA_BUILD_THREADS`.
+//!
+//! Pinning is *opt-in* except on hybrid CPUs, where the workers are pinned to the
+//! P-cores by default so the build hot loop does not land on the lower-IPC
+//! E-cores (measured 1.5-2× on Alder Lake). `KIRA_BUILD_PIN=0` disables that;
+//! `KIRA_BUILD_CORE_IDS=0,2,4` pins to an explicit list on any host. Pinning a
+//! library's threads on a homogeneous server is the application's decision (NUMA
+//! placement, SMT siblings, co-tenants), so it is never done by default there.
+//!
+//! Every parallel phase of every engine (`Index`, `PgmIndex`, `HybridIndex`,
+//! `BlockBloom`) runs on this pool, never on rayon's global pool.
 //!
 //! ## Radix sort
 //!
@@ -60,19 +70,7 @@ fn pick_thread_count() -> usize {
     if topo.is_hybrid && !topo.performance_cores.is_empty() {
         return topo.performance_cores.len();
     }
-    std::thread::available_parallelism()
-        .map(|n| {
-            let t = n.get();
-            #[cfg(target_arch = "x86_64")]
-            {
-                (t / 2).clamp(4, 16)
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            {
-                t.clamp(2, 8)
-            }
-        })
-        .unwrap_or(4)
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
 
 #[cfg(feature = "parallel")]
@@ -87,21 +85,27 @@ fn pick_pinning_cores() -> Option<Vec<usize>> {
             return Some(ids);
         }
     }
+    if std::env::var_os("KIRA_BUILD_PIN").is_some_and(|v| v == "0") {
+        return None;
+    }
     let topo = crate::hybrid_topology::Topology::detect();
     if topo.is_hybrid && !topo.performance_cores.is_empty() {
         return Some(topo.performance_cores);
     }
-    let cores = core_affinity::get_core_ids()?;
-    if cores.is_empty() {
-        return None;
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        let half = (cores.len() / 2).clamp(1, 16);
-        return Some(cores.iter().take(half).map(|c| c.id).collect());
-    }
-    #[allow(unreachable_code)]
-    Some(cores.iter().map(|c| c.id).collect())
+    None
+}
+
+/// Run `f` on the build pool when `parallel` is set (no-op wrapper otherwise, and
+/// when the `parallel` feature is off). Nested calls from inside the pool run
+/// inline.
+#[cfg(feature = "parallel")]
+pub fn run<T: Send>(parallel: bool, f: impl FnOnce() -> T + Send) -> T {
+    if parallel { pool().install(f) } else { f() }
+}
+
+#[cfg(not(feature = "parallel"))]
+pub fn run<T>(_parallel: bool, f: impl FnOnce() -> T) -> T {
+    f()
 }
 
 /// LSD radix sort for `(u64 key, u32 payload)` pairs, sorted by the u64 key.

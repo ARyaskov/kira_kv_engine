@@ -1246,18 +1246,8 @@ const MAX_PREHASH_ROUNDS: u32 = 4;
 /// Run `f` on the persistent build pool (P-core pinned on hybrid CPUs) so every rayon
 /// call inside the build lands there. Initialized once; avoids the ~150 ms Windows
 /// CreateThread cost of a per-build pool.
-#[cfg(feature = "parallel")]
 fn run_in_build_pool<T: Send>(parallel: bool, f: impl FnOnce() -> T + Send) -> T {
-    if parallel {
-        crate::build_pool::pool().install(f)
-    } else {
-        f()
-    }
-}
-
-#[cfg(not(feature = "parallel"))]
-fn run_in_build_pool<T>(_parallel: bool, f: impl FnOnce() -> T) -> T {
-    f()
+    crate::build_pool::run(parallel, f)
 }
 
 /// The build pipeline:

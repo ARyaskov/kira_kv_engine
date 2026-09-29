@@ -1486,7 +1486,7 @@ impl PgmBuilder {
             #[cfg(feature = "parallel")]
             {
                 if self.enable_parallel {
-                    PgmIndex::build_segments_parallel(&sorted, epsilon)
+                    crate::build_pool::run(true, || PgmIndex::build_segments_parallel(&sorted, epsilon))
                 } else {
                     PgmIndex::build_segments_greedy(&sorted, epsilon)
                 }
