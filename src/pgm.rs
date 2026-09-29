@@ -518,7 +518,7 @@ impl PgmIndex {
     }
 
     /// Serialize to a self-contained byte vector (uses the same v2 wire format
-    /// as [`write_to`]).
+    /// as `write_to`).
     #[allow(dead_code)]
     pub fn to_bytes(&self) -> Result<Vec<u8>, PgmError> {
         let mut out = Vec::with_capacity(self.stats().memory_usage);
@@ -526,7 +526,7 @@ impl PgmIndex {
         Ok(out)
     }
 
-    /// Deserialize from a byte slice produced by [`to_bytes`] / [`write_to`].
+    /// Deserialize from a byte slice produced by [`PgmIndex::to_bytes`] / `write_to`.
     #[allow(dead_code)]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, PgmError> {
         let mut pos = 0usize;

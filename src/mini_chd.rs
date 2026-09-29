@@ -2,7 +2,7 @@
 //!
 //! Designed for use inside `HybridIndex` per-segment storage where we have
 //! thousands of independent tiny MPHs to build. PtrHash25's machinery
-//! (prerotation learning, 2-level bucketing, compressed pilots, build arena)
+//! (prerotation learning, 2-level bucketing, eviction search, partitioning)
 //! adds 5–10 ms of fixed overhead per instance — too much when summed over
 //! 50K segments. MiniChd strips all that to the bare CHD essentials:
 //!
@@ -12,7 +12,7 @@
 //! - **Near-minimal**: slot space = `ceil(1.10 · N)` so the last-bucket
 //!   pilot search converges in 1–2 attempts.
 //!
-//! Memory: ~1.1 bytes/key (one u8 per bucket, gamma = ~0.5).
+//! Memory: ~0.55 bytes/key (one u8 per bucket, two slots per bucket).
 //! Build:  ~50–500 µs for 100–4000 keys (vs 2–10 ms for PtrHash25).
 //! Lookup: ~6 ns (one splitmix + one mod + one u8 read).
 

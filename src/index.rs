@@ -385,7 +385,7 @@ impl Index {
     /// Vec<u64>` scratch buffer (each `keys.len()` long) on every call. For
     /// hot paths that call this millions of times per second (e.g.
     /// per-read seeding in an aligner), prefer
-    /// [`lookup_batch_u64_simd_into`] which takes both buffers from the
+    /// [`Index::lookup_batch_u64_simd_into`] which takes both buffers from the
     /// caller and does zero allocation.
     pub fn lookup_batch_u64_simd(&self, keys: &[u64]) -> Vec<Option<usize>> {
         let mut out = vec![None; keys.len()];
@@ -394,7 +394,7 @@ impl Index {
         out
     }
 
-    /// Zero-allocation variant of [`lookup_batch_u64_simd`]. The caller
+    /// Zero-allocation variant of [`Index::lookup_batch_u64_simd`]. The caller
     /// supplies both `canon` (canonical-hash scratch) and `out` (the
     /// `Option<usize>` result slice). Both must already be sized to at
     /// least `keys.len()`; any extra slots are left untouched.
@@ -952,25 +952,21 @@ impl Index {
         }
     }
 
-    /// Save the index using a section-based on-disk layout. For indexes whose primary
-    /// backend is `PtrHashV2`, each component (pilots, fingerprints, bloom-words, meta)
-    /// lives in its own 64-byte-aligned section so a future `open_mmap_zero_copy` can
-    /// reference the data in place via mmap. For other backends we fall back to a
-    /// single `LegacyPayload` section that wraps `to_bytes()`.
+    /// Save the index inside the section container (`mmap_index`): one
+    /// `LegacyPayload` section holding exactly the bytes of [`Index::to_bytes`].
+    /// Kept for compatibility; [`Index::save`] streams the same payload without the
+    /// container and without a second in-memory copy.
     pub fn save_mmap<P: AsRef<std::path::Path>>(&self, path: P) -> Result<(), IndexError> {
         use crate::mmap_index::{MmapIndexWriter, SectionKind};
         let mut w = MmapIndexWriter::create(path, self.key_count as u64)?;
-        // We always write the legacy payload (so open_mmap continues to work).
-        // For PtrHashV2-backed Mph engines we ALSO add per-field sections, enabling
-        // zero-copy reads via Index::open_mmap_zero_copy in future versions.
         let bytes = self.to_bytes()?;
         w.add_section(SectionKind::LegacyPayload, bytes);
         Ok(w.finalize()?)
     }
 
-    /// Open a previously `save_mmap`'d index. Currently does a one-time read from the
-    /// LegacyPayload section into a `Vec<u8>`. A future zero-copy variant will keep
-    /// the mmap alive and return views into it without copying.
+    /// Open a previously `save_mmap`'d index. Reads the file, then parses the
+    /// `LegacyPayload` section exactly like [`Index::from_bytes`] (checksum and
+    /// validation included). Nothing is memory-mapped.
     pub fn open_mmap<P: AsRef<std::path::Path>>(path: P) -> Result<Self, IndexError> {
         use crate::mmap_index::{MmapIndex, SectionKind};
         let mmap = MmapIndex::open(path)?;

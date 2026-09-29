@@ -7,9 +7,9 @@
 //! while using 2.5× less memory. The other backends added complexity and confusion
 //! without any workload where they won.
 //!
-//! `BackendKind` is kept as a 1-variant enum to preserve the public API shape; future
-//! algorithms (e.g., true paper-style PtrHash 2025 with cuckoo relocation) would slot
-//! in as new variants here.
+//! `BackendKind` is kept as a 1-variant enum to preserve the public API shape; the
+//! dispatch layer is deprecated and goes away with it. PtrHash25 itself is now the
+//! paper-style algorithm (λ = 3 buckets, cuckoo-style eviction, tail remap).
 
 #![allow(dead_code)]
 

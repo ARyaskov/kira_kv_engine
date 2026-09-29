@@ -1,15 +1,14 @@
-//! Memory-mapped zero-copy serialized index.
+//! Section container for on-disk indexes.
 //!
-//! On-disk layout designed for direct `mmap` consumption: a header followed by
-//! aligned sections, each starting at a known offset. The reader exposes typed
-//! slice views into the mmap'd region without any allocation.
+//! Layout: a fixed header, a section table, then the sections, each starting at a
+//! 64-byte-aligned offset. The alignment is what a future zero-copy loader would
+//! need to reference pilots, Bloom words and fingerprints in place.
 //!
-//! Load time for a 100 MB index drops from ~500 ms (Vec<u8> allocation + memcpy +
-//! deserialize) to <10 ms (open + mmap + parse fixed-size header).
-//!
-//! Status: scaffolding + layout definitions. Wire-up to PtrHashV2 / BlockBloom is
-//! pending — needs a POD representation for each component that doesn't require
-//! validation at load time.
+//! **Today there is no memory mapping**: `MmapIndex::open` reads the whole file
+//! into a `Vec<u8>` (no `memmap2` dependency), and `Index::open_mmap` parses the
+//! `LegacyPayload` section exactly like `Index::from_bytes`. The names are kept
+//! for API compatibility; `Index::save`/`Index::load` are the plain, streaming
+//! alternative.
 
 #![allow(dead_code)]
 
@@ -26,15 +25,15 @@ pub const MAGIC: &[u8; 8] = b"KIRA_V01";
 pub enum SectionKind {
     /// Whole legacy payload (output of Index::to_bytes). Used by the v0 path.
     LegacyPayload = 0,
-    /// u8 pilots array of PtrHashV2. Aligned to 64 B.
+    /// u8 pilots array of PtrHash25. Aligned to 64 B.
     PtrHash25Pilots = 1,
     /// u64 words of BlockBloom. Aligned to 64 B.
     BlockBloomWords = 2,
-    /// u8 fingerprints of PtrHashV2.
+    /// u8 fingerprints of PtrHash25.
     PtrHash25Fingerprints = 3,
     /// u16 fingerprints of the outer MPH Engine.
     OuterFingerprints = 4,
-    /// PtrHashV2 metadata (n, num_buckets, salt, bloom_seed, prehash_seed, key_count) — POD.
+    /// PtrHash25 metadata (n, num_buckets, salt, bloom_seed, prehash_seed, key_count) — POD.
     PtrHash25Meta = 5,
 
     // ---- PGM zero-copy sections ----

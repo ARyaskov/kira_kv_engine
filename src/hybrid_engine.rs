@@ -44,9 +44,9 @@
 //!
 //! ## Trade-offs
 //!
-//! - **Point lookup adds ~10–20 ns** vs vanilla PtrHash25 because of the
-//!   extra PGM segment-find step. So a pure-random-access workload is still
-//!   better served by `Engine::Mph`.
+//! - **Point lookup adds the PGM segment-find step** (a binary search over the
+//!   segment table) on top of the per-segment structure, so a pure point-lookup
+//!   workload is still better served by `Index`.
 //! - Segment-storage variance: workloads with heavy hash clustering produce
 //!   uneven segments; tune `target_segment_size` to balance.
 //!
@@ -102,7 +102,7 @@ enum SegmentStorage {
         positions: Vec<u32>,
     },
     /// Mid-sized segment (64–4096 keys) — MiniChd (simple single-level CHD,
-    /// 1.1 B/key, ~5× faster build than full PtrHash25 for small N).
+    /// ~0.6 B/key of pilots, cheap to build for small N).
     MiniChd {
         chd: crate::mini_chd::MiniChd,
         positions: Vec<u32>,

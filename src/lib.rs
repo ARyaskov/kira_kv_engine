@@ -1,11 +1,18 @@
-//! kira_kv_engine — PtrHash-style MPH + PGM index.
+//! kira_kv_engine — key→id index toolkit: a minimal perfect hash (`Index`, PtrHash
+//! 2025 with eviction), an LSM of such hashes (`DynamicIndex`), a PGM-bucketed
+//! byte-key engine (`HybridIndex`) and learned indexes with range queries
+//! (`PgmIndex` for u64, `PgmIndexU128` for 16-byte keys).
 //!
-//! - Build once on a set of **unique** keys (bytes/str).
+//! - Build once on a set of **unique** keys (bytes/str); duplicates are an error.
 //! - O(1) lookups: key → position in `[0..Index::slot_capacity())`, which equals
 //!   `[0..len())` for indexes built by this version (minimal perfect hashing);
 //!   indexes written by 0.6 keep their 1.1× padded range. Size parallel side
 //!   arrays to `slot_capacity()`.
-//! - Empty input is supported (0.6.1+): produces a no-op instance.
+//! - Empty input is accepted by every engine and yields an always-miss instance.
+//! - Every engine serializes into a checksummed, validated, platform-independent
+//!   byte form; hashing is bit-identical on x86_64, aarch64 and other targets.
+//!
+//! See `README.md` for choosing an engine and `API.md` for the full surface.
 
 mod aes_hash;
 mod block_bloom;
