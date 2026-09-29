@@ -370,7 +370,7 @@ fn bench_hashmap_baseline(initial: &[Vec<u8>], extra: &[Vec<u8>], lookup_keys: &
     // Memory estimate: HashMap is `(K, V)` pairs + ~25% bucket overhead.
     let entries = map.len();
     let avg_key_len: usize =
-        map.iter().take(1000).map(|(k, _)| k.capacity()).sum::<usize>() / 1000.max(1);
+        map.iter().take(1000).map(|(k, _)| k.capacity()).sum::<usize>() / 1000;
     let est_mem = entries * (avg_key_len + std::mem::size_of::<u32>() + 8 /* pointer */)
         + map.capacity() * std::mem::size_of::<(Vec<u8>, u32)>();
     println!(

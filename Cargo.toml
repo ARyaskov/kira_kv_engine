@@ -34,6 +34,14 @@ core_affinity = { version = "0.8", optional = true }
 wyhash = "0.6"
 hashbrown = "0.16"
 
+[lints.clippy]
+# Index loops over parallel arrays are clearer than zipped iterators here.
+needless_range_loop = "allow"
+# Configs are built by mutating Default; the struct-literal form would spell out
+# every deprecated field.
+field_reassign_with_default = "allow"
+type_complexity = "allow"
+
 [dev-dependencies]
 tempfile = "3"
 rand = "0.8.5"

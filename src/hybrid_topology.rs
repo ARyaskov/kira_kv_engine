@@ -12,13 +12,10 @@
 //! When the topology is homogeneous (no efficiency classes / equal frequencies) we
 //! return all physical cores, deduplicated across SMT siblings.
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Topology {
     /// OS logical core IDs that belong to P-cores. Empty if detection failed.
     pub performance_cores: Vec<usize>,
-    /// OS logical core IDs that belong to E-cores. Empty if the host is homogeneous.
-    pub efficiency_cores: Vec<usize>,
     /// Whether the host is heterogeneous (hybrid).
     pub is_hybrid: bool,
 }
@@ -46,27 +43,11 @@ impl Topology {
             .unwrap_or(1);
         Self {
             performance_cores: (0..n).collect(),
-            efficiency_cores: Vec::new(),
             is_hybrid: false,
         }
     }
 }
 
-/// Best-effort: returns the build-side preferred core list — P-cores if hybrid,
-/// otherwise the first N distinct physical cores.
-#[allow(dead_code)]
-pub fn preferred_build_cores() -> Vec<usize> {
-    let t = Topology::detect();
-    if t.performance_cores.is_empty() {
-        return (0..std::thread::available_parallelism()
-            .map(|v| v.get())
-            .unwrap_or(1))
-            .collect();
-    }
-    t.performance_cores
-}
-
-/// Role-based core split for build pipeline.
 // ----- Windows
 #[cfg(target_os = "windows")]
 mod windows {
@@ -172,27 +153,18 @@ mod windows {
             let is_hybrid = max_class != min_class;
 
             let mut perf: Vec<usize> = Vec::new();
-            let mut eff: Vec<usize> = Vec::new();
             for (cls, lids) in &cores {
-                if let Some(&first) = lids.first() {
-                    // One thread per physical core (first SMT sibling) to avoid
-                    // same-core contention.
-                    if *cls == max_class {
-                        perf.push(first);
-                    } else if is_hybrid && *cls == min_class {
-                        eff.push(first);
-                    }
+                // One thread per physical core (first SMT sibling) to avoid
+                // same-core contention.
+                if let Some(&first) = lids.first()
+                    && *cls == max_class
+                {
+                    perf.push(first);
                 }
             }
             perf.sort_unstable();
             perf.dedup();
-            eff.sort_unstable();
-            eff.dedup();
-            Some(Topology {
-                performance_cores: perf,
-                efficiency_cores: eff,
-                is_hybrid,
-            })
+            Some(Topology { performance_cores: perf, is_hybrid })
         }
     }
 }
@@ -250,24 +222,15 @@ mod linux {
         let min = entries.iter().map(|(_, w, _)| *w).min().unwrap_or(0);
         let is_hybrid = max != min;
 
-        // Per-tier first-SMT-sibling per physical core.
+        // First SMT sibling per physical core of the top tier.
         let mut perf_by_core: BTreeMap<usize, usize> = BTreeMap::new();
-        let mut eff_by_core: BTreeMap<usize, usize> = BTreeMap::new();
         for &(cpu_id, w, core_id) in &entries {
             if w == max {
                 perf_by_core.entry(core_id).or_insert(cpu_id);
-            } else if is_hybrid && w == min {
-                eff_by_core.entry(core_id).or_insert(cpu_id);
             }
         }
         let mut perf: Vec<usize> = perf_by_core.into_values().collect();
         perf.sort_unstable();
-        let mut eff: Vec<usize> = eff_by_core.into_values().collect();
-        eff.sort_unstable();
-        Some(Topology {
-            performance_cores: perf,
-            efficiency_cores: eff,
-            is_hybrid,
-        })
+        Some(Topology { performance_cores: perf, is_hybrid })
     }
 }

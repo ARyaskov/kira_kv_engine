@@ -61,11 +61,10 @@ pub fn pool() -> &'static rayon::ThreadPool {
 
 #[cfg(feature = "parallel")]
 fn pick_thread_count() -> usize {
-    if let Some(v) = std::env::var_os("KIRA_BUILD_THREADS") {
-        if let Ok(parsed) = v.to_string_lossy().parse::<usize>() {
+    if let Some(v) = std::env::var_os("KIRA_BUILD_THREADS")
+        && let Ok(parsed) = v.to_string_lossy().parse::<usize>() {
             return parsed.max(1);
         }
-    }
     let topo = crate::hybrid_topology::Topology::detect();
     if topo.is_hybrid && !topo.performance_cores.is_empty() {
         return topo.performance_cores.len();

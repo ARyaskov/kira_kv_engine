@@ -483,8 +483,8 @@ impl Index {
                 Some(bf) => bf.contains_hash(hash),
                 None => true,
             };
-            if bloom_ok {
-                if let Some(idx) = engine.backend.lookup(hash) {
+            if bloom_ok
+                && let Some(idx) = engine.backend.lookup(hash) {
                     let idx = idx as usize;
                     let ok = match &engine.fingerprints {
                         Some(fps) => {
@@ -497,7 +497,6 @@ impl Index {
                         out[i] = Some(idx);
                     }
                 }
-            }
             i += 1;
         }
     }
@@ -784,12 +783,11 @@ impl Index {
                     }
 
                     // Wave B: optional Bloom check.
-                    if let Some(bf) = filter {
-                        if !bf.contains_hash(hash) {
+                    if let Some(bf) = filter
+                        && !bf.contains_hash(hash) {
                             out.push(None);
                             continue;
                         }
-                    }
                     let idx_opt = engine.backend.lookup(hash);
 
                     // Wave C: prefetch fingerprint (only if fingerprints present).
@@ -1221,11 +1219,10 @@ impl Index {
     fn lookup_mph(&self, engine: &MphEngine, key: &[u8]) -> Result<usize, IndexError> {
         let canonical = canonical_hash_key(key, engine.prehash_seed);
         // Optional Bloom prefilter (skipped in lean_mph mode).
-        if let Some(bf) = &engine.filter {
-            if !bf.contains_hash(canonical) {
+        if let Some(bf) = &engine.filter
+            && !bf.contains_hash(canonical) {
                 return Err(IndexError::KeyNotFound);
             }
-        }
         let idx = engine
             .backend
             .lookup(canonical)

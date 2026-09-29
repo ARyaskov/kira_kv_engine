@@ -457,7 +457,7 @@ impl Default for BuildConfig {
             alpha: DEFAULT_ALPHA,
             max_rehash: 16,
             with_fingerprints: true,
-            seed: 0xC0FF_EE00_D15E_A5E,
+            seed: 0x0C0F_FEE0_0D15_EA5E,
             use_aes_hash: false,
         }
     }

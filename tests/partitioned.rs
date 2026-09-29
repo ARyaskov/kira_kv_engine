@@ -151,7 +151,7 @@ fn duplicate_key_detected_multi_part() {
     let n = PART_TARGET_KEYS * 2;
     let mut keys = keys_u64(n, 0xE5);
     keys[n - 1] = keys[17];
-    let err = Builder::new().build(&keys).err().expect("duplicate must fail");
+    let err = Builder::new().build(&keys).expect_err("duplicate must fail");
     assert!(matches!(err, PtrHash25Error::DuplicateKey), "got {err:?}");
 }
 
@@ -159,7 +159,7 @@ fn duplicate_key_detected_multi_part() {
 fn duplicate_key_detected_single_part() {
     let mut keys = keys_u64(1000, 0xF6);
     keys[999] = keys[3];
-    let err = Builder::new().build(&keys).err().expect("duplicate must fail");
+    let err = Builder::new().build(&keys).expect_err("duplicate must fail");
     assert!(matches!(err, PtrHash25Error::DuplicateKey), "got {err:?}");
 }
 

@@ -259,7 +259,7 @@ pub struct HybridBuilder {
 impl HybridBuilder {
     pub fn new() -> Self {
         Self {
-            seed: 0xC0FF_EE00_D15E_A5E,
+            seed: 0x0C0F_FEE0_0D15_EA5E,
             pgm_epsilon: 2048,
             linear_threshold: 64,
             chd_threshold: 4096,
@@ -703,11 +703,10 @@ impl HybridIndex {
     /// upstream (e.g. SIMD-hashing many keys at once).
     #[inline]
     pub fn lookup_hash(&self, hash: u64) -> Option<u32> {
-        if let Some(bf) = &self.bloom {
-            if !bf.contains_u64(hash) {
+        if let Some(bf) = &self.bloom
+            && !bf.contains_u64(hash) {
                 return None;
             }
-        }
         let seg_id = self.pgm.segment_for_key(hash)?;
         let seg = &self.segments[seg_id];
         seg.lookup(hash)
@@ -764,11 +763,10 @@ impl HybridIndex {
 
             let hash = hashes[i];
             // Bloom check (if present).
-            if let Some(bf) = &self.bloom {
-                if !bf.contains_u64(hash) {
+            if let Some(bf) = &self.bloom
+                && !bf.contains_u64(hash) {
                     continue;
                 }
-            }
             // Segment find + lookup.
             if let Some(seg_id) = self.pgm.segment_for_key(hash) {
                 out[i] = self.segments[seg_id].lookup(hash);

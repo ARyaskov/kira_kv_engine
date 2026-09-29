@@ -15,7 +15,7 @@ use std::thread;
 use std::time::Instant;
 
 /// Default key count; override with `KIRA_BENCH_N=<n>`.
-const N_KEYS_DEFAULT: usize = 10_000_0000;
+const N_KEYS_DEFAULT: usize = 100_000_000;
 fn n_keys() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -33,7 +33,7 @@ const MISSING_POOL_FRACTION: f64 = 0.01;
 // startup is ~30-100 μs vs ~5-10 μs on macOS). 1M ops × 20 threads = 50k per thread ≈ 1.5 ms
 // of work per thread — enough to drown out spawn cost.
 /// Default lookup count per measurement; override with `KIRA_BENCH_OPS=<n>`.
-const QUERY_OPS_DEFAULT: usize = 1_000_0000;
+const QUERY_OPS_DEFAULT: usize = 10_000_000;
 fn query_ops() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -275,6 +275,7 @@ fn print_table_header() {
     println!("{}", "-".repeat(146));
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_row(
     structure: &str,
     workload: &str,
@@ -408,10 +409,8 @@ fn batch_lookup(index: &kira_kv_engine::index::Index, refs: &[&[u8]]) -> u64 {
     // Use pipelined path everywhere so single-thread and parallel paths share the
     // same prefetch wave optimization. lookup_batch falls back internally for tiny
     // slices.
-    for opt in index.lookup_batch_pipelined(refs) {
-        if let Some(idx) = opt {
-            acc ^= idx as u64;
-        }
+    for idx in index.lookup_batch_pipelined(refs).into_iter().flatten() {
+        acc ^= idx as u64;
     }
     acc
 }
@@ -421,14 +420,12 @@ fn parallel_batch_lookup(index: &kira_kv_engine::index::Index, refs: &[&[u8]]) -
     // Avoids the ~30-100 μs Windows CreateThread cost per measurement.
     use rayon::prelude::*;
     let threads = thread_count();
-    let per = (refs.len() + threads - 1) / threads;
+    let per = refs.len().div_ceil(threads);
     refs.par_chunks(per.max(1))
         .map(|slice| {
             let mut local = 0u64;
-            for opt in index.lookup_batch_pipelined(slice) {
-                if let Some(idx) = opt {
-                    local ^= idx as u64;
-                }
+            for idx in index.lookup_batch_pipelined(slice).into_iter().flatten() {
+                local ^= idx as u64;
             }
             local
         })
@@ -636,7 +633,7 @@ fn gen_numeric_keys(n: usize, seed: u64) -> Vec<u64> {
         for _ in 0..n_uniform {
             keys.push(rng.next_u64());
         }
-        let zipf_domain = (n_zipf / 4).max(5_000).min(50_000) as u64;
+        let zipf_domain = (n_zipf / 4).clamp(5_000, 50_000) as u64;
         let zipf_seed = rng.next_u64();
         for _ in 0..n_zipf {
             let rank = sample_zipf_fast(&mut rng, zipf_domain, 1.07);
@@ -765,7 +762,7 @@ fn gen_random_strings_parallel(
     max_len: usize,
 ) -> Vec<Vec<u8>> {
     let threads = thread_count();
-    let per = (n + threads - 1) / threads;
+    let per = n.div_ceil(threads);
     let mut handles = Vec::new();
     for t in 0..threads {
         let count = per.min(n.saturating_sub(t * per));
@@ -820,7 +817,7 @@ fn gen_shared_prefix_strings_parallel(
 
     let shared_count = rng.gen_range((n as f64 * 0.60) as usize..=(n as f64 * 0.80) as usize);
     let threads = thread_count();
-    let per = (shared_count + threads - 1) / threads;
+    let per = shared_count.div_ceil(threads);
     let mut handles = Vec::new();
     for t in 0..threads {
         let count = per.min(shared_count.saturating_sub(t * per));
@@ -958,7 +955,7 @@ fn gen_numeric_keys_missing(
         }
     }
 
-    let zipf_domain = (n_zipf / 4).max(5_000).min(50_000) as u64;
+    let zipf_domain = (n_zipf / 4).clamp(5_000, 50_000) as u64;
     let zipf_seed = local_rng.next_u64();
     count = 0;
     while count < n_zipf {
@@ -1053,7 +1050,7 @@ fn splitmix64(mut x: u64) -> u64 {
 
 fn gen_numeric_uniform_parallel(n: usize, seed: u64) -> Vec<u64> {
     let threads = thread_count();
-    let per = (n + threads - 1) / threads;
+    let per = n.div_ceil(threads);
     let mut handles = Vec::new();
     for t in 0..threads {
         let count = per.min(n.saturating_sub(t * per));
@@ -1082,9 +1079,9 @@ fn gen_numeric_uniform_parallel(n: usize, seed: u64) -> Vec<u64> {
 
 fn gen_numeric_zipf_parallel(n: usize, seed: u64) -> Vec<u64> {
     let threads = thread_count();
-    let per = (n + threads - 1) / threads;
+    let per = n.div_ceil(threads);
     let mut handles = Vec::new();
-    let zipf_domain = (n / 4).max(5_000).min(50_000) as u64;
+    let zipf_domain = (n / 4).clamp(5_000, 50_000) as u64;
     for t in 0..threads {
         let count = per.min(n.saturating_sub(t * per));
         if count == 0 {
@@ -1114,7 +1111,7 @@ fn gen_numeric_zipf_parallel(n: usize, seed: u64) -> Vec<u64> {
 
 fn gen_numeric_cluster_parallel(n: usize, rng: &mut StdRng) -> Vec<u64> {
     let threads = thread_count();
-    let per = (n + threads - 1) / threads;
+    let per = n.div_ceil(threads);
     let cluster_count = (n / 32_768).max(4);
     let clusters = build_clusters(cluster_count, rng);
     let mut handles = Vec::new();

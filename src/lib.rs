@@ -16,7 +16,6 @@
 
 mod aes_hash;
 mod block_bloom;
-mod build_hasher;
 mod build_pool;
 mod canonical_hash;
 mod checksum;
@@ -27,6 +26,7 @@ mod hot_tier;
 mod hot_tier_dynamic;
 mod hugepage;
 mod hybrid_engine;
+#[cfg(feature = "parallel")]
 mod hybrid_topology;
 pub mod index;
 mod mini_chd;

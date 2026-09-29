@@ -37,6 +37,8 @@ const PGM_FORMAT_V2: u8 = 0x02;
 /// v3 adds the fitted key count separately from the stored keys, so a
 /// locator-only index (keys released, see `take_keys`) round-trips.
 const PGM_FORMAT_V3: u8 = 0x03;
+/// v4 drops the per-segment 64-bit filters (never consulted on any lookup path).
+const PGM_FORMAT_V4: u8 = 0x04;
 
 /// Segment built in-memory (used during PGM construction only).
 /// Working-storage segment used during greedy-PLA construction. f64 is
@@ -67,7 +69,6 @@ pub(crate) struct SegmentsSoA {
     pub(crate) max_keys: Vec<u64>,
     pub(crate) max_errors_u8: Vec<u8>,     // 0xFF sentinel = overflow
     pub(crate) overflow_errors: Vec<(u32, u32)>, // (segment_idx, real_error), sorted
-    pub(crate) filters: Vec<u64>,
     pub(crate) starts: Vec<u32>,
     pub(crate) ends: Vec<u32>,
 }
@@ -138,24 +139,6 @@ impl PgmIndex {
     /// PLA, no Bloom filter, sequential).
     pub fn build(keys: Vec<u64>, epsilon: u32) -> Result<Self, PgmError> {
         PgmBuilder::new().with_epsilon(epsilon).build(keys)
-    }
-
-    /// Build via builder — exposed mostly so the `mmap_index` zero-copy path
-    /// can reconstruct the same shape from raw byte slices.
-    pub(crate) fn from_parts(
-        keys: Vec<u64>,
-        segments: SegmentsSoA,
-        epsilon: u32,
-        bloom: Option<BlockBloom>,
-    ) -> Self {
-        Self {
-            key_count: keys.len(),
-            keys,
-            keys_ef: None,
-            segments,
-            epsilon,
-            bloom,
-        }
     }
 
     /// Give the sorted key array back to the caller and switch this index into
@@ -349,11 +332,10 @@ impl PgmIndex {
     /// Find position of key with O(1) average complexity.
     pub fn index(&self, key: u64) -> Result<usize, PgmError> {
         // optional Block-Bloom short-circuit for negative lookups.
-        if let Some(bf) = &self.bloom {
-            if !bf.contains_u64(key) {
+        if let Some(bf) = &self.bloom
+            && !bf.contains_u64(key) {
                 return Err(PgmError::KeyNotFound);
             }
-        }
         if !self.has_keys() {
             return Err(PgmError::KeyNotFound);
         }
@@ -418,19 +400,6 @@ impl PgmIndex {
         let start_pos = self.lower_bound(min_key);
         let end_pos = self.upper_bound(max_key);
         start_pos..end_pos.max(start_pos)
-    }
-
-    pub(crate) fn range_guard(&self, key: u64) -> bool {
-        if self.keys_count() == 0 {
-            return false;
-        }
-        let idx = find_segment_branchless(&self.segments.max_keys, key);
-        if idx >= self.segments.max_keys.len() {
-            return false;
-        }
-        let min_key = self.segments.min_keys[idx];
-        let max_key = self.segments.max_keys[idx];
-        key >= min_key && key <= max_key
     }
 
     /// Find first position where key >= target.
@@ -502,7 +471,6 @@ impl PgmIndex {
             + self.segments.max_keys.len() * std::mem::size_of::<u64>()
             + self.segments.max_errors_u8.len() * std::mem::size_of::<u8>()
             + self.segments.overflow_errors.len() * std::mem::size_of::<(u32, u32)>()
-            + self.segments.filters.len() * std::mem::size_of::<u64>()
             + self.segments.starts.len() * std::mem::size_of::<u32>()
             + self.segments.ends.len() * std::mem::size_of::<u32>()
             + bloom_mem;
@@ -519,7 +487,6 @@ impl PgmIndex {
 
     /// Serialize to a self-contained byte vector (uses the same v2 wire format
     /// as `write_to`).
-    #[allow(dead_code)]
     pub fn to_bytes(&self) -> Result<Vec<u8>, PgmError> {
         let mut out = Vec::with_capacity(self.stats().memory_usage);
         self.write_to(&mut out);
@@ -527,22 +494,23 @@ impl PgmIndex {
     }
 
     /// Deserialize from a byte slice produced by [`PgmIndex::to_bytes`] / `write_to`.
-    #[allow(dead_code)]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, PgmError> {
         let mut pos = 0usize;
         Self::read_from(bytes, &mut pos)
     }
 
-    /// Wire format v3:
-    /// [u8 ver=3] [u32 epsilon] [u64 key_count] [u64 stored_keys] [keys×u64]
+    /// Wire format v4:
+    /// [u8 ver=4] [u32 epsilon] [u64 key_count] [u64 stored_keys] [keys×u64]
     /// [u64 seg_len]
     /// segments contiguous SoA: slopes[u32 f32][intercepts][min_keys u64][max_keys u64]
     ///                          [max_errors u8] [u64 overflow_count]
     ///                          [overflow entries (u32 seg_idx, u32 err)×N]
-    ///                          [filters u64][starts u32][ends u32]
+    ///                          [starts u32][ends u32]
     /// [u8 has_bloom] [bloom payload if present]
+    /// v2 (single key count) and v3 (with a `[filters u64]` array before `starts`)
+    /// are still read.
     pub(crate) fn write_to(&self, out: &mut Vec<u8>) {
-        out.push(PGM_FORMAT_V3);
+        out.push(PGM_FORMAT_V4);
         write_u32(out, self.epsilon);
         write_u64(out, self.key_count as u64);
         // Plain or EF — emit the materialized u64 stream either way. EF reload
@@ -571,7 +539,6 @@ impl PgmIndex {
             write_u32(out, si);
             write_u32(out, er);
         }
-        crate::wire::extend_le(out, &s.filters);
         crate::wire::extend_le(out, &s.starts);
         crate::wire::extend_le(out, &s.ends);
         match &self.bloom {
@@ -591,14 +558,14 @@ impl PgmIndex {
             pos: *pos,
         };
         let ver = cur.read_u8().ok_or(PgmError::CorruptData)?;
-        if ver != PGM_FORMAT_V2 && ver != PGM_FORMAT_V3 {
+        if !(PGM_FORMAT_V2..=PGM_FORMAT_V4).contains(&ver) {
             return Err(PgmError::CorruptData);
         }
         let epsilon = cur.read_u32().ok_or(PgmError::CorruptData)?;
         // Every count is capped by the bytes actually present before allocating.
         let remaining = |cur: &Cursor<'_>| cur.buf.len() - cur.pos;
         let key_count = cur.read_u64().ok_or(PgmError::CorruptData)? as usize;
-        let stored = if ver == PGM_FORMAT_V3 {
+        let stored = if ver >= PGM_FORMAT_V3 {
             cur.read_u64().ok_or(PgmError::CorruptData)? as usize
         } else {
             key_count
@@ -631,7 +598,10 @@ impl PgmIndex {
             let er = cur.read_u32().ok_or(PgmError::CorruptData)?;
             overflow_errors.push((si, er));
         }
-        let filters: Vec<u64> = cur.read_le(seg_len)?;
+        if ver < PGM_FORMAT_V4 {
+            // Skip the legacy per-segment filter words.
+            let _: Vec<u64> = cur.read_le(seg_len)?;
+        }
         let starts: Vec<u32> = cur.read_le(seg_len)?;
         let ends: Vec<u32> = cur.read_le(seg_len)?;
         let has_bloom = cur.read_u8().ok_or(PgmError::CorruptData)?;
@@ -655,7 +625,6 @@ impl PgmIndex {
                 max_keys,
                 max_errors_u8,
                 overflow_errors,
-                filters,
                 starts,
                 ends,
             },
@@ -678,7 +647,6 @@ impl PgmIndex {
             || s.intercepts.len() != m
             || s.min_keys.len() != m
             || s.max_errors_u8.len() != m
-            || s.filters.len() != m
             || s.starts.len() != m
             || s.ends.len() != m
         {
@@ -735,7 +703,6 @@ impl PgmIndex {
         let mut max_keys = Vec::with_capacity(n);
         let mut max_errors_u8 = Vec::with_capacity(n);
         let mut overflow_errors: Vec<(u32, u32)> = Vec::new();
-        let mut filters = Vec::with_capacity(n);
         let mut starts = Vec::with_capacity(n);
         let mut ends = Vec::with_capacity(n);
 
@@ -767,13 +734,6 @@ impl PgmIndex {
             }
             starts.push(seg.start as u32);
             ends.push(seg.end as u32);
-            let mut filter = 0u64;
-            let mut i = seg.start;
-            while i < seg.end {
-                filter |= filter_bit(keys[i]);
-                i += 1;
-            }
-            filters.push(filter);
         }
         // overflow_errors is built in segment-index order; binary_search_by_key works.
         SegmentsSoA {
@@ -783,23 +743,9 @@ impl PgmIndex {
             max_keys,
             max_errors_u8,
             overflow_errors,
-            filters,
             starts,
             ends,
         }
-    }
-
-    pub(crate) fn filter_allows(&self, key: u64) -> bool {
-        let idx = find_segment_branchless(&self.segments.max_keys, key);
-        if idx >= self.segments.max_keys.len() {
-            return false;
-        }
-        let min_key = self.segments.min_keys[idx];
-        let max_key = self.segments.max_keys[idx];
-        if key < min_key || key > max_key {
-            return false;
-        }
-        (self.segments.filters[idx] & filter_bit(key)) != 0
     }
 
     pub(crate) fn segment_for_key(&self, key: u64) -> Option<usize> {
@@ -833,22 +779,6 @@ impl PgmIndex {
         self.segments.max_keys.len()
     }
 
-    pub(crate) fn keys_len(&self) -> usize {
-        self.keys_count()
-    }
-
-    /// Plain-storage slice. Empty when the index has been compacted via
-    /// [`compact_keys`] (EF-backed). Callers needing random key access in that
-    /// state should use [`key_at_public`] or [`keys_iter`].
-    pub(crate) fn keys(&self) -> &[u64] {
-        &self.keys
-    }
-
-    /// Random access to the i-th key — O(1) for plain, O(1) amortized for EF.
-    pub(crate) fn key_at_public(&self, i: usize) -> u64 {
-        self.key_at(i)
-    }
-
     /// Iterate keys in order. Works whether plain or EF-backed.
     pub(crate) fn keys_iter(&self) -> KeysIter<'_> {
         KeysIter {
@@ -856,32 +786,6 @@ impl PgmIndex {
             i: 0,
             n: self.keys_count(),
         }
-    }
-
-    pub(crate) fn segment_density_order(&self, hot_fraction: f64) -> Vec<usize> {
-        let n = self.keys.len().max(1);
-        let target = ((n as f64) * hot_fraction).ceil() as usize;
-        let mut ids: Vec<usize> = (0..self.segments.max_keys.len()).collect();
-        ids.sort_by(|&a, &b| {
-            let a_len = (self.segments.ends[a] - self.segments.starts[a]) as u128;
-            let b_len = (self.segments.ends[b] - self.segments.starts[b]) as u128;
-            let a_span = (self.segments.max_keys[a] - self.segments.min_keys[a] + 1) as u128;
-            let b_span = (self.segments.max_keys[b] - self.segments.min_keys[b] + 1) as u128;
-            let left = a_len * b_span;
-            let right = b_len * a_span;
-            right.cmp(&left).then_with(|| a.cmp(&b))
-        });
-        let mut picked = Vec::new();
-        let mut count = 0usize;
-        for id in ids {
-            let len = (self.segments.ends[id] - self.segments.starts[id]) as usize;
-            picked.push(id);
-            count += len;
-            if count >= target {
-                break;
-            }
-        }
-        picked
     }
 
     /// Whether this index has the optional Bloom filter for negative-lookup fast path.
@@ -903,7 +807,6 @@ impl PgmIndex {
         writer.add_section(SectionKind::PgmMaxErrors, s.max_errors_u8.clone());
         let overflow_bytes = bytes_of_u32_pairs(&s.overflow_errors);
         writer.add_section(SectionKind::PgmOverflowErrors, overflow_bytes);
-        writer.add_section(SectionKind::PgmFilters, bytes_of_u64(&s.filters));
         writer.add_section(SectionKind::PgmStarts, bytes_of_u32(&s.starts));
         writer.add_section(SectionKind::PgmEnds, bytes_of_u32(&s.ends));
         // PgmMeta: [u32 epsilon][u8 has_bloom][padding..]
@@ -939,7 +842,6 @@ impl PgmIndex {
         let max_errors_u8 = mmap.section(header, SectionKind::PgmMaxErrors)?.to_vec();
         let overflow_errors =
             u32_pairs_from_section(mmap.section(header, SectionKind::PgmOverflowErrors)?);
-        let filters = u64_vec_from_section(mmap.section(header, SectionKind::PgmFilters)?);
         let starts = u32_vec_from_section(mmap.section(header, SectionKind::PgmStarts)?);
         let ends = u32_vec_from_section(mmap.section(header, SectionKind::PgmEnds)?);
         let meta = mmap.section(header, SectionKind::PgmMeta)?;
@@ -966,7 +868,6 @@ impl PgmIndex {
                 max_keys,
                 max_errors_u8,
                 overflow_errors,
-                filters,
                 starts,
                 ends,
             },
@@ -1051,7 +952,7 @@ fn f32_vec_from_section(bytes: &[u8]) -> Vec<f32> {
 fn u32_pairs_from_section(bytes: &[u8]) -> Vec<(u32, u32)> {
     let n = bytes.len() / 8;
     let mut out = Vec::with_capacity(n);
-    for chunk in bytes.chunks_exact(8) {
+    for chunk in bytes.as_chunks::<8>().0 {
         let mut a = [0u8; 4];
         let mut b = [0u8; 4];
         a.copy_from_slice(&chunk[..4]);
@@ -1083,21 +984,6 @@ fn predict_pos(segments: &SegmentsSoA, idx: usize, key: u64) -> usize {
     } else {
         prediction as usize
     }
-}
-
-#[inline]
-fn filter_bit(key: u64) -> u64 {
-    let h = splitmix64(key);
-    1u64 << (h & 63)
-}
-
-#[inline]
-fn splitmix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = x;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
 }
 
 /// Largest scan window searched linearly (SIMD); longer windows are bisected.
@@ -1404,7 +1290,6 @@ fn write_u64(out: &mut Vec<u8>, v: u64) {
 // --------------------------------------------------------------------------------------
 
 /// Statistics about PGM index.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct PgmStats {
     pub total_keys: usize,
@@ -1415,7 +1300,6 @@ pub struct PgmStats {
     pub epsilon: u32,
 }
 
-#[allow(dead_code)]
 impl PgmStats {
     pub fn print_summary(&self) {
         println!("PGM Index Statistics:");

@@ -10,8 +10,6 @@
 //! for API compatibility; `Index::save`/`Index::load` are the plain, streaming
 //! alternative.
 
-#![allow(dead_code)]
-
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
@@ -22,6 +20,7 @@ pub const MAGIC: &[u8; 8] = b"KIRA_V01";
 /// Section identifiers. Each section starts at a 64-byte-aligned offset within the file.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // wire-format ids; not all are produced by this version
 pub enum SectionKind {
     /// Whole legacy payload (output of Index::to_bytes). Used by the v0 path.
     LegacyPayload = 0,

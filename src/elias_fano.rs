@@ -61,7 +61,7 @@ impl EliasFano {
 
         // Pack low bits.
         let total_low_bits = n * low_bits as usize;
-        let low_words = (total_low_bits + 63) / 64;
+        let low_words = total_low_bits.div_ceil(64);
         let mut low = vec![0u64; low_words];
         if low_bits > 0 {
             for (i, &k) in keys.iter().enumerate() {
@@ -78,7 +78,7 @@ impl EliasFano {
 
         // High bitvector: bit `(k >> low_bits) + i` set for the i-th key.
         let high_len = (max_key >> low_bits as u32).saturating_add(n as u64);
-        let high_words = ((high_len + 63) / 64) as usize;
+        let high_words = high_len.div_ceil(64) as usize;
         let mut high = vec![0u64; high_words];
         for (i, &k) in keys.iter().enumerate() {
             let pos = (k >> low_bits as u32) + i as u64;
@@ -90,7 +90,7 @@ impl EliasFano {
         // Build select1 sample table. select_sample[s] = bit position of the
         // (s * SAMPLE_RATE)-th set bit (0-indexed). For s = 0 the answer is the
         // bit position of the very first '1'.
-        let num_samples = (n + SAMPLE_RATE - 1) / SAMPLE_RATE;
+        let num_samples = n.div_ceil(SAMPLE_RATE);
         let mut select_sample = Vec::with_capacity(num_samples);
         let mut bit_count = 0usize;
         for (word_idx, &w) in high.iter().enumerate() {
@@ -98,7 +98,7 @@ impl EliasFano {
             // We want to record any sample target that lies in this word.
             let mut remaining = w;
             for _ in 0..popcnt {
-                if bit_count % SAMPLE_RATE == 0 {
+                if bit_count.is_multiple_of(SAMPLE_RATE) {
                     let bit_in_word = remaining.trailing_zeros() as usize;
                     let abs_bit = word_idx * 64 + bit_in_word;
                     select_sample.push(abs_bit as u32);

@@ -16,8 +16,6 @@
 //!
 //! Returned buffers have hugepage alignment (2 MB) and are zero-initialized.
 
-#![allow(dead_code)]
-
 use std::alloc::{Layout, dealloc};
 use std::sync::OnceLock;
 
@@ -105,6 +103,7 @@ impl std::fmt::Debug for HugepageBuf {
 
 enum HugepageLayout {
     /// Backed by OS hugepage allocator — must be released via the matching API.
+    #[cfg_attr(not(any(target_os = "windows", target_os = "linux")), allow(dead_code))]
     Hugepage,
     /// Backed by the global allocator with a fallback Layout.
     Fallback(Layout),
@@ -118,11 +117,10 @@ impl HugepageBuf {
     /// Allocate `len` bytes, zero-initialized, hugepage-aligned. Falls back to the
     /// global allocator if hugepages are unavailable.
     pub fn alloc_zeroed(len: usize) -> Self {
-        if len >= 1024 * 1024 {
-            if let Some(buf) = try_alloc_hugepage(len) {
+        if len >= 1024 * 1024
+            && let Some(buf) = try_alloc_hugepage(len) {
                 return buf;
             }
-        }
         alloc_fallback(len)
     }
 

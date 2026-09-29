@@ -80,7 +80,7 @@ fn known_answer_vectors_are_platform_independent() {
     const KAT: &[(&[u8], u64, u64)] = &[
         (b"", 0x0, 0xE220_A839_7B1D_CDAF),
         (b"a", 0x1234_5678, 0xE82A_FCEB_756B_11B8),
-        (b"hello", 0xC0FF_EE00_D15E_A5E, 0xAA6F_83F7_94D9_D305),
+        (b"hello", 0x0C0F_FEE0_0D15_EA5E, 0xAA6F_83F7_94D9_D305),
         (b"exactly-16-bytes", 0xDEAD_BEEF, 0x1A04_A58A_5B8A_8891),
         (b"a somewhat longer key that spans several 16-byte blocks!!", 0x42, 0x03D4_B35A_592A_E644),
     ];

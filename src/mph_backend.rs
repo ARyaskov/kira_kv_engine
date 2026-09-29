@@ -11,8 +11,6 @@
 //! dispatch layer is deprecated and goes away with it. PtrHash25 itself is now the
 //! paper-style algorithm (λ = 3 buckets, cuckoo-style eviction, tail remap).
 
-#![allow(dead_code)]
-
 use crate::ptrhash25::{self, Partitioned, PtrHash25Error};
 use hashbrown::HashMap;
 
@@ -55,7 +53,7 @@ impl Default for BuildConfig {
         Self {
             backend: BackendKind::PtrHash25,
             enable_parallel_build: true,
-            seed: 0xC0FF_EE00_D15E_A5E,
+            seed: 0x0C0F_FEE0_0D15_EA5E,
             lambda: ptrhash25::DEFAULT_LAMBDA,
             alpha: ptrhash25::DEFAULT_ALPHA,
             rehash_limit: 16,
@@ -211,12 +209,6 @@ pub enum BackendDispatch {
 
 #[allow(deprecated)]
 impl BackendDispatch {
-    pub fn kind(&self) -> BackendKind {
-        match self {
-            Self::PtrHash25(_) => BackendKind::PtrHash25,
-        }
-    }
-
     #[inline]
     pub fn lookup(&self, key: u64) -> Option<u32> {
         match self {
@@ -254,13 +246,6 @@ impl BackendDispatch {
             }
             _ => None,
         }
-    }
-}
-
-#[allow(deprecated)]
-pub fn build_dispatch(keys: &[u64], cfg: &BuildConfig) -> BackendDispatch {
-    match cfg.backend {
-        BackendKind::PtrHash25 => BackendDispatch::PtrHash25(PtrHash25Backend::build(keys, cfg)),
     }
 }
 

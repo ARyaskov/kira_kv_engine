@@ -248,7 +248,7 @@ impl BlockBloom {
         // At least one block (the lookup indexes block 0 unconditionally), whole
         // blocks only, and the payload must fit — with overflow-safe arithmetic so a
         // huge length word cannot slip past the check and trigger a giant allocation.
-        if len < BLOCK_WORDS || len % BLOCK_WORDS != 0 {
+        if len < BLOCK_WORDS || !len.is_multiple_of(BLOCK_WORDS) {
             return None;
         }
         let payload = len.checked_mul(8)?;
