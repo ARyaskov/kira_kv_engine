@@ -306,6 +306,75 @@ cache-resident.
 Pilot storage is ~2.7 bits/key (λ = 3, flat bytes, no rank/select on the lookup
 path) plus ~0.1 B/key of remap table, against ~2.4 bits/key for the PtrHash paper.
 
+### 0.6.3 → 0.7, same harness, same machine, same data
+
+Both versions measured with `benches/engines.rs` on the same Apple M-series core,
+10M random keys and 2M random queries (PGM rows at 200K keys because the 0.6.3
+builder is quadratic in segment length; PgmIndexU128 at 2M).
+
+**`Index` (PtrHash25), 10M keys**
+
+| Metric | 0.6.3 | 0.7 | Change |
+|---|---:|---:|---:|
+| lean: memory, B/key | 0.59 | 0.42 | −29% |
+| lean: lookup, ns | 30.5 | 13.3 | 2.3× faster |
+| lean: batch lookup, ns | 27.2 | 12.1 | 2.2× faster |
+| default: memory, B/key | 4.16 | 3.79 | −9% |
+| default: lookup, ns | 79.0 | 62.3 | −21% |
+| default: batch lookup, ns | 82.0 | 64.1 | −22% |
+| default: miss, ns | 25.1 | 24.9 | = |
+| build, s (lean / default) | 0.17 / 0.19 | 0.15 / 0.20 | = |
+| id range | `[0, 1.1·n)` | `[0, n)` | minimal |
+| `to_bytes` / `from_bytes`, ms | 66 / 54 | 11 / 12 | 6× / 4.5× faster |
+| serialized size, MB | 55 | 36 | −35% |
+
+**`HybridIndex`, 10M keys**
+
+| Metric | 0.6.3 | 0.7 | Change |
+|---|---:|---:|---:|
+| build, s | 117 | 0.50 | 230× faster |
+| memory, B/key | 15.5 | 6.8 | −56% |
+| lookup, ns | 145 | 111 | −24% |
+| lean: build, s | 96 | 0.39 | 245× faster |
+| lean: memory, B/key | 13.0 | 4.4 | −66% |
+| lean: lookup, ns | 82 | 64 | −22% |
+
+**`PgmIndex` (u64), ε=64**
+
+| Metric | 0.6.3 | 0.7 | Change |
+|---|---:|---:|---:|
+| build 200K keys, s | 3.04 | <0.01 | >300× faster |
+| build 10M keys, s | hours (O(L²)) | 0.02 | — |
+| lookup 200K keys, ns | 43.6 | 24.9 | −43% |
+| correctness | ~0.1% of built keys not found, 33% on near-linear keys | every key found | fixed |
+
+**`PgmIndexU128`, 2M random 128-bit keys, ε=64**
+
+| Metric | 0.6.3 | 0.7 | Change |
+|---|---:|---:|---:|
+| build, s | 29.9 | 0.02 | 1500× faster |
+| lookup, ns | 237 | 150 | −37% |
+| memory, B/key | 16.0 | 16.0 | = (the keys) |
+
+**`DynamicIndex`, 1M keys**
+
+| Metric | 0.6.3 | 0.7 | Change |
+|---|---:|---:|---:|
+| insert, ns | 362 | 275 | −24% |
+| lookup, ns | 29 | 41 | +40% (slower) |
+| memory, B/key | 49.9 | 51.5 | +3% |
+
+The DynamicIndex lookup got slower on purpose: every tier hit is now verified
+against the stored key bytes. Before, a fingerprint false positive (1/65536 per
+foreign lookup) — or, with `lean_tiers`, any foreign key — returned another
+key's id.
+
+Not in the table but visible to dependents: in 0.6.3 the AVX2 Bloom check and the
+gather-based batch lookup were compiled only when *this* crate was built with
+`-C target-cpu` (its `.cargo/config.toml`), so a dependent built with default
+flags ran the scalar paths. 0.7 dispatches at runtime and adds prefetch on
+aarch64. Run-to-run spread on memory-bound rows is about ±10% on this machine.
+
 ## Performance tuning checklist
 
 1. **Closed key set?** Enable `lean_mph(true)` → -89% memory, 4× faster lookups.
