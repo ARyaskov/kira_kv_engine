@@ -5,7 +5,7 @@
 `kira_kv_engine` is a high-performance key→id index toolkit for Rust.
 **Six engines** under one roof, each tuned for a specific workload shape — static
 MPH (lean & default), dynamic LSM-on-MPH, hybrid byte-key, learned PGM (u64 and
-u128). Edition 2024, Rust 1.95+.
+u128). Edition 2024, Rust 1.96+.
 
 | Engine | Memory | Lookup | Insert/Delete | Range | Best for |
 |---|---:|---:|:---:|:---:|---|
