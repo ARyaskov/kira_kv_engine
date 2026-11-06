@@ -109,7 +109,7 @@ use kira_kv_engine::{DynamicIndex, DynamicConfig};
 
 let mut idx = DynamicIndex::with_config(DynamicConfig {
     flush_threshold: 64 * 1024,    // batch ~64K inserts before tier-flush
-    max_tiers: 8,                  // compact when >8 tiers accumulate
+    max_tiers: 8,                  // bound tiers; apply writer backpressure
     lean_tiers: false,
     parallel_build: true,
 });
@@ -270,10 +270,42 @@ let bytes = u128_idx.to_bytes();  let u128_idx = kira_kv_engine::PgmIndexU128::f
 let bytes = dynamic.to_bytes();   let dynamic = kira_kv_engine::DynamicIndex::from_bytes(&bytes)?;
 ```
 
-`Index::save_mmap` / `open_mmap` write the same payload inside a section container
-(64-byte-aligned sections, reserved for a future zero-copy loader); today they
-read the file into memory like `load`. Indexes written by 0.6 still load (without
-checksum verification); rebuild them to get the minimal geometry.
+`Index::save_mmap` writes aligned, checksummed sections. On Windows,
+`Index::open_mmap` references pilots, remap, Bloom and fingerprints in place and
+retains a handle that denies write/delete sharing. On Unix the safe opener uses
+an owned byte buffer; `unsafe Index::open_mmap_unchecked` provides OS mapping when
+the application guarantees the backing file remains immutable. Metadata is small
+and owned. Big-endian or unaligned tables are decoded into owned arrays. Legacy
+payload containers remain readable. `index.is_memory_mapped()` reports OS backing.
+
+Bloom and fingerprints are independently configurable:
+
+```rust
+use kira_kv_engine::{FingerprintBits, IndexBuilder};
+let index = IndexBuilder::new()
+    .with_bloom_filter(false)                  // hit-heavy workloads
+    .with_fingerprint_bits(FingerprintBits::Bits24)
+    .build_index_ref(&keys)?;
+```
+
+Defaults remain Bloom + fp16. fp16/fp24/fp32 consume 2/3/4 bytes per slot; removing
+Bloom saves about 1.38 B/key at large scale. Without Bloom, misses cost a full
+MPH/fingerprint probe. Membership remains probabilistic. Lean mode disables both.
+
+`DynamicIndex` stores tier keys in byte arenas with metadata directly in MPH-slot
+order. Its default full-compaction policy is preserved. Write-heavy workloads can
+opt into geometric background compaction with `idx.set_background_compaction(true)?`:
+four similarly sized tiers merge on one worker while old tiers remain readable.
+Publication occurs at flush boundaries. Use `finish_background_compaction` to
+include outstanding maintenance in measurements and `compact()` for single-tier
+reads. `set_background_compaction(false)` keeps geometric merges synchronous;
+`set_compaction_ratio` also opts into size tiering. Deserialization restores the
+default full-compaction policy. Multiple tiers can increase lookup latency.
+
+
+The stage-by-stage 10M-key verification and measured before/after results are in
+[performance/REPORT.md](performance/REPORT.md).
+
 
 ## Benchmarks
 
@@ -384,7 +416,7 @@ aarch64. Run-to-run spread on memory-bound rows is about ±10% on this machine.
    serializes in ~10 ms and loads (checksum + validation included) in ~12 ms.
 4. **Batched lookups?** Use `lookup_batch_u64_simd_into` (Index) or
    `lookup_batch_u64_simd` (Hybrid) — prefetch pipelines on both x86_64 and
-   aarch64, AVX2 gather dispatched at runtime (no `-C target-cpu` needed).
+   aarch64, SIMD hashing dispatched at runtime (no `-C target-cpu` needed).
 5. **u64 keys to Hybrid?** Use `build_from_u64()` instead of `build()` — SIMD
    hash path.
 6. **Building from keys you keep around?** Use `build_index_ref(&keys)` — the

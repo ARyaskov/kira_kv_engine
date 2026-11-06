@@ -48,6 +48,8 @@ impl IndexBuilder {
     pub fn with_config(self, config: IndexConfig) -> Self;
     pub fn with_mph_config(self, mph_config: ptrhash25::BuildConfig) -> Self;
     pub fn with_parallel_build(self, enabled: bool) -> Self;
+    pub fn with_bloom_filter(self, enabled: bool) -> Self;
+    pub fn with_fingerprint_bits(self, width: FingerprintBits) -> Self;
 
     /// Drop Bloom + fingerprints: 0.42 B/key, ~4x faster lookups.
     /// Foreign keys return arbitrary in-range positions — closed-world only.
@@ -81,6 +83,8 @@ pub struct IndexConfig {
                                               // max_rehash, seed, with_fingerprints, use_aes_hash
     pub enable_parallel_build: bool,
     pub lean_mph: bool,
+    pub bloom_filter: bool,                  // default true
+    pub fingerprint_bits: FingerprintBits,    // Bits16 (default), Bits24, Bits32
     // deprecated, no effect: pgm_epsilon, auto_detect_numeric, backend, hot_fraction,
     // build_fast_profile, pgm_enable_bloom, pgm_enable_elias_fano, pgm_target_lookup_ns
 }
@@ -109,7 +113,7 @@ impl Index {
     pub fn contains(&self, key: &[u8]) -> bool;
     pub fn contains_batch(&self, keys: &[&[u8]]) -> Vec<bool>;
 
-    // Batched (prefetch pipelines; AVX2 gather dispatched at runtime)
+    // Batched (SIMD hashing and a three-stage pilot/Bloom/fingerprint pipeline)
     pub fn lookup_batch(&self, keys: &[&[u8]]) -> Vec<Option<usize>>;
     pub fn lookup_batch_pipelined(&self, keys: &[&[u8]]) -> Vec<Option<usize>>;
     pub fn lookup_batch_u64_simd(&self, keys: &[u64]) -> Vec<Option<usize>>;
@@ -127,9 +131,12 @@ impl Index {
     pub fn write_to<W: std::io::Write>(&self, w: W) -> std::io::Result<()>;   // streaming
     pub fn save<P: AsRef<Path>>(&self, path: P) -> std::io::Result<()>;
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, IndexError>;
-    // Section container (same payload; reserved for a future zero-copy loader)
+    // Aligned, checksummed section container; Windows safe opener maps tables.
     pub fn save_mmap<P: AsRef<Path>>(&self, path: P) -> Result<(), IndexError>;
     pub fn open_mmap<P: AsRef<Path>>(path: P) -> Result<Self, IndexError>;
+    /// Caller guarantees the backing file stays immutable while the index lives.
+    pub unsafe fn open_mmap_unchecked<P: AsRef<Path>>(path: P) -> Result<Self, IndexError>;
+    pub fn is_memory_mapped(&self) -> bool;
 
     // deprecated aliases: get, get_str, get_u64, get_batch, has, exists, has_batch,
     // exists_batch, serialize, deserialize, lookup_u64_fast, range, get_all
@@ -184,10 +191,14 @@ impl DynamicIndex {
     pub fn delete(&mut self, key: &[u8]) -> Option<StableId>; // prior id, if any
     pub fn lookup(&self, key: &[u8]) -> Option<StableId>;
 
-    /// buffer → new tier. On Err the buffer is untouched.
+    /// Buffer to new tier, then schedule size-tiered maintenance; bindings survive errors.
     pub fn flush(&mut self) -> Result<(), IndexError>;
-    /// all tiers + buffer → one tier. On Err the index is unchanged.
+    /// All tiers and buffer to one tier; bindings survive errors.
     pub fn compact(&mut self) -> Result<(), IndexError>;
+    pub fn finish_background_compaction(&mut self) -> Result<(), IndexError>;
+    pub fn set_background_compaction(&mut self, enabled: bool) -> Result<(), IndexError>;
+    pub fn set_compaction_ratio(&mut self, ratio: usize) -> Result<(), IndexError>;
+    pub fn compaction_stats(&self) -> (u64, u64); // automatic merges and input keys rebuilt
 
     pub fn len(&self) -> usize;                 // exact live count
     pub fn is_empty(&self) -> bool;
@@ -500,3 +511,31 @@ PGM format v2 still load, without a checksum.
 `BackendKind`, `BackendBuildConfig`, `BuildProfile` and the `MphBackend` trait
 are remnants of the multi-algorithm era (PtrHash25 has been the only backend
 since 0.5). They remain exported for source compatibility only.
+
+## Membership modes and mapped file lifetime
+
+`FingerprintBits::{Bits16, Bits24, Bits32}` selects 2, 3 or 4 bytes per slot.
+Bloom and fingerprint width are independent; lean mode disables both. Without
+Bloom, `contains` checks fingerprints. Membership stays probabilistic in every
+non-lean mode; a wider fingerprint reduces false acceptance. `GpuExport` carries
+`fingerprint_bits` and packed `fingerprint_bytes`; the older `fingerprints`
+field is populated only for fp16.
+
+The aligned mmap container has a checksum covering its header and sections.
+Windows `open_mmap` retains a read handle that denies write/delete sharing.
+Safe opens on other platforms retain an owned byte buffer; immutable-file
+applications can use `unsafe open_mmap_unchecked` for OS-backed mapping there.
+Big-endian and unaligned tables fall back to owned, endian-converted arrays.
+Old payload-based mmap containers remain readable through the copying decoder.
+
+Dynamic tiers use one byte arena and slot-ordered metadata. The default full-merge
+policy is preserved. `set_background_compaction(true)` opts into size tiering:
+four similarly sized tiers merge on one worker and publication occurs at flush
+boundaries. Disabling the worker keeps size-tiered merges synchronous;
+`set_compaction_ratio` also enables size tiering. `max_tiers` applies writer
+backpressure. Explicit `compact` restores single-tier reads. Multiple tiers can
+increase lookup latency. `finish_background_compaction` waits for eligible merges
+and belongs in end-to-end write timing. Tombstones remain until full compaction.
+The serialized key/id/config layout stays compatible; restored indexes use the
+default full-compaction policy. `memory_usage` excludes in-flight worker scratch
+and unpublished output.

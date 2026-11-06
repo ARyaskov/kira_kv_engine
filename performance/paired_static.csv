@@ -1,0 +1,15 @@
+metric,before,after,unit,reduction_percent
+keys,10000000.000000,10000000.000000,keys,0.000
+default.memory,3.792535,3.792537,B/key,-0.000
+default.hit,81.437600,75.143000,ns/key,7.729
+default.miss,25.116900,13.462300,ns/key,46.401
+default.batch_u64,62.251800,23.570300,ns/key,62.137
+default.batch_bytes,84.906700,38.664000,ns/key,54.463
+mmap.load,32868600.000000,17628500.000000,ns/key,46.367
+fp16_no_bloom.memory,3.792535,2.416278,B/key,36.289
+fp16_no_bloom.hit,70.181100,62.065500,ns/key,11.564
+fp24_no_bloom.memory,3.792535,3.416278,B/key,9.921
+fp24_no_bloom.hit,66.782600,66.857600,ns/key,-0.112
+fp32_no_bloom.memory,3.792535,4.416278,B/key,-16.447
+fp32_no_bloom.hit,71.269000,64.782800,ns/key,9.101
+correctness,1.000000,1.000000,pass,0.000
