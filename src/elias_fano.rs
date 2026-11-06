@@ -275,7 +275,7 @@ impl EliasFano {
         let select_sample: Vec<u32> = crate::wire::read_le_at(bytes, pos, sample_count)?;
         // low: n * low_bits bits must fit; high: high_len bits must fit and hold
         // exactly n set bits; samples: one per SAMPLE_RATE keys, each inside `high`.
-        let need_low = (n as u64 * low_bits as u64).div_ceil(64) as usize;
+        let need_low = (n as u64).checked_mul(low_bits as u64)?.div_ceil(64) as usize;
         if low.len() < need_low || (high.len() as u64) < high_len.div_ceil(64) {
             return None;
         }
@@ -287,6 +287,25 @@ impl EliasFano {
             || select_sample.iter().any(|&s| s as u64 >= high_len)
         {
             return None;
+        }
+        // A sample must point to the corresponding set bit, not merely inside
+        // the array. Otherwise corrupted samples can make select1 run past high.
+        let mut rank = 0usize;
+        for (word_idx, &word) in high.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                let pos = word_idx.checked_mul(64)?.checked_add(bits.trailing_zeros() as usize)?;
+                if pos as u64 >= high_len {
+                    return None;
+                }
+                if rank.is_multiple_of(SAMPLE_RATE)
+                    && select_sample[rank / SAMPLE_RATE] as usize != pos
+                {
+                    return None;
+                }
+                rank += 1;
+                bits &= bits - 1;
+            }
         }
         Some(EliasFano { n, universe, low_bits, low_mask, low, high_len, high, select_sample })
     }

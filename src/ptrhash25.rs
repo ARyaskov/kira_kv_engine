@@ -1461,7 +1461,7 @@ impl PtrHash25Mphf {
             if p.num_slots < p.num_keys || p.num_slots == 0 || p.num_buckets == 0 {
                 return false;
             }
-            if p.large_buckets > p.num_buckets {
+            if p.large_buckets >= p.num_buckets {
                 return false;
             }
             if p.bucket_off as u64 + p.num_buckets as u64 > pilots {
@@ -1469,7 +1469,9 @@ impl PtrHash25Mphf {
             }
             // Every reachable output position must be < n: the keys' own range and,
             // through the remap, the tail.
-            if p.slot_off + p.num_keys as u64 > n || p.slot_off >= n {
+            if p.slot_off >= n
+                || p.slot_off.checked_add(p.num_keys as u64).is_none_or(|end| end > n)
+            {
                 return false;
             }
             let tail = (p.num_slots - p.num_keys) as u64;
