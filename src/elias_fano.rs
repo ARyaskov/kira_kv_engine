@@ -51,7 +51,7 @@ impl EliasFano {
         // l = floor(log2(U / N)); clamp to [0, 56] so the low component fits in 64 bits
         // even when we straddle a u64 boundary.
         let ratio = (universe / n as u64).max(1);
-        let low_bits = (63 - ratio.leading_zeros()) as u8;
+        let low_bits = ratio.ilog2() as u8;
         let low_bits = low_bits.min(56);
         let low_mask = if low_bits == 0 { 0 } else { (1u64 << low_bits) - 1 };
 

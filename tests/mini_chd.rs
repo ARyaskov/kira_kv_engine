@@ -27,5 +27,5 @@ fn build_and_lookup_2k_keys() {
 
 #[test]
 fn rejects_empty() {
-    assert!(matches!(MiniChd::build(&[], 0), Err(MiniChdError::Empty)));
+    std::assert_matches!(MiniChd::build(&[], 0), Err(MiniChdError::Empty));
 }

@@ -152,7 +152,7 @@ fn duplicate_key_detected_multi_part() {
     let mut keys = keys_u64(n, 0xE5);
     keys[n - 1] = keys[17];
     let err = Builder::new().build(&keys).expect_err("duplicate must fail");
-    assert!(matches!(err, PtrHash25Error::DuplicateKey), "got {err:?}");
+    std::assert_matches!(err, PtrHash25Error::DuplicateKey, "got {err:?}");
 }
 
 #[test]
@@ -160,7 +160,7 @@ fn duplicate_key_detected_single_part() {
     let mut keys = keys_u64(1000, 0xF6);
     keys[999] = keys[3];
     let err = Builder::new().build(&keys).expect_err("duplicate must fail");
-    assert!(matches!(err, PtrHash25Error::DuplicateKey), "got {err:?}");
+    std::assert_matches!(err, PtrHash25Error::DuplicateKey, "got {err:?}");
 }
 
 #[test]
@@ -211,7 +211,7 @@ fn index_duplicate_bytes_rejected() {
     let mut keys = byte_keys(100_000, 0x39);
     keys[99_999] = keys[42].clone();
     let err = IndexBuilder::new().build_index_ref(&keys).err().expect("must fail");
-    assert!(matches!(err, kira_kv_engine::IndexError::DuplicateKey), "got {err}");
+    std::assert_matches!(err, kira_kv_engine::IndexError::DuplicateKey, "got {err}");
 }
 
 #[test]
@@ -313,7 +313,7 @@ fn duplicate_keys_are_a_typed_error() {
     let mut keys = byte_keys(5_000, 0x9F);
     keys[4_999] = keys[42].clone();
     let err = IndexBuilder::new().build_index_ref(&keys).err().expect("duplicate must fail");
-    assert!(matches!(err, kira_kv_engine::IndexError::DuplicateKey), "{err:?}");
+    std::assert_matches!(err, kira_kv_engine::IndexError::DuplicateKey, "{err:?}");
     let io = Index::load("/definitely/not/a/path/kira.idx").err().expect("missing file");
-    assert!(matches!(io, kira_kv_engine::IndexError::Io(_)), "{io:?}");
+    std::assert_matches!(io, kira_kv_engine::IndexError::Io(_), "{io:?}");
 }

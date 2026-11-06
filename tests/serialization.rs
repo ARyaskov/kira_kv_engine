@@ -106,7 +106,7 @@ fn pgm_u128_roundtrip_empty_and_duplicates() {
     assert!(back.is_empty());
 
     let dup = PgmIndexU128::build(vec![5, 3, 5], 16).err().unwrap();
-    assert!(matches!(dup, PgmU128Error::DuplicateKeys));
+    std::assert_matches!(dup, PgmU128Error::DuplicateKeys);
 }
 
 #[test]

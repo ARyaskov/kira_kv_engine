@@ -7,7 +7,7 @@ fn build_and_lookup_dense() {
     for (expected, k) in keys.iter().enumerate() {
         assert_eq!(idx.index(*k).unwrap(), expected, "for key {k}");
     }
-    assert!(matches!(idx.index(7).err(), Some(PgmU128Error::KeyNotFound)));
+    std::assert_matches!(idx.index(7).err(), Some(PgmU128Error::KeyNotFound));
 }
 
 #[test]
