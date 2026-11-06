@@ -41,6 +41,22 @@ pub struct BlockBloom {
 }
 
 impl BlockBloom {
+    pub(crate) fn mapped(
+        seed: u64,
+        bit_shift: u32,
+        words: crate::hugepage::HugeVec<u64>,
+    ) -> Option<Self> {
+        if !matches!(bit_shift, BIT_SHIFT_V2 | BIT_SHIFT_LEGACY)
+            || words.len() < BLOCK_WORDS
+            || !words.len().is_multiple_of(BLOCK_WORDS)
+        {
+            return None;
+        }
+        Some(Self { seed, words, bit_shift })
+    }
+    pub(crate) fn mmap_data(&self) -> (u64, u32, &[u64]) {
+        (self.seed, self.bit_shift, self.words.as_slice())
+    }
     pub fn build_from_prehashed(hashes: &[u64]) -> Self {
         Self::build_with_seed(hashes, 0xC1B5_4A32_D192_ED03, None)
     }

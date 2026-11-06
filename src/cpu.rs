@@ -44,6 +44,8 @@ impl CpuFeatures {
             pgm_enable_elias_fano: false,
             pgm_target_lookup_ns: None,
             lean_mph: false,
+            bloom_filter: true,
+            fingerprint_bits: crate::FingerprintBits::Bits16,
         }
     }
 }

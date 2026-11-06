@@ -321,7 +321,7 @@ pub struct PtrHash25Mphf {
     pub pilots: crate::hugepage::HugeVec<u8>,
     /// Tail redirection: for part `p`, local slot `s ≥ num_keys` maps to
     /// `remap[p.remap_off + s - num_keys]`, a free slot `< num_keys`.
-    pub remap: Box<[u32]>,
+    pub remap: crate::hugepage::HugeVec<u32>,
     /// Optional fingerprint table (u8 per output position) for negative-query rejection.
     /// Empty if the index doesn't need negative-query support.
     pub fingerprints: Vec<u8>,
@@ -337,6 +337,42 @@ pub struct PtrHash25Mphf {
 }
 
 impl PtrHash25Mphf {
+    /// First pipeline stage: compute and prefetch the pilot address without loading it.
+    #[inline(always)]
+    pub(crate) fn prepare_lookup(&self, key: u64) -> PreparedLookup {
+        let rotated = key.rotate_left(self.prerotate as u32);
+        let pi = if self.parts.len() > 1 {
+            part_of(rotated, self.part_salt, self.parts.len())
+        } else {
+            0
+        };
+        let p = &self.parts[pi];
+        let h1 = if self.parts.len() > 1 {
+            remix(base_hash(rotated, self.salt, self.use_aes_hash), p.salt)
+        } else {
+            base_hash(rotated, p.salt, self.use_aes_hash)
+        };
+        let bucket = p.bucket_off as usize
+            + bucket_in_part(
+                h1,
+                p.large_buckets as usize,
+                (p.num_buckets - p.large_buckets) as usize,
+            );
+        crate::prefetch::prefetch_read(unsafe { self.pilots.as_slice().as_ptr().add(bucket) });
+        PreparedLookup { h2: h2_from_h1(h1), part: pi as u32, bucket: bucket as u32 }
+    }
+
+    /// Second stage, after other queries have given the pilot prefetch time to finish.
+    #[inline(always)]
+    pub(crate) fn finish_lookup(&self, q: PreparedLookup) -> usize {
+        let p = &self.parts[q.part as usize];
+        let pilot = self.pilots[q.bucket as usize];
+        let mut local = slot_for(q.h2, pilot, p.num_slots as usize);
+        if local >= p.num_keys as usize {
+            local = self.remap[p.remap_off as usize + local - p.num_keys as usize] as usize;
+        }
+        p.slot_off as usize + local
+    }
     /// Size of the output range: `lookup_u64` returns values in `[0..slot_capacity())`.
     /// Equal to the number of keys for indexes built by this version; `1.1 × keys`
     /// for files written by 0.6.
@@ -422,6 +458,13 @@ impl PtrHash25Mphf {
             + self.fingerprints.len()
             + self.parts.len() * std::mem::size_of::<PartInfo>()
     }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct PreparedLookup {
+    h2: u64,
+    part: u32,
+    bucket: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -1274,7 +1317,7 @@ pub fn build_partitioned_with(
             num_buckets: total_buckets as u32,
             salt: global_salt.unwrap_or(infos[0].salt),
             pilots: pilots_buf,
-            remap: remap.into_boxed_slice(),
+            remap: remap.into(),
             fingerprints: fp8,
             use_aes_hash: cfg.use_aes_hash,
             prerotate: part.prerotate,
@@ -1427,7 +1470,7 @@ pub fn read_ptrhash25(buf: &[u8], pos: &mut usize) -> Option<PtrHash25Mphf> {
         num_buckets,
         salt,
         pilots,
-        remap: remap.into_boxed_slice(),
+        remap: remap.into(),
         fingerprints,
         use_aes_hash,
         prerotate,

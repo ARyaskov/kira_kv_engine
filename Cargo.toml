@@ -33,6 +33,7 @@ rayon = { version = "1.11", optional = true }
 core_affinity = { version = "0.8", optional = true }
 wyhash = "0.6"
 hashbrown = "0.16"
+memmap2 = "0.9"
 
 [lints.clippy]
 # Index loops over parallel arrays are clearer than zipped iterators here.

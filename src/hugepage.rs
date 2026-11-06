@@ -168,7 +168,22 @@ impl Drop for HugepageBuf {
 #[derive(Debug)]
 pub enum HugeVec<T: Copy + Default + 'static> {
     Small(Vec<T>),
-    Huge { buf: HugepageBuf, len: usize, _t: std::marker::PhantomData<T> },
+    Huge {
+        buf: HugepageBuf,
+        len: usize,
+        _t: std::marker::PhantomData<T>,
+    },
+    /// Immutable file-backed table. Mutating it first makes an owned copy.
+    Mapped(MappedRegion<T>),
+}
+
+/// A validated view; private fields prevent constructing out-of-bounds mapped tables.
+#[derive(Debug, Clone)]
+pub struct MappedRegion<T> {
+    owner: std::sync::Arc<crate::mmap_index::MappedFile>,
+    offset: usize,
+    len: usize,
+    _t: std::marker::PhantomData<T>,
 }
 
 impl<T: Copy + Default + 'static> HugeVec<T> {
@@ -191,6 +206,7 @@ impl<T: Copy + Default + 'static> HugeVec<T> {
         v
     }
 
+    #[inline(always)]
     pub fn as_slice(&self) -> &[T] {
         match self {
             HugeVec::Small(v) => v.as_slice(),
@@ -198,15 +214,30 @@ impl<T: Copy + Default + 'static> HugeVec<T> {
                 // SAFETY: buf is valid for at least len * size_of::<T>() bytes; T: Copy.
                 unsafe { std::slice::from_raw_parts(buf.as_slice().as_ptr() as *const T, *len) }
             }
+            HugeVec::Mapped(view) => {
+                let MappedRegion { owner, offset, len, .. } = view;
+                // SAFETY: from_mapped verifies alignment, bounds and primitive element type.
+                // The owner keeps the immutable mapping alive for this entire borrow.
+                unsafe {
+                    std::slice::from_raw_parts(
+                        owner.as_ref().as_ref().as_ptr().add(*offset).cast::<T>(),
+                        *len,
+                    )
+                }
+            }
         }
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [T] {
+        if matches!(self, Self::Mapped(_)) {
+            *self = Self::from_slice(self.as_slice());
+        }
         match self {
             HugeVec::Small(v) => v.as_mut_slice(),
             HugeVec::Huge { buf, len, .. } => unsafe {
                 std::slice::from_raw_parts_mut(buf.as_mut_slice().as_mut_ptr() as *mut T, *len)
             },
+            HugeVec::Mapped(_) => unreachable!(),
         }
     }
 
@@ -214,6 +245,7 @@ impl<T: Copy + Default + 'static> HugeVec<T> {
         match self {
             HugeVec::Small(v) => v.len(),
             HugeVec::Huge { len, .. } => *len,
+            HugeVec::Mapped(view) => view.len,
         }
     }
 
@@ -225,15 +257,61 @@ impl<T: Copy + Default + 'static> HugeVec<T> {
         matches!(self, HugeVec::Huge { .. })
     }
 
+    pub(crate) fn is_memory_mapped(&self) -> bool {
+        matches!(self,Self::Mapped(view) if view.owner.is_mapped())
+    }
+
     pub fn memory_usage(&self) -> usize {
         self.len() * std::mem::size_of::<T>()
+    }
+
+    pub(crate) fn from_mapped(
+        owner: std::sync::Arc<crate::mmap_index::MappedFile>,
+        offset: usize,
+        len: usize,
+    ) -> Option<Self> {
+        // Only the integer primitives used by the on-disk table format may be reinterpreted.
+        use std::any::TypeId;
+        let ty = TypeId::of::<T>();
+        if !cfg!(target_endian = "little")
+            || !(ty == TypeId::of::<u8>()
+                || ty == TypeId::of::<u16>()
+                || ty == TypeId::of::<u32>()
+                || ty == TypeId::of::<u64>())
+        {
+            return None;
+        }
+        let bytes = owner.as_ref().as_ref();
+        let end = offset.checked_add(len.checked_mul(std::mem::size_of::<T>())?)?;
+        if end > bytes.len()
+            || !(bytes.as_ptr() as usize + offset).is_multiple_of(std::mem::align_of::<T>())
+        {
+            return None;
+        }
+        Some(Self::Mapped(MappedRegion { owner, offset, len, _t: std::marker::PhantomData }))
+    }
+}
+
+impl<T: Copy + Default + 'static> std::ops::Deref for HugeVec<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        self.as_slice()
+    }
+}
+
+impl<T: Copy + Default + 'static> From<Vec<T>> for HugeVec<T> {
+    fn from(v: Vec<T>) -> Self {
+        Self::Small(v)
     }
 }
 
 // Manual Clone since HugepageBuf isn't Clone (it owns OS memory).
 impl<T: Copy + Default + 'static> Clone for HugeVec<T> {
     fn clone(&self) -> Self {
-        Self::from_slice(self.as_slice())
+        match self {
+            Self::Mapped(view) => Self::Mapped(view.clone()),
+            _ => Self::from_slice(self.as_slice()),
+        }
     }
 }
 

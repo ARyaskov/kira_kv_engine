@@ -1,4 +1,5 @@
 use crate::block_bloom::BlockBloom;
+use crate::fingerprints::{FingerprintBits, Fingerprints};
 #[allow(deprecated)]
 use crate::mph_backend::{
     BackendDispatch, BackendKind, BuildConfig as BackendConfig, BuildProfile, PtrHash25Backend,
@@ -20,13 +21,9 @@ struct MphEngine {
     /// assumes the caller only queries with keys from the build set; foreign
     /// keys return garbage positions.
     filter: Option<BlockBloom>,
-    /// u16 fingerprint per slot — distinguishes real hits from MPH collisions
-    /// of foreign keys. `None` in Lean mode (~16 bits/key saved).
-    ///
-    /// Invariant: `len() == slot_capacity() + 1`. The trailing element is padding
-    /// so the AVX2 gather (a 32-bit load at every `u16`) never reads past the
-    /// allocation for the last slot; it is neither serialized nor exported.
-    fingerprints: Option<Box<[u16]>>,
+    /// Optional 16/24/32-bit membership fingerprints. Mapped tables retain their
+    /// owner; packed 24-bit entries carry one padding byte for unaligned loads.
+    fingerprints: Option<Fingerprints>,
 }
 
 /// Static MPH-backed key→id index. For semantic range queries on u64 keys
@@ -91,7 +88,8 @@ impl From<PgmError> for IndexError {
 
 /// Configuration for the index.
 ///
-/// The live options are `mph_config`, `enable_parallel_build` and `lean_mph`.
+/// Live options are `mph_config`, `enable_parallel_build`, `lean_mph`,
+/// `bloom_filter` and `fingerprint_bits`.
 /// The PGM-related fields and `backend`/`hot_fraction`/`build_fast_profile` are
 /// left over from the removed in-`Index` PGM engine (0.6) and the multi-backend
 /// era (0.5): they have no effect, are deprecated, and will be removed in the next
@@ -118,21 +116,19 @@ pub struct IndexConfig {
     pub pgm_enable_elias_fano: bool,
     #[deprecated(since = "0.7.0", note = "no effect; use PgmBuilder::with_target_lookup_ns")]
     pub pgm_target_lookup_ns: Option<u32>,
-    /// **Lean MPH mode** (saves ~50% memory for positive-only workloads).
-    ///
-    /// When `true`, the MPH engine skips:
-    ///   - The outer Block-Bloom filter (saves ~10 bits/key)
-    ///   - The u16 fingerprint table (saves ~16 bits/key)
-    ///   - The inner PtrHash25 fingerprints (saves ~8 bits/key)
-    ///
-    /// Total saving: ~34 bits/key = ~4.5 bytes/key down to ~2.5 bytes/key
-    /// at 100M scale (450 MB → 250 MB).
+    /// Lean MPH mode drops Bloom and outer fingerprints. With default geometry
+    /// this reduces the index from about 3.79 to 0.42 B/key. The inner MPH never
+    /// stores an additional fingerprint table in an Index.
     ///
     /// **Trade-off**: a lookup with a key that wasn't in the build set returns
     /// an arbitrary in-range position instead of `KeyNotFound`. Use only when
     /// you can guarantee all queries are valid keys (e.g. preloaded dictionary,
     /// closed-world vocabulary, deduped log lines).
     pub lean_mph: bool,
+    /// Independent prefilter; ignored in lean mode.
+    pub bloom_filter: bool,
+    /// Outer membership fingerprint width; ignored in lean mode.
+    pub fingerprint_bits: FingerprintBits,
 }
 
 #[allow(deprecated)]
@@ -194,7 +190,11 @@ pub struct GpuExport {
     /// Tail redirection table shared by all parts (see [`GpuPart::remap_off`]).
     pub remap: Vec<u32>,
     pub bloom: Option<BloomExport>,
+    /// Legacy fp16 export; None for wider fingerprints.
     pub fingerprints: Option<Vec<u16>>,
+    /// Actual width and little-endian packed bytes for accelerator membership checks.
+    pub fingerprint_bits: u8,
+    pub fingerprint_bytes: Option<Vec<u8>>,
     /// Salt of the part selector:
     /// `part = mulhi((rotated ^ part_salt) * 0x9E3779B97F4A7C15, parts.len())`.
     /// Ignored when `parts.len() == 1`.
@@ -325,6 +325,7 @@ impl Index {
         self.lookup_str(key)
     }
 
+    #[inline]
     pub fn lookup_u64(&self, key: u64) -> Result<usize, IndexError> {
         let Some(engine) = self.engine.as_ref() else {
             return Err(IndexError::KeyNotFound);
@@ -332,56 +333,9 @@ impl Index {
         self.lookup_mph(engine, &key.to_le_bytes())
     }
 
-    /// AVX2-gather based fingerprint check for 8 indices at a time.
-    /// Returns a bitmask: bit `i` is set if fingerprints[indices[i]] == expected_fps[i].
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2")]
-    #[allow(unsafe_op_in_unsafe_fn)]
-    #[inline]
-    unsafe fn gather_fp_check_x8(fp_base: *const u16, indices: [u32; 8], expected: [u16; 8]) -> u8 {
-        use core::arch::x86_64::{
-            _mm256_and_si256, _mm256_cmpeq_epi32, _mm256_i32gather_epi32, _mm256_movemask_epi8,
-            _mm256_set_epi32, _mm256_set1_epi32,
-        };
-        let vindex = _mm256_set_epi32(
-            indices[7] as i32,
-            indices[6] as i32,
-            indices[5] as i32,
-            indices[4] as i32,
-            indices[3] as i32,
-            indices[2] as i32,
-            indices[1] as i32,
-            indices[0] as i32,
-        );
-        // scale = 2 bytes per u16 element; gather 8 u32, lower 16 bits = fp value.
-        let loaded = _mm256_i32gather_epi32::<2>(fp_base as *const i32, vindex);
-        let mask_lo = _mm256_set1_epi32(0x0000_FFFF);
-        let loaded_lo = _mm256_and_si256(loaded, mask_lo);
-        let expected_v = _mm256_set_epi32(
-            expected[7] as i32,
-            expected[6] as i32,
-            expected[5] as i32,
-            expected[4] as i32,
-            expected[3] as i32,
-            expected[2] as i32,
-            expected[1] as i32,
-            expected[0] as i32,
-        );
-        let cmp = _mm256_cmpeq_epi32(loaded_lo, expected_v);
-        let mm = _mm256_movemask_epi8(cmp) as u32;
-        let mut out = 0u8;
-        for i in 0..8 {
-            if (mm >> (i * 4)) & 0xF == 0xF {
-                out |= 1 << i;
-            }
-        }
-        out
-    }
-
-    /// SIMD-batched u64 lookup: hashes 4 keys at a time via AVX2 `hash_u64_avx2`,
-    /// then issues paired prefetches for each lane's Bloom block + pilot byte. On
-    /// 100M-scale indexes this beats `lookup_batch_pipelined` by 20-35% because the
-    /// 4-wide hash phase happens 4× faster and the prefetch wave is wider.
+    /// SIMD-hashed u64 lookup with three stages over 64 independent queries:
+    /// pilot/Bloom prefetch, slot calculation/fingerprint prefetch, verification.
+    /// Tiny batches use the scalar path to avoid pipeline setup overhead.
     ///
     /// Available only for u64 keys (cannot vectorize variable-length byte hashing).
     /// Returns Some(idx) on hit, None on miss (filter or fingerprint reject).
@@ -432,142 +386,72 @@ impl Index {
         if n == 0 {
             return;
         }
-        // Reset the result range — callers may reuse `out` across calls
-        // of varying length, so we can't trust the previous values.
-        for slot in &mut out[..n] {
-            *slot = None;
-        }
-        let Some(engine) = self.engine.as_ref() else { return };
-
-        // Hash all keys up-front via AVX2 (4-wide).
+        let Some(engine) = self.engine.as_ref() else {
+            out[..n].fill(None);
+            return;
+        };
         crate::simd_hash::hash_u64(keys, engine.prehash_seed, &mut canon[..n]);
-        let canon = &canon[..n];
+        Self::lookup_canonical_batch(engine, &canon[..n], &mut out[..n]);
+    }
 
-        // Lean-mode fast path: no Bloom, no fingerprints — straight from
-        // hash → backend.lookup → output. Saves ~30 % per-key work.
-        if engine.filter.is_none() && engine.fingerprints.is_none() {
-            for (i, &hash) in canon.iter().enumerate() {
-                if let Some(idx) = engine.backend.lookup(hash) {
-                    out[i] = Some(idx as usize);
-                }
+    /// Three stages across 64 independent queries: pilot/Bloom prefetch,
+    /// slot calculation/fingerprint prefetch, then fingerprint validation.
+    /// Every output is overwritten, including misses when scratch is reused.
+    fn lookup_canonical_batch(engine: &MphEngine, hashes: &[u64], out: &mut [Option<usize>]) {
+        use crate::mph_backend::PtrHash25Storage;
+        let BackendDispatch::PtrHash25(backend) = &engine.backend;
+        if hashes.len() < 16 {
+            for (&hash, result) in hashes.iter().zip(out) {
+                *result = if engine.filter.as_ref().is_some_and(|bf| !bf.contains_hash(hash)) {
+                    None
+                } else {
+                    engine.backend.lookup(hash).map(|s| s as usize).filter(|&s| {
+                        engine.fingerprints.as_ref().is_none_or(|fp| fp.matches(s, hash))
+                    })
+                };
             }
             return;
         }
-
-        // Pre-prefetch the first WINDOW Bloom blocks (only when filter present).
-        const WINDOW: usize = 16;
-        if let Some(bf) = &engine.filter {
-            for &h in &canon[..WINDOW.min(n)] {
-                prefetch_read(bf.block_ptr(h));
+        let PtrHash25Storage::Mph(mph) = &backend.storage else {
+            for (&hash, result) in hashes.iter().zip(out) {
+                *result =
+                    engine.backend.lookup(hash).map(|s| s as usize).filter(|&s| {
+                        engine.fingerprints.as_ref().is_none_or(|fp| fp.matches(s, hash))
+                    });
             }
-        }
-
-        // Main loop: 8 keys per iteration with an AVX2 gather for the fingerprint
-        // stage (one instruction instead of 8 scalar loads). Dispatched at runtime so
-        // dependents built without `-C target-cpu` get it too; the gather takes i32
-        // lane indices, so it is skipped for slot counts beyond 2^31.
-        let mut i = 0usize;
-        #[cfg(target_arch = "x86_64")]
-        {
-            let avx2 = cfg!(target_feature = "avx2") || std::arch::is_x86_feature_detected!("avx2");
-            if avx2 && engine.backend.slot_capacity() <= i32::MAX as usize {
-                // SAFETY: AVX2 presence checked above.
-                i = unsafe { Self::batch_u64_avx2(engine, canon, out, WINDOW) };
-            }
-        }
-
-        // Tail (and the whole batch on non-AVX2 hosts): scalar with the same prefetch wave.
-        while i < n {
-            let hash = canon[i];
-            if let Some(bf) = &engine.filter
-                && i + WINDOW < n
-            {
-                prefetch_read(bf.block_ptr(canon[i + WINDOW]));
-            }
-            let bloom_ok = match &engine.filter {
-                Some(bf) => bf.contains_hash(hash),
-                None => true,
-            };
-            if bloom_ok && let Some(idx) = engine.backend.lookup(hash) {
-                let idx = idx as usize;
-                let ok = match &engine.fingerprints {
-                    Some(fps) => {
-                        let fp = fingerprint16_mph(hash);
-                        unsafe { *fps.get_unchecked(idx) == fp }
-                    }
-                    None => true,
-                };
-                if ok {
-                    out[i] = Some(idx);
+            return;
+        };
+        const LANES: usize = 64;
+        for (hashes, out) in hashes.chunks(LANES).zip(out.chunks_mut(LANES)) {
+            let mut prepared = [crate::ptrhash25::PreparedLookup::default(); LANES];
+            let mut slots = [usize::MAX; LANES];
+            for (i, &hash) in hashes.iter().enumerate() {
+                prepared[i] = mph.prepare_lookup(hash);
+                if let Some(bf) = &engine.filter {
+                    prefetch_read(bf.block_ptr(hash));
                 }
             }
-            i += 1;
-        }
-    }
-
-    /// 8-wide body of [`Index::lookup_batch_u64_simd_into`]. Processes whole groups
-    /// of 8 and returns the number of keys handled.
-    ///
-    /// # Safety
-    /// AVX2 must be available; `engine.backend.slot_capacity() <= i32::MAX`.
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2")]
-    unsafe fn batch_u64_avx2(
-        engine: &MphEngine,
-        canon: &[u64],
-        out: &mut [Option<usize>],
-        window: usize,
-    ) -> usize {
-        let n = canon.len();
-        let fp_base =
-            engine.fingerprints.as_ref().map(|fp| fp.as_ptr()).unwrap_or(std::ptr::null());
-        let mut i = 0usize;
-        while i + 8 <= n {
-            // Lookahead Bloom prefetch.
-            if let Some(bf) = &engine.filter {
-                for k in 0..8 {
-                    if i + window + k < n {
-                        prefetch_read(bf.block_ptr(canon[i + window + k]));
-                    }
-                }
-            }
-
-            // Bloom + backend.lookup for 8 keys, collecting (idx, expected_fp) pairs.
-            let mut indices = [0u32; 8];
-            let mut expected = [0u16; 8];
-            let mut alive = [false; 8];
-            for k in 0..8 {
-                let hash = canon[i + k];
-                if let Some(bf) = &engine.filter
-                    && !bf.contains_hash(hash)
-                {
+            for (i, &hash) in hashes.iter().enumerate() {
+                if engine.filter.as_ref().is_some_and(|bf| !bf.contains_hash(hash)) {
                     continue;
                 }
-                if let Some(idx) = engine.backend.lookup(hash) {
-                    indices[k] = idx;
-                    expected[k] = fingerprint16_mph(hash);
-                    alive[k] = true;
+                let slot = mph.finish_lookup(prepared[i]);
+                slots[i] = slot;
+                if let Some(fp) = &engine.fingerprints {
+                    fp.prefetch(slot);
                 }
             }
-            if !fp_base.is_null() {
-                // Single gather for fingerprint validation. Dead lanes carry index 0;
-                // the last live slot's 32-bit load ends in the padding element.
-                let bitmask = unsafe { Self::gather_fp_check_x8(fp_base, indices, expected) };
-                for k in 0..8 {
-                    if alive[k] && (bitmask & (1 << k)) != 0 {
-                        out[i + k] = Some(indices[k] as usize);
-                    }
-                }
-            } else {
-                for k in 0..8 {
-                    if alive[k] {
-                        out[i + k] = Some(indices[k] as usize);
-                    }
-                }
+            for (i, &hash) in hashes.iter().enumerate() {
+                let slot = slots[i];
+                out[i] = if slot != usize::MAX
+                    && engine.fingerprints.as_ref().is_none_or(|fp| fp.matches(slot, hash))
+                {
+                    Some(slot)
+                } else {
+                    None
+                };
             }
-            i += 8;
         }
-        i
     }
 
     /// Same result as [`Index::lookup_u64`]; the extra `Option` layer dates from
@@ -591,8 +475,7 @@ impl Index {
             None => return Some(Err(IndexError::KeyNotFound)),
         };
         if let Some(fps) = &engine.fingerprints {
-            let fp = fingerprint16_mph(canonical);
-            let ok = unsafe { *fps.get_unchecked(idx) == fp };
+            let ok = fps.matches(idx, canonical);
             Some(if ok { Ok(idx) } else { Err(IndexError::KeyNotFound) })
         } else {
             Some(Ok(idx))
@@ -633,7 +516,8 @@ impl Index {
 
     /// Probabilistic membership test: `false` means the key is definitely absent,
     /// `true` means it is present with the Bloom filter's false-positive rate
-    /// (~0.5% at 11 bits/key). For an exact answer use `lookup(..).is_ok()`.
+    /// (~0.5% at 11 bits/key). Without Bloom, checks the configured fingerprints.
+    /// `lookup(..).is_ok()` uses all configured filters but remains probabilistic.
     ///
     /// **Lean mode** (`lean_mph = true`): there is no membership information at
     /// all, so this always returns `true` for a non-empty index. Check
@@ -645,10 +529,7 @@ impl Index {
         let canonical = canonical_hash_key(key, engine.prehash_seed);
         match &engine.filter {
             Some(bf) => bf.contains_hash(canonical),
-            // Fingerprints without a filter never happen for indexes built by
-            // this crate; go through the full lookup so the answer stays exact
-            // if such a combination is ever loaded. In lean mode the lookup
-            // cannot fail, so this is the documented always-`true`.
+            // Without Bloom, use the fingerprints. Lean lookups cannot fail.
             None => self.lookup_mph(engine, key).is_ok(),
         }
     }
@@ -722,99 +603,18 @@ impl Index {
         self.lookup_batch(keys)
     }
 
-    /// Software-pipelined batched lookup with WINDOW=32 prefetch depth. At 100M index
-    /// size the per-key working set spans 3 random cache lines (BlockBloom block,
-    /// fingerprint byte, and pilot byte from the backend) — together ~190 ns of stalls
-    /// per key with sequential code. Issuing 32 prefetches ahead overlaps all three
-    /// loads with ongoing compute, getting throughput close to the DRAM bandwidth limit.
-    ///
-    /// Empirically window=32 beats window=8 by 2-3× on 100M-key indexes on Alder Lake
-    /// (where each core has ~10 outstanding L1/L2 misses, scaled by 3 prefetch streams).
+    /// Batched byte-key lookup through the same three-stage pipeline as the u64
+    /// API. Uses bounded stack scratch and preserves query order, including misses.
     pub fn lookup_batch_pipelined(&self, keys: &[&[u8]]) -> Vec<Option<usize>> {
-        let Some(engine) = self.engine.as_ref() else {
-            return vec![None; keys.len()];
-        };
-        let mut out = Vec::with_capacity(keys.len());
-        {
-            {
-                // Lean-mode fast path: no Bloom, no fingerprints. Strip down to
-                // hash → backend.lookup. Still does WINDOW-ahead hashing for
-                // pilot-table prefetch hit, but skips Bloom/fp waves entirely.
-                if engine.filter.is_none() && engine.fingerprints.is_none() {
-                    for &k in keys {
-                        let h = canonical_hash_key(k, engine.prehash_seed);
-                        out.push(engine.backend.lookup(h).map(|i| i as usize));
-                    }
-                    return out;
-                }
-                let filter = engine.filter.as_ref();
-                let fingerprints = engine.fingerprints.as_ref();
-                const WINDOW: usize = 32;
-                if keys.len() < WINDOW * 2 {
-                    for &k in keys {
-                        out.push(self.lookup_mph(engine, k).ok());
-                    }
-                    return out;
-                }
-                let mut canon = vec![0u64; WINDOW * 2];
-
-                // Bootstrap: hash first WINDOW keys + issue first wave of Bloom prefetches.
-                for slot in 0..WINDOW {
-                    let h = canonical_hash_key(keys[slot], engine.prehash_seed);
-                    canon[slot] = h;
-                    if let Some(bf) = filter {
-                        prefetch_read(bf.block_ptr(h));
-                    }
-                }
-
-                let mut hash_head = WINDOW;
-                for i in 0..keys.len() {
-                    let ring_pos = i % (WINDOW * 2);
-                    let hash = canon[ring_pos];
-
-                    // Wave A: hash + Bloom prefetch for key[i + WINDOW].
-                    if hash_head < keys.len() {
-                        let next_pos = hash_head % (WINDOW * 2);
-                        let h = canonical_hash_key(keys[hash_head], engine.prehash_seed);
-                        canon[next_pos] = h;
-                        if let Some(bf) = filter {
-                            prefetch_read(bf.block_ptr(h));
-                        }
-                        hash_head += 1;
-                    }
-
-                    // Wave B: optional Bloom check.
-                    if let Some(bf) = filter
-                        && !bf.contains_hash(hash)
-                    {
-                        out.push(None);
-                        continue;
-                    }
-                    let idx_opt = engine.backend.lookup(hash);
-
-                    // Wave C: prefetch fingerprint (only if fingerprints present).
-                    if let (Some(fps), Some(idx)) = (fingerprints, idx_opt) {
-                        // SAFETY: `idx < slot_capacity() < fps.len()`; a prefetch is a hint.
-                        prefetch_read(unsafe { fps.as_ptr().add(idx as usize) });
-                    }
-
-                    let res = match idx_opt {
-                        Some(idx) => {
-                            let idx = idx as usize;
-                            match fingerprints {
-                                Some(fps) => {
-                                    let fp = fingerprint16_mph(hash);
-                                    let ok = unsafe { *fps.get_unchecked(idx) == fp };
-                                    if ok { Some(idx) } else { None }
-                                }
-                                None => Some(idx),
-                            }
-                        }
-                        None => None,
-                    };
-                    out.push(res);
-                }
+        let Some(engine) = self.engine.as_ref() else { return vec![None; keys.len()] };
+        let mut out = vec![None; keys.len()];
+        // Bounded scratch; byte-key batches no longer allocate a full hash array.
+        let mut hashes = [0u64; 64];
+        for (input, result) in keys.chunks(64).zip(out.chunks_mut(64)) {
+            for (h, key) in hashes.iter_mut().zip(input) {
+                *h = canonical_hash_key(key, engine.prehash_seed);
             }
+            Self::lookup_canonical_batch(engine, &hashes[..input.len()], result);
         }
         out
     }
@@ -872,7 +672,13 @@ impl Index {
             }
         });
 
-        let fingerprints = engine.fingerprints.as_ref().map(|fps| fps[..fps.len() - 1].to_vec());
+        let fingerprints = engine.fingerprints.as_ref().and_then(Fingerprints::export_low16);
+        let fingerprint_bits = engine.fingerprints.as_ref().map_or(0, |fp| fp.width().bits());
+        let fingerprint_bytes = engine.fingerprints.as_ref().map(|fp| {
+            let mut bytes = fp.mmap_bytes();
+            bytes.truncate(fp.memory_usage());
+            bytes
+        });
 
         let parts = mph
             .parts
@@ -899,6 +705,8 @@ impl Index {
             remap: mph.remap.to_vec(),
             bloom: bloom_export,
             fingerprints,
+            fingerprint_bits,
+            fingerprint_bytes,
             part_salt: mph.part_salt,
             parts,
         })
@@ -916,11 +724,7 @@ impl Index {
         };
         let mph_memory = engine.backend.memory_usage_bytes();
         let filter_memory = engine.filter.as_ref().map(|b| b.memory_usage()).unwrap_or(0);
-        let fp_memory = engine
-            .fingerprints
-            .as_ref()
-            .map(|fp| (fp.len() - 1) * std::mem::size_of::<u16>())
-            .unwrap_or(0);
+        let fp_memory = engine.fingerprints.as_ref().map(Fingerprints::memory_usage).unwrap_or(0);
         IndexStats {
             engine: "mph",
             total_keys: self.key_count,
@@ -943,28 +747,211 @@ impl Index {
         }
     }
 
-    /// Save the index inside the section container (`mmap_index`): one
-    /// `LegacyPayload` section holding exactly the bytes of [`Index::to_bytes`].
-    /// Kept for compatibility; [`Index::save`] streams the same payload without the
-    /// container and without a second in-memory copy.
+    /// Save aligned, checksummed tables for zero-copy loading. The rare map
+    /// fallback is stored as a legacy payload and remains readable.
     pub fn save_mmap<P: AsRef<std::path::Path>>(&self, path: P) -> Result<(), IndexError> {
         use crate::mmap_index::{MmapIndexWriter, SectionKind};
         let mut w = MmapIndexWriter::create(path, self.key_count as u64)?;
-        let bytes = self.to_bytes()?;
-        w.add_section(SectionKind::LegacyPayload, bytes);
+        if let Some(e) = &self.engine {
+            use crate::mph_backend::PtrHash25Storage;
+            let BackendDispatch::PtrHash25(b) = &e.backend;
+            if let PtrHash25Storage::Mph(m) = &b.storage {
+                let (bseed, bshift) = e
+                    .filter
+                    .as_ref()
+                    .map(|f| {
+                        let (s, b, _) = f.mmap_data();
+                        (s, b as u64)
+                    })
+                    .unwrap_or((0, 0));
+                let fields = [
+                    e.fingerprints.as_ref().map_or(16, |fp| fp.width().bits() as u64),
+                    e.prehash_seed,
+                    m.n,
+                    m.num_buckets as u64,
+                    m.salt,
+                    m.use_aes_hash as u64,
+                    m.prerotate as u64,
+                    m.part_salt,
+                    bseed,
+                    bshift,
+                ];
+                let mut meta = Vec::new();
+                crate::wire::extend_le(&mut meta, &fields);
+                w.add_section(SectionKind::PtrHash25Meta, meta);
+                w.add_section(SectionKind::PtrHash25Pilots, m.pilots.as_slice().to_vec());
+                let mut parts = Vec::new();
+                for p in &m.parts {
+                    crate::wire::extend_le(&mut parts, &[p.slot_off, p.salt]);
+                    crate::wire::extend_le(
+                        &mut parts,
+                        &[
+                            p.bucket_off,
+                            p.num_keys,
+                            p.num_slots,
+                            p.num_buckets,
+                            p.large_buckets,
+                            p.remap_off,
+                        ],
+                    );
+                }
+                w.add_section(SectionKind::PtrHash25Parts, parts);
+                let mut remap = Vec::new();
+                crate::wire::extend_le(&mut remap, &m.remap);
+                w.add_section(SectionKind::PtrHash25Remap, remap);
+                if !m.fingerprints.is_empty() {
+                    w.add_section(SectionKind::PtrHash25Fingerprints, m.fingerprints.to_vec());
+                }
+                if let Some(f) = &e.filter {
+                    let mut words = Vec::new();
+                    crate::wire::extend_le(&mut words, f.mmap_data().2);
+                    w.add_section(SectionKind::BlockBloomWords, words);
+                }
+                if let Some(f) = &e.fingerprints {
+                    w.add_section(SectionKind::OuterFingerprints, f.mmap_bytes());
+                }
+            } else {
+                w.add_section(SectionKind::LegacyPayload, self.to_bytes()?);
+            }
+        } else {
+            w.add_section(SectionKind::LegacyPayload, self.to_bytes()?);
+        }
         Ok(w.finalize()?)
     }
 
-    /// Open a previously `save_mmap`'d index. Reads the file, then parses the
-    /// `LegacyPayload` section exactly like [`Index::from_bytes`] (checksum and
-    /// validation included). Nothing is memory-mapped.
+    /// Open aligned tables without copying on little-endian Windows. A retained
+    /// read handle excludes write/delete opens until the index is dropped.
+    /// Other platforms use owned file bytes for safety; use `open_mmap_unchecked`
+    /// there when the application guarantees an immutable backing file.
+    /// Legacy payloads still load through the validated copying decoder.
     pub fn open_mmap<P: AsRef<std::path::Path>>(path: P) -> Result<Self, IndexError> {
-        use crate::mmap_index::{MmapIndex, SectionKind};
-        let mmap = MmapIndex::open(path)?;
+        Self::from_mmap_reader(crate::mmap_index::MmapIndex::open(path)?)
+    }
+
+    /// Whether the lookup tables reference an OS file mapping. False for owned
+    /// builds, legacy payloads, empty indexes and the safe Unix byte-buffer fallback.
+    pub fn is_memory_mapped(&self) -> bool {
+        let Some(engine) = &self.engine else {
+            return false;
+        };
+        let BackendDispatch::PtrHash25(backend) = &engine.backend;
+        match &backend.storage {
+            crate::mph_backend::PtrHash25Storage::Mph(m) => m.pilots.is_memory_mapped(),
+            _ => false,
+        }
+    }
+
+    /// Zero-copy opener on Unix as well as Windows.
+    /// # Safety
+    /// The backing file must not be modified or truncated while the index lives,
+    /// including by other processes. Prefer `open_mmap` on Windows.
+    pub unsafe fn open_mmap_unchecked<P: AsRef<std::path::Path>>(
+        path: P,
+    ) -> Result<Self, IndexError> {
+        Self::from_mmap_reader(unsafe { crate::mmap_index::MmapIndex::open_unchecked(path)? })
+    }
+
+    fn from_mmap_reader(mmap: crate::mmap_index::MmapIndex) -> Result<Self, IndexError> {
+        use crate::mmap_index::SectionKind;
         let header = mmap.parse_header().map_err(|e| match e.kind() {
             std::io::ErrorKind::InvalidData => IndexError::CorruptData,
             _ => IndexError::Io(e),
         })?;
+        if let Some(meta) = mmap.section(&header, SectionKind::PtrHash25Meta) {
+            let bad = || IndexError::CorruptData;
+            // Aligned tables have no inner payload checksum. Never accept a
+            // version downgrade that would bypass the container checksum.
+            if header.version != 2 {
+                return Err(bad());
+            }
+            if meta.len() != 80 {
+                return Err(bad());
+            }
+            let f: Vec<u64> =
+                meta.as_chunks::<8>().0.iter().map(|b| u64::from_le_bytes(*b)).collect();
+            if FingerprintBits::from_bits(f[0]).is_none() || f[5] > 1 || f[6] >= 64 {
+                return Err(bad());
+            }
+            let raw = mmap.section(&header, SectionKind::PtrHash25Parts).ok_or_else(bad)?;
+            if !raw.len().is_multiple_of(40) {
+                return Err(bad());
+            }
+            let parts: Vec<crate::ptrhash25::PartInfo> = raw
+                .as_chunks::<40>()
+                .0
+                .iter()
+                .map(|b| {
+                    let u64_at = |i| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+                    let u32_at = |i| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
+                    crate::ptrhash25::PartInfo {
+                        slot_off: u64_at(0),
+                        salt: u64_at(8),
+                        bucket_off: u32_at(16),
+                        num_keys: u32_at(20),
+                        num_slots: u32_at(24),
+                        num_buckets: u32_at(28),
+                        large_buckets: u32_at(32),
+                        remap_off: u32_at(36),
+                    }
+                })
+                .collect();
+            let m = crate::ptrhash25::PtrHash25Mphf {
+                n: f[2],
+                num_buckets: u32::try_from(f[3]).map_err(|_| bad())?,
+                salt: f[4],
+                pilots: mmap.table(&header, SectionKind::PtrHash25Pilots).ok_or_else(bad)?,
+                remap: mmap.table(&header, SectionKind::PtrHash25Remap).ok_or_else(bad)?,
+                fingerprints: mmap
+                    .section(&header, SectionKind::PtrHash25Fingerprints)
+                    .unwrap_or(&[])
+                    .to_vec(),
+                use_aes_hash: f[5] != 0,
+                prerotate: f[6] as u8,
+                part_salt: f[7],
+                parts: parts.into_boxed_slice(),
+            };
+            if !m.validate() {
+                return Err(bad());
+            }
+            let filter = if mmap.section(&header, SectionKind::BlockBloomWords).is_some() {
+                Some(
+                    BlockBloom::mapped(
+                        f[8],
+                        u32::try_from(f[9]).map_err(|_| bad())?,
+                        mmap.table(&header, SectionKind::BlockBloomWords).ok_or_else(bad)?,
+                    )
+                    .ok_or_else(bad)?,
+                )
+            } else {
+                None
+            };
+            let fingerprints = if mmap.section(&header, SectionKind::OuterFingerprints).is_some() {
+                Some(match FingerprintBits::from_bits(f[0]).ok_or_else(bad)? {
+                    FingerprintBits::Bits16 => Fingerprints::u16_table(
+                        mmap.table(&header, SectionKind::OuterFingerprints).ok_or_else(bad)?,
+                    ),
+                    width => Fingerprints::packed(
+                        mmap.table(&header, SectionKind::OuterFingerprints).ok_or_else(bad)?,
+                        width,
+                        usize::try_from(header.key_count).map_err(|_| bad())?,
+                    ),
+                })
+            } else {
+                None
+            };
+            let idx = Self {
+                key_count: usize::try_from(header.key_count).map_err(|_| bad())?,
+                engine: Some(MphEngine {
+                    backend: BackendDispatch::PtrHash25(PtrHash25Backend {
+                        storage: crate::mph_backend::PtrHash25Storage::Mph(m),
+                    }),
+                    prehash_seed: f[1],
+                    filter,
+                    fingerprints,
+                }),
+            };
+            return if idx.validate() { Ok(idx) } else { Err(bad()) };
+        }
         let bytes = mmap
             .section(&header, SectionKind::LegacyPayload)
             .or_else(|| mmap.section(&header, SectionKind::PtrHash25Pilots))
@@ -1016,10 +1003,8 @@ impl Index {
             }
             match &engine.fingerprints {
                 Some(fp) => {
-                    w.write_all(&[1])?;
-                    let real = &fp[..fp.len() - 1];
-                    w.write_all(&(real.len() as u64).to_le_bytes())?;
-                    crate::wire::write_le(&mut w, real)?;
+                    w.write_all(&[fp.wire_flag()])?;
+                    fp.write_into(&mut w)?;
                 }
                 None => w.write_all(&[0])?,
             }
@@ -1067,7 +1052,7 @@ impl Index {
                 let filter =
                     BlockBloom::read_from(bytes, &mut bf_pos).ok_or(IndexError::CorruptData)?;
                 cursor.pos = bf_pos;
-                let fingerprints = read_fingerprints(&mut cursor)?;
+                let fingerprints = read_fingerprints(&mut cursor, 1)?;
                 Ok(Index {
                     engine: Some(MphEngine {
                         backend,
@@ -1097,7 +1082,7 @@ impl Index {
                 };
                 let has_fp = cursor.read_u8().ok_or(IndexError::CorruptData)?;
                 let fingerprints =
-                    if has_fp == 1 { Some(read_fingerprints(&mut cursor)?) } else { None };
+                    if has_fp == 1 { Some(read_fingerprints(&mut cursor, 1)?) } else { None };
                 Ok(Index {
                     engine: Some(MphEngine { backend, prehash_seed, filter, fingerprints }),
                     key_count,
@@ -1162,7 +1147,7 @@ impl Index {
         };
         let has_fp = cursor.read_u8().ok_or(IndexError::CorruptData)?;
         let fingerprints = match has_fp {
-            1 => Some(read_fingerprints(&mut cursor)?),
+            1..=3 => Some(read_fingerprints(&mut cursor, has_fp)?),
             0 => None,
             _ => return Err(IndexError::CorruptData),
         };
@@ -1187,7 +1172,7 @@ impl Index {
                     return false;
                 }
                 if let Some(fp) = &engine.fingerprints
-                    && fp.len() != cap + 1
+                    && !fp.validate(cap)
                 {
                     return false;
                 }
@@ -1201,6 +1186,7 @@ impl Index {
         Self::from_bytes(bytes)
     }
 
+    #[inline(always)]
     fn lookup_mph(&self, engine: &MphEngine, key: &[u8]) -> Result<usize, IndexError> {
         let canonical = canonical_hash_key(key, engine.prehash_seed);
         // Optional Bloom prefilter (skipped in lean_mph mode).
@@ -1212,9 +1198,7 @@ impl Index {
         let idx = engine.backend.lookup(canonical).ok_or(IndexError::KeyNotFound)? as usize;
         // Optional fingerprint verification (skipped in lean_mph mode).
         if let Some(fps) = &engine.fingerprints {
-            let fp = fingerprint16_mph(canonical);
-            // SAFETY: mph index is in [0..n), fingerprints.len() == n
-            let ok = unsafe { *fps.get_unchecked(idx) == fp };
+            let ok = fps.matches(idx, canonical);
             if !ok {
                 return Err(IndexError::KeyNotFound);
             }
@@ -1297,7 +1281,7 @@ where
         //  - lean: the partition reads A and scatters into a fresh B.
         // Filter and part builds only need *a* permutation of the hashes, so no copy of
         // the original order is ever kept. At 100M keys this avoids faulting in 800 MB.
-        let (filter, part) = if config.lean_mph {
+        let (filter, part) = if config.lean_mph || !config.bloom_filter {
             let part = crate::ptrhash25::partition_keys(canonical.as_slice(), &mph_cfg);
             drop(canonical);
             (None, part)
@@ -1311,25 +1295,42 @@ where
             (Some(filter), part)
         };
         let t2 = std::time::Instant::now();
-        let (backend, fp16) =
-            match PtrHash25Backend::build_from_partitioned(&part, &backend_cfg, !config.lean_mph) {
-                Ok(v) => v,
-                Err(MphError::DuplicateKey) => {
-                    round += 1;
-                    if round >= MAX_PREHASH_ROUNDS {
-                        return Err(IndexError::DuplicateKey);
-                    }
-                    continue;
+        let (backend, fp16) = match PtrHash25Backend::build_from_partitioned(
+            &part,
+            &backend_cfg,
+            !config.lean_mph && config.fingerprint_bits == FingerprintBits::Bits16,
+        ) {
+            Ok(v) => v,
+            Err(MphError::DuplicateKey) => {
+                round += 1;
+                if round >= MAX_PREHASH_ROUNDS {
+                    return Err(IndexError::DuplicateKey);
                 }
-                Err(e) => return Err(e.into()),
-            };
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
         let t3 = std::time::Instant::now();
-        // Outer u16 fingerprints were filled per part inside the MPH build; one
-        // padding element keeps the batched gather inside the allocation.
-        let fingerprints = fp16.map(|mut v| {
-            v.push(0);
-            v.into_boxed_slice()
-        });
+        // Default fp16 is filled inside the MPH build. Wider packed tables
+        // are filled from the original canonical hashes and the final slots.
+        let fingerprints = if config.lean_mph {
+            None
+        } else if config.fingerprint_bits == FingerprintBits::Bits16 {
+            fp16.map(Fingerprints::low16)
+        } else {
+            let stride = config.fingerprint_bits.bits() as usize / 8;
+            let mut data = vec![0u8; n * stride + 1];
+            for i in 0..part.len() {
+                let hash = part.original_key(i);
+                let slot = match &backend.storage {
+                    crate::mph_backend::PtrHash25Storage::Mph(m) => m.index_u64(hash),
+                    crate::mph_backend::PtrHash25Storage::Map(m) => m[&hash],
+                } as usize;
+                data[slot * stride..(slot + 1) * stride]
+                    .copy_from_slice(&hash.to_le_bytes()[..stride]);
+            }
+            Some(Fingerprints::packed(data.into(), config.fingerprint_bits, n))
+        };
         if trace {
             eprintln!(
                 "[kira_kv_engine build] n={} parts={} | canonical {:?} | bloom+partition {:?} | mph+fingerprints {:?} | total {:?}",
@@ -1464,6 +1465,16 @@ impl IndexBuilder {
         self
     }
 
+    pub fn with_bloom_filter(mut self, enabled: bool) -> Self {
+        self.config.bloom_filter = enabled;
+        self
+    }
+
+    pub fn with_fingerprint_bits(mut self, width: FingerprintBits) -> Self {
+        self.config.fingerprint_bits = width;
+        self
+    }
+
     pub fn with_parallel_build(mut self, enabled: bool) -> Self {
         self.config.enable_parallel_build = enabled;
         self
@@ -1504,8 +1515,8 @@ impl IndexBuilder {
         self
     }
 
-    /// Enable Lean MPH mode — drops Bloom filter + outer fingerprints + inner
-    /// PtrHash25 fingerprints. Saves ~50% memory (4.5 → 2.5 B/key on PtrHash25)
+    /// Enable Lean MPH mode: drops Bloom and outer fingerprints, reducing the
+    /// default index from about 3.79 to 0.42 B/key
     /// at the cost of negative-lookup safety: foreign keys return arbitrary
     /// in-range positions instead of `KeyNotFound`.
     ///
@@ -1537,11 +1548,6 @@ impl Default for IndexBuilder {
     fn default() -> Self {
         Self::new()
     }
-}
-
-#[inline]
-fn fingerprint16_mph(canonical: u64) -> u16 {
-    (canonical & 0xFFFF) as u16
 }
 
 struct Cursor<'a> {
@@ -1596,10 +1602,19 @@ fn write_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
-fn read_fingerprints(cursor: &mut Cursor<'_>) -> Result<Box<[u16]>, IndexError> {
-    let len = cursor.read_u64().ok_or(IndexError::CorruptData)? as usize;
-    let mut fps: Vec<u16> =
-        crate::wire::read_le_at(cursor.buf, &mut cursor.pos, len).ok_or(IndexError::CorruptData)?;
-    fps.push(0); // padding element, see `MphEngine::fingerprints`
-    Ok(fps.into_boxed_slice())
+fn read_fingerprints(cursor: &mut Cursor<'_>, flag: u8) -> Result<Fingerprints, IndexError> {
+    let len = usize::try_from(cursor.read_u64().ok_or(IndexError::CorruptData)?)
+        .map_err(|_| IndexError::CorruptData)?;
+    if flag == 1 {
+        let fps: Vec<u16> = crate::wire::read_le_at(cursor.buf, &mut cursor.pos, len)
+            .ok_or(IndexError::CorruptData)?;
+        return Ok(Fingerprints::low16(fps));
+    }
+    let width = FingerprintBits::from_bits((flag as u64 + 1) * 8).ok_or(IndexError::CorruptData)?;
+    let bytes = len.checked_mul(width.bits() as usize / 8).ok_or(IndexError::CorruptData)?;
+    let end = cursor.pos.checked_add(bytes).ok_or(IndexError::CorruptData)?;
+    let mut data = cursor.buf.get(cursor.pos..end).ok_or(IndexError::CorruptData)?.to_vec();
+    cursor.pos = end;
+    data.push(0);
+    Ok(Fingerprints::packed(data.into(), width, len))
 }

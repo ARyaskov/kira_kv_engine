@@ -22,6 +22,8 @@ mod checksum;
 mod cpu;
 mod dynamic_index;
 mod elias_fano;
+mod fingerprints;
+pub use fingerprints::FingerprintBits;
 mod hot_tier;
 mod hot_tier_dynamic;
 mod hugepage;

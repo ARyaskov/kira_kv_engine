@@ -34,6 +34,7 @@ macro_rules! le_num {
     };
 }
 le_num!(u16, 2);
+le_num!(u8, 1);
 le_num!(u32, 4);
 le_num!(u64, 8);
 le_num!(f32, 4);
