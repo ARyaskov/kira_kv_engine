@@ -114,3 +114,9 @@ fuzz/target/
 fuzz/corpus/
 fuzz/artifacts/
 fuzz/coverage/
+performance/*.idx
+performance/*.exe
+performance/*.log
+performance/baseline-source/
+performance/paired/
+performance/paired-baseline/

@@ -15,7 +15,7 @@ use std::thread;
 use std::time::Instant;
 
 /// Default key count; override with `KIRA_BENCH_N=<n>`.
-const N_KEYS_DEFAULT: usize = 100_000_000;
+const N_KEYS_DEFAULT: usize = 40_000_000;
 fn n_keys() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {

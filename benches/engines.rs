@@ -12,6 +12,7 @@
 use kira_kv_engine::{
     DynamicConfig, DynamicIndex, HybridBuilder, IndexBuilder, IndexConfig, PgmBuilder, PgmIndexU128,
 };
+use std::hint::black_box;
 use std::time::Instant;
 
 fn splitmix(mut x: u64) -> u64 {
@@ -24,7 +25,7 @@ fn splitmix(mut x: u64) -> u64 {
 
 fn ns_per<T>(iters: usize, f: impl FnOnce() -> T) -> (f64, T) {
     let t = Instant::now();
-    let r = f();
+    let r = black_box(f());
     (t.elapsed().as_nanos() as f64 / iters as f64, r)
 }
 
@@ -72,7 +73,10 @@ fn main() {
         sink = sink.wrapping_add(s);
         let mut out = vec![None; q];
         let mut canon = vec![0u64; q];
-        let (batch, _) = ns_per(q, || idx.lookup_batch_u64_simd_into(&hits, &mut canon, &mut out));
+        let (batch, _) = ns_per(q, || {
+            idx.lookup_batch_u64_simd_into(black_box(&hits), &mut canon, &mut out);
+            black_box(&out);
+        });
         let miss = if lean {
             None
         } else {
@@ -167,7 +171,9 @@ fn main() {
         idx.compact().unwrap();
         let build = t.elapsed().as_secs_f64();
         let bpk = idx.memory_usage() as f64 / m as f64;
-        let hb: Vec<[u8; 8]> = hits.iter().take(m).map(|k| k.to_le_bytes()).collect();
+        let hb: Vec<[u8; 8]> = (0..q.min(m))
+            .map(|i| keys_u64[(splitmix(i as u64 ^ 0x77) % m as u64) as usize].to_le_bytes())
+            .collect();
         let (lookup, s) = ns_per(hb.len(), || {
             hb.iter().fold(0usize, |a, k| a.wrapping_add(idx.lookup(k).unwrap_or(0) as usize))
         });
