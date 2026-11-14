@@ -104,7 +104,10 @@ impl BlockBloom {
         // no reduce.
         #[cfg(feature = "parallel")]
         {
-            if rayon::current_num_threads() > 1 && hashes.len() >= PARALLEL_MIN_KEYS {
+            if crate::build_pool::parallel_enabled()
+                && hashes.len() >= PARALLEL_MIN_KEYS
+                && rayon::current_num_threads() > 1
+            {
                 match grouped {
                     Some(g) => {
                         build_parallel_ranges(hashes, words.as_mut_slice(), blocks, bit_shift, g)

@@ -347,6 +347,14 @@ impl HybridBuilder {
         hashed: &mut Vec<(u64, u32)>,
         n: usize,
     ) -> Result<HybridIndex, HybridError> {
+        crate::build_pool::run(self.enable_parallel, || self.finalize_build_inner(hashed, n))
+    }
+
+    fn finalize_build_inner(
+        self,
+        hashed: &mut Vec<(u64, u32)>,
+        n: usize,
+    ) -> Result<HybridIndex, HybridError> {
         // Phase 2: sort by hash. Duplicate hashes (collisions) would break
         // segment lookup — reject early. canonical_hash on distinct keys has
         // ~2^-64 collision rate, so this rarely triggers.
@@ -450,7 +458,7 @@ impl HybridBuilder {
         let segments: Vec<SegmentStorage> = {
             #[cfg(feature = "parallel")]
             {
-                if self.enable_parallel {
+                if self.enable_parallel && crate::build_pool::parallel_enabled() {
                     use rayon::prelude::*;
                     crate::build_pool::run(true, || seg_ranges.par_iter().map(build_one).collect())
                 } else {

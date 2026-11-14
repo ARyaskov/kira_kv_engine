@@ -39,9 +39,9 @@ pub enum SectionKind {
     // ---- PGM zero-copy sections ----
     /// PGM raw sorted keys, `[u64]`.
     PgmKeys = 16,
-    /// PGM segment slopes, `[f32]` (one f32 per segment).
+    /// PGM segment slopes: legacy `[f32]`, relative models `[f64]` (see PgmMeta).
     PgmSlopes = 17,
-    /// PGM segment intercepts, `[f32]`.
+    /// Legacy PGM segment intercepts, `[f32]`; empty for relative models.
     PgmIntercepts = 18,
     /// PGM per-segment min_key, `[u64]`.
     PgmMinKeys = 19,
@@ -57,7 +57,8 @@ pub enum SectionKind {
     PgmStarts = 24,
     /// PGM per-segment end position, `[u32]`.
     PgmEnds = 25,
-    /// PGM metadata: `[u32 epsilon][u8 has_bloom][padding…]`.
+    /// PGM metadata: `[u32 epsilon][u8 has_bloom][u8 relative][2 zero bytes]`.
+    /// Relative 0 denotes legacy absolute f32 models; 1 denotes relative f64.
     PgmMeta = 26,
     /// PGM optional Block-Bloom (encoded in BlockBloom format).
     PgmBloom = 27,

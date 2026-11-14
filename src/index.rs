@@ -52,6 +52,12 @@ pub enum IndexError {
     KeyNotFound,
     #[error("invalid key format")]
     InvalidKey,
+    /// A build option is outside its supported domain.
+    #[error("invalid build configuration: {0}")]
+    InvalidConfig(&'static str),
+    /// The requested table cannot be represented by the index or target platform.
+    #[error("index capacity exceeded: {0}")]
+    CapacityExceeded(&'static str),
     /// Serialized data failed the checksum or a structural check.
     #[error("corrupt data")]
     CorruptData,
@@ -74,6 +80,19 @@ impl From<MphError> for IndexError {
         match err {
             MphError::DuplicateKey => IndexError::DuplicateKey,
             MphError::Unresolvable => IndexError::Unresolvable,
+        }
+    }
+}
+
+impl From<crate::ptrhash25::BuildValidationError> for IndexError {
+    fn from(err: crate::ptrhash25::BuildValidationError) -> Self {
+        match err {
+            crate::ptrhash25::BuildValidationError::InvalidConfig(reason) => {
+                Self::InvalidConfig(reason)
+            }
+            crate::ptrhash25::BuildValidationError::CapacityExceeded(reason) => {
+                Self::CapacityExceeded(reason)
+            }
         }
     }
 }
@@ -251,7 +270,7 @@ pub struct BloomExport {
 
 impl Index {
     /// Build from owned keys. Equivalent to [`Index::build_index_ref`] followed by
-    /// dropping `keys` (the drop of millions of small allocations runs in parallel).
+    /// dropping `keys` (large drops run in parallel when enabled in the config).
     ///
     /// Prefer [`Index::build_index_ref`] when the keys stay alive anyway: it avoids the
     /// clone on the caller side and the deallocation cost inside the build.
@@ -259,19 +278,21 @@ impl Index {
     where
         K: AsRef<[u8]> + Send + Sync,
     {
+        let parallel = config.enable_parallel_build;
         let index = Self::build_index_ref(&keys, config)?;
-        drop_keys_parallel(keys);
+        drop_keys_parallel(keys, parallel);
         Ok(index)
     }
 
-    /// Build from borrowed keys (must be unique). Keys are hashed in place in parallel;
-    /// nothing is copied into an intermediate arena.
+    /// Build from borrowed keys (must be unique). Keys are hashed in place, using
+    /// parallel workers only when enabled in the config.
     ///
     /// Duplicate keys are detected exactly (`IndexError::DuplicateKey`).
     pub fn build_index_ref<K>(keys: &[K], config: IndexConfig) -> Result<Self, IndexError>
     where
         K: AsRef<[u8]> + Sync,
     {
+        config.mph_config.validate_for_len(keys.len())?;
         if keys.is_empty() {
             return Ok(Self::empty());
         }
@@ -1347,6 +1368,7 @@ where
             (Some(filter), part)
         };
         let t2 = std::time::Instant::now();
+        crate::ptrhash25::validate_partitioned(&part, &mph_cfg)?;
         let (backend, fp16) = match PtrHash25Backend::build_from_partitioned(
             &part,
             &backend_cfg,
@@ -1421,17 +1443,17 @@ where
     crate::hugepage::prefault(out.as_mut_slice());
     #[cfg(feature = "parallel")]
     {
-        use rayon::prelude::*;
-        const CHUNK: usize = 4096;
-        out.as_mut_slice()
-            .par_chunks_mut(CHUNK)
-            .zip(keys.par_chunks(CHUNK))
-            .for_each(|(o, kc)| hash_chunk(o, kc, seed));
+        if crate::build_pool::parallel_enabled() {
+            use rayon::prelude::*;
+            const CHUNK: usize = 4096;
+            out.as_mut_slice()
+                .par_chunks_mut(CHUNK)
+                .zip(keys.par_chunks(CHUNK))
+                .for_each(|(o, kc)| hash_chunk(o, kc, seed));
+            return out;
+        }
     }
-    #[cfg(not(feature = "parallel"))]
-    {
-        hash_chunk(out.as_mut_slice(), keys, seed);
-    }
+    hash_chunk(out.as_mut_slice(), keys, seed);
     out
 }
 
@@ -1448,15 +1470,21 @@ fn hash_chunk<K: AsRef<[u8]>>(out: &mut [u64], keys: &[K], seed: u64) {
 
 /// Drop a large key vector using all build threads. Freeing 10M small allocations
 /// single-threaded costs ~200 ms on the Windows heap.
-fn drop_keys_parallel<K: Send>(keys: Vec<K>) {
+fn drop_keys_parallel<K: Send>(keys: Vec<K>, parallel: bool) {
     #[cfg(feature = "parallel")]
     {
-        if keys.len() >= 1 << 16 && std::mem::needs_drop::<K>() {
+        if parallel
+            && crate::build_pool::parallel_enabled()
+            && keys.len() >= 1 << 16
+            && std::mem::needs_drop::<K>()
+        {
             use rayon::prelude::*;
             crate::build_pool::pool().install(|| keys.into_par_iter().for_each(drop));
             return;
         }
     }
+    #[cfg(not(feature = "parallel"))]
+    let _ = parallel;
     drop(keys);
 }
 

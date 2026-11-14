@@ -6,7 +6,7 @@ from the crate root:
 ```rust
 use kira_kv_engine::{
     // Static MPH (PtrHash25)
-    Index, IndexBuilder, IndexConfig, IndexError, IndexStats,
+    Index, IndexBuilder, IndexConfig, IndexError, IndexStats, MphConfig,
     // Dynamic MPH (LSM-style)
     DynamicIndex, DynamicConfig, DynamicInsertError, CompactionPolicy, StableId,
     // PGM learned index
@@ -46,7 +46,7 @@ pub struct IndexBuilder { /* opaque */ }
 impl IndexBuilder {
     pub fn new() -> Self;
     pub fn with_config(self, config: IndexConfig) -> Self;
-    pub fn with_mph_config(self, mph_config: ptrhash25::BuildConfig) -> Self;
+    pub fn with_mph_config(self, mph_config: MphConfig) -> Self;
     pub fn with_parallel_build(self, enabled: bool) -> Self;
     pub fn with_bloom_filter(self, enabled: bool) -> Self;
     pub fn with_fingerprint_bits(self, width: FingerprintBits) -> Self;
@@ -60,7 +60,7 @@ impl IndexBuilder {
     // with_pgm_elias_fano, with_pgm_target_lookup_ns
 
     /// Owned keys: same build as `build_index_ref`, then `keys` is dropped in
-    /// parallel on the build pool.
+    /// parallel on the build pool when parallel building is enabled.
     pub fn build_index<K: AsRef<[u8]> + Send + Sync>(self, keys: Vec<K>)
         -> Result<Index, IndexError>;
 
@@ -79,7 +79,7 @@ pool: every core by default, P-cores (pinned) on hybrid CPUs; `KIRA_BUILD_THREAD
 
 ```rust
 pub struct IndexConfig {
-    pub mph_config: ptrhash25::BuildConfig,   // lambda (keys/bucket, 3.0), alpha (load, 0.98),
+    pub mph_config: MphConfig,              // lambda (keys/bucket, 3.0), alpha (load, 0.98),
                                               // max_rehash, seed, with_fingerprints, use_aes_hash
     pub enable_parallel_build: bool,
     pub lean_mph: bool,
@@ -91,6 +91,18 @@ pub struct IndexConfig {
 ```
 
 Default: `lean_mph=false`, `enable_parallel_build=true` (with the `parallel` feature).
+
+`MphConfig` is a public alias of the existing MPH `BuildConfig`; existing types
+and builder signatures remain compatible. `lambda` must be finite and positive,
+and `alpha` finite and in `(0, 1]`. Invalid options return `InvalidConfig` before
+hashing, including on empty input; unrepresentable table sizes return
+`CapacityExceeded` before narrowing or table allocation. These checks do not
+guarantee that the host has enough free memory for a representable table.
+
+`with_parallel_build(false)` keeps hashing, partitioning, Bloom construction,
+pilot search and owned-key destruction on the caller thread. The equivalent
+`with_parallel(false)` options on PGM and Hybrid also suppress nested Rayon work.
+These builds do not initialize either the dedicated or global Rayon pool.
 
 ### `Index` lookups
 
@@ -170,6 +182,8 @@ pub enum IndexError {
     Unresolvable,                // pilot search gave up (change the seed)
     KeyNotFound,
     InvalidKey,
+    InvalidConfig(&'static str), // invalid finite/range configuration
+    CapacityExceeded(&'static str), // table exceeds representable addressing
     CorruptData,                 // checksum or structural check failed
     Io(std::io::Error),
     Unsupported(&'static str),
@@ -259,9 +273,10 @@ an uncommitted blocked write or exhausted ID space panics before mutation.
 
 ## `PgmIndex` (sorted u64 learned index)
 
-Range queries + lookups on u64 keys. Linear-time segmentation; every key is
-within `epsilon` positions of its prediction (`stats().max_error` is the exact
-value; f32 rounding can add 1 at very large N).
+Range queries + lookups on u64 keys. Linear-time segmentation; new builds keep
+every key within saturating `epsilon + 1` positions of its integer prediction.
+`stats().max_error` reports the measured value. Loaded absolute models retain
+their original, potentially larger error budget.
 
 ```rust
 pub struct PgmBuilder { /* opaque */ }
@@ -300,7 +315,7 @@ impl PgmIndex {
 }
 
 #[non_exhaustive]
-pub enum PgmError { DuplicateKeys, UnsortedKeys /* deprecated */, EmptyKeys, KeyNotFound, CorruptData }
+pub enum PgmError { DuplicateKeys, UnsortedKeys /* deprecated */, EmptyKeys, KeyNotFound, TooManyKeys, CorruptData }
 
 pub struct PgmStats {
     pub total_keys: usize,
@@ -546,14 +561,37 @@ The checksummed container is `[tag]["KIRA"][format u16][kind u8][0][body][checks
 New `Index` and `HybridIndex` builds use tag 4 and kinds 6 and 7 respectively;
 legacy kinds 1 and 2 retain their original byte-key hash when loaded or saved
 again. Kinds 3 and 4 identify `PgmIndexU128` and `DynamicIndex`.
-Standalone `PgmIndex` uses tag 5 and kind 5 around its raw v4 payload, avoiding
-ambiguity with legacy raw PGM versions 2/3/4, which remain readable. Its embedded
-layout inside Hybrid is unchanged. Legacy `Index` tags 0/2/3 also remain readable.
+Standalone `PgmIndex` uses tag 5 and kind 5 around its raw payload. New models
+use raw v6: one relative f64 slope replaces the absolute f32 slope/intercept
+pair, preserving eight numeric bytes per segment. Key offsets are subtracted as
+integers before conversion; prediction adds the integer segment start. The
+stored integer prediction error is measured and bounded by `epsilon + 1`
+(saturating at `u32::MAX`). Input is limited to `u32::MAX` keys and larger builds
+return `PgmError::TooManyKeys`. Raw versions 2/3/4 and old tag-5 containers remain
+readable; loaded absolute models retain raw v4 on resave, including locator-only
+models inside Hybrid. New Hybrid payloads embed raw v6. Section metadata byte 5
+is 0 for legacy f32 arrays and 1 for relative f64 slopes with empty intercepts.
+Legacy `Index` tags 0/2/3 also remain readable.
 Legacy raw formats have no checksum; new containers verify the checksum before
 validating lengths, contiguous part geometry, remap targets and sortedness.
 Stored PGM keys additionally verify segment bounds, model errors and Bloom
 containment. Dynamic loads reject repeated stable IDs and allocate their write
 buffer on demand rather than reserving the persisted flush threshold.
+
+Elias-Fano retains its ordinary u32-sample byte layout. A reserved zero count
+followed by `KIRAEF02` introduces the wide u64-sample extension only when needed.
+Loading rebuilds a derived select directory: groups of 64 ranks either span
+fewer than 2048 high bits or store their positions directly. Random access visits
+at most 33 high words and clears at most 63 set bits; range decoding is `O(k + 1)`.
+On 64-bit targets the directory costs 16 bytes per group, plus sparse positions,
+versus the old 4-byte samples. Failed reads leave the caller's cursor unchanged.
+PGM compressed queries use at most 24 stack keys for small windows and binary
+search for larger ones: `O(log S + log W)` time, `O(1)` extra space and no heap
+allocation, for `S` segments and window width `W`. Fitting and measuring models
+are linear passes; sorting input remains `O(n log n)` in the worst case.
+
+The measured PGM/Elias-Fano speed and memory comparison is in
+[`performance/PGM_EF_REPORT.md`](performance/PGM_EF_REPORT.md).
 
 New aligned mmap metadata includes the canonical hash version (88 bytes);
 the previous 80-byte metadata remains readable with the legacy hash.

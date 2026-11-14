@@ -1,19 +1,18 @@
 //! PGM (Piecewise Geometric Model) learned index for sorted u64 keys.
 //!
-//! v2 architecture additions over v1:
-//!   - **f32 quantization** of slope/intercept (50% smaller segment metadata).
+//! Implementation:
+//!   - **Relative f64 slopes**: integer key offsets avoid loss of precision near u64::MAX.
 //!   - **Per-segment u8 epsilon** (`max_errors_u8`) with overflow Vec for rare cases >254.
 //!   - **Branchless SIMD local search** via `movemask + tzcnt` (no scalar fallback inside SIMD loop).
 //!   - **SIMD-aware branchless segment lookup** with cache-line prefetch on each step.
-//!   - **Greedy-PLA optimal segmentation** with incremental convex-hull validation
-//!     (replaces O(N²) regression-per-extension with O(N · avg_seg_len)).
-//!   - **Parallel chunked build** via rayon (independent prefix sums, then merge).
+//!   - **Anchored slope-window segmentation** with O(N) fitting and error measurement.
+//!   - **Parallel chunked build** via rayon (independent chunks, then merge).
 //!   - **Optional Block-Bloom** fast-path for negative lookups (10–100× faster miss).
-//!   - **Auto-tune epsilon** via micro-benchmark on the actual key distribution.
+//!   - **Auto-tune epsilon** via a cost model sampled from the key distribution.
 //!
-//! Standalone serialization uses a checksummed container around the v4 payload.
-//! Legacy raw v2/v3/v4 payloads remain readable; embedded payloads keep their raw
-//! layout for compatibility with HybridIndex.
+//! Standalone serialization uses a checksummed container around the v6 payload.
+//! Legacy raw v2/v3/v4 absolute models remain readable and retain their numeric
+//! representation when saved again, including locator-only HybridIndex models.
 
 use thiserror::Error;
 
@@ -31,7 +30,7 @@ use std::arch::x86_64::{
 };
 
 // --------------------------------------------------------------------------------------
-// Wire format version. v1 = legacy (f64 slopes, u32 errors). v2 = current.
+// Supported raw wire versions; standalone container tag 5 is separate.
 // --------------------------------------------------------------------------------------
 const PGM_FORMAT_V2: u8 = 0x02;
 /// v3 adds the fitted key count separately from the stored keys, so a
@@ -39,15 +38,15 @@ const PGM_FORMAT_V2: u8 = 0x02;
 const PGM_FORMAT_V3: u8 = 0x03;
 /// v4 drops the per-segment 64-bit filters (never consulted on any lookup path).
 const PGM_FORMAT_V4: u8 = 0x04;
+/// v6 stores a relative f64 slope instead of an absolute f32 slope/intercept.
+/// Tag 5 is reserved for the standalone checksummed container.
+const PGM_FORMAT_V6: u8 = 0x06;
 
 /// Segment built in-memory (used during PGM construction only).
-/// Working-storage segment used during greedy-PLA construction. f64 is
-/// retained until the final emit so quantization to f32 happens once with the
-/// max-error check baked in (`segments_to_soa`).
+/// Both the key and position origins are kept as integers until prediction.
 #[derive(Debug, Clone)]
 struct SegmentBuild {
     slope: f64,
-    intercept: f64,
     min_key: u64,
     max_key: u64,
     start: usize,
@@ -63,6 +62,9 @@ struct SegmentBuild {
 #[repr(align(64))]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SegmentsSoA {
+    /// New relative models have no absolute slope/intercept arrays. Keeping the
+    /// legacy representation permits lossless reads and resaves without keys.
+    pub(crate) relative_slopes: Option<Vec<f64>>,
     pub(crate) slopes: Vec<f32>,
     pub(crate) intercepts: Vec<f32>,
     pub(crate) min_keys: Vec<u64>,
@@ -94,7 +96,8 @@ impl SegmentsSoA {
     }
 }
 
-/// PGM Index for sorted integer keys with O(1) average lookup.
+/// PGM Index for sorted integer keys. Lookup takes O(log S + log W) time for S
+/// segments and a fitted error window of W keys, with a SIMD scan for small W.
 #[derive(Debug, Clone)]
 pub struct PgmIndex {
     /// Sorted keys (plain storage). Empty when `keys_ef` is `Some` — that's the
@@ -102,8 +105,8 @@ pub struct PgmIndex {
     keys: Vec<u64>,
     /// Optional Elias-Fano compact representation of `keys`. When set, the
     /// plain `keys` Vec is empty and key reads go through `key_at`/
-    /// `materialize_range`. Trades ~30–50% memory for one extra cache line per
-    /// local search on average.
+    /// a bounded-select reader. Search windows do not allocate or decompress
+    /// unrelated keys.
     keys_ef: Option<crate::elias_fano::EliasFano>,
     /// Learned segments.
     segments: SegmentsSoA,
@@ -123,6 +126,8 @@ pub enum PgmError {
     /// never the problem).
     #[error("duplicate key in input")]
     DuplicateKeys,
+    #[error("PGM supports at most u32::MAX keys")]
+    TooManyKeys,
     #[deprecated(
         since = "0.7.0",
         note = "the builder sorts its input; duplicates raise DuplicateKeys"
@@ -137,9 +142,13 @@ pub enum PgmError {
     CorruptData,
 }
 
+fn check_key_count(count: usize) -> Result<(), PgmError> {
+    if count > u32::MAX as usize { Err(PgmError::TooManyKeys) } else { Ok(()) }
+}
+
 impl PgmIndex {
-    /// Build PGM index from sorted unique keys with the default settings (greedy
-    /// PLA, no Bloom filter, sequential).
+    /// Build a PGM index with the default builder settings, sorting unique keys
+    /// before fitting models.
     pub fn build(keys: Vec<u64>, epsilon: u32) -> Result<Self, PgmError> {
         PgmBuilder::new().with_epsilon(epsilon).build(keys)
     }
@@ -188,7 +197,7 @@ impl PgmIndex {
         (original_bytes as isize) - (ef_bytes as isize)
     }
 
-    /// Get the i-th key (O(1) plain, O(1) amortized for EF).
+    /// Get the i-th key (O(1) plain or bounded-select EF).
     #[inline]
     fn key_at(&self, i: usize) -> u64 {
         if let Some(ef) = &self.keys_ef { ef.get(i) } else { self.keys[i] }
@@ -198,20 +207,6 @@ impl PgmIndex {
     #[inline]
     fn keys_count(&self) -> usize {
         self.key_count
-    }
-
-    /// Materialize keys in `[from, to)` into `out`. Used by `index()` /
-    /// `lower_bound()` for the local SIMD scan window.
-    fn materialize_keys(&self, from: usize, to: usize, out: &mut Vec<u64>) {
-        out.clear();
-        if from >= to {
-            return;
-        }
-        if let Some(ef) = &self.keys_ef {
-            ef.materialize_range(from, to - from, out);
-        } else {
-            out.extend_from_slice(&self.keys[from..to]);
-        }
     }
 
     /// Linear-time piecewise-linear segmentation (slope-window / "swing" filter).
@@ -227,8 +222,8 @@ impl PgmIndex {
     /// single 200K-key segment.
     ///
     /// Anchoring the intercept costs a few percent more segments than the optimal
-    /// convex-hull PLA, but the guarantee is exact for the f64 line. The f32
-    /// quantization is measured afterwards (see `segments_to_soa`).
+    /// convex-hull PLA. Stored predictions are measured afterwards, with a
+    /// bounded-error fallback for floating-point rounding (`segments_to_soa`).
     fn build_segments_greedy(keys: &[u64], epsilon: u32) -> Vec<SegmentBuild> {
         let n = keys.len();
         if n == 0 {
@@ -238,19 +233,13 @@ impl PgmIndex {
         let mut segments: Vec<SegmentBuild> = Vec::with_capacity(n / 32 + 1);
         let mut start = 0usize;
         while start < n {
-            let x0 = keys[start] as f64;
-            let y0 = start as f64;
             let mut lo = f64::NEG_INFINITY;
             let mut hi = f64::INFINITY;
             let mut end = start + 1;
             while end < n {
-                // Keys are sorted and unique, so dx > 0 (as f64 it can round to a
-                // value equal to a neighbour's only for keys > 2^53 apart by < 1 ulp,
-                // in which case the window simply closes).
-                let dx = keys[end] as f64 - x0;
-                if dx <= 0.0 {
-                    break;
-                }
+                // Subtract before converting: neighbouring u64 keys remain
+                // distinguishable even when their absolute values exceed 2^53.
+                let dx = (keys[end] - keys[start]) as f64;
                 let dy = (end - start) as f64;
                 let new_lo = lo.max((dy - local_eps) / dx);
                 let new_hi = hi.min((dy + local_eps) / dx);
@@ -266,13 +255,11 @@ impl PgmIndex {
                 0.0
             } else {
                 // Any slope in [lo, hi] is valid; the midpoint maximizes the margin
-                // that survives f32 quantization.
+                // against floating-point rounding.
                 0.5 * (lo + hi)
             };
-            let intercept = y0 - slope * x0;
             segments.push(SegmentBuild {
                 slope,
-                intercept,
                 min_key: keys[start],
                 max_key: keys[end - 1],
                 start,
@@ -312,7 +299,6 @@ impl PgmIndex {
                 for seg in &mut local {
                     seg.start += c_start;
                     seg.end += c_start;
-                    seg.intercept += c_start as f64;
                 }
                 local
             })
@@ -326,7 +312,7 @@ impl PgmIndex {
         all
     }
 
-    /// Find position of key with O(1) average complexity.
+    /// Find the position of a key in O(log S + log W) time and O(1) extra space.
     pub fn index(&self, key: u64) -> Result<usize, PgmError> {
         // optional Block-Bloom short-circuit for negative lookups.
         if let Some(bf) = &self.bloom
@@ -368,12 +354,20 @@ impl PgmIndex {
             };
         }
 
-        // EF path: materialize the search window into a small stack buffer,
-        // then run the same SIMD scan against it.
-        let mut buf = Vec::with_capacity(search_end - search_start);
-        self.materialize_keys(search_start, search_end, &mut buf);
-        if let Some(local) = find_in_range_simd(&buf, 0, buf.len(), key) {
-            Ok(search_start + local)
+        let window = search_end - search_start;
+        if window <= SCAN_WINDOW {
+            let mut buf = [0u64; SCAN_WINDOW];
+            let count =
+                self.keys_ef.as_ref().unwrap().materialize_into(search_start, &mut buf[..window]);
+            return find_in_range_simd(&buf, 0, count, key)
+                .map(|local| search_start + local)
+                .ok_or(PgmError::KeyNotFound);
+        }
+        // A large error window is bisected in compressed storage. Bounded EF
+        // select keeps this O(log W), with no W-sized temporary allocation.
+        let pos = self.lower_bound_compressed(search_start, search_end, key);
+        if pos < search_end && self.key_at(pos) == key {
+            Ok(pos)
         } else {
             Err(PgmError::KeyNotFound)
         }
@@ -437,13 +431,29 @@ impl PgmIndex {
             // its keys (then `search_end` is already n or the lookup misses).
             return search_end.min(n);
         }
-        // EF path.
-        let mut buf = Vec::with_capacity(search_end - search_start);
-        self.materialize_keys(search_start, search_end, &mut buf);
-        if let Some(local) = find_first_ge_simd(&buf, 0, buf.len(), target) {
-            return search_start + local;
+        let window = search_end - search_start;
+        if window <= SCAN_WINDOW {
+            let mut buf = [0u64; SCAN_WINDOW];
+            let count =
+                self.keys_ef.as_ref().unwrap().materialize_into(search_start, &mut buf[..window]);
+            return find_first_ge_simd(&buf, 0, count, target)
+                .map(|local| search_start + local)
+                .unwrap_or(search_end);
         }
-        search_end
+        self.lower_bound_compressed(search_start, search_end, target)
+    }
+
+    #[inline]
+    fn lower_bound_compressed(&self, mut start: usize, mut end: usize, target: u64) -> usize {
+        while start < end {
+            let middle = start + (end - start) / 2;
+            if self.key_at(middle) < target {
+                start = middle + 1;
+            } else {
+                end = middle;
+            }
+        }
+        start
     }
 
     /// Find first position where key > target.
@@ -472,6 +482,7 @@ impl PgmIndex {
             + std::mem::size_of_val(&self.segments)
             + self.segments.slopes.len() * std::mem::size_of::<f32>()
             + self.segments.intercepts.len() * std::mem::size_of::<f32>()
+            + self.segments.relative_slopes.as_ref().map_or(0, |s| s.len() * 8)
             + self.segments.min_keys.len() * std::mem::size_of::<u64>()
             + self.segments.max_keys.len() * std::mem::size_of::<u64>()
             + self.segments.max_errors_u8.len() * std::mem::size_of::<u8>()
@@ -490,14 +501,15 @@ impl PgmIndex {
         }
     }
 
-    /// Serialize into a self-contained, checksummed container with a v4 payload.
+    /// Serialize into a self-contained, checksummed container. New models use a
+    /// relative v6 payload; loaded legacy models retain their absolute v4 layout.
     pub fn to_bytes(&self) -> Result<Vec<u8>, PgmError> {
         let mut out = Vec::with_capacity(self.stats().memory_usage);
         self.write_to(&mut out);
         Ok(crate::wire::seal_tagged(crate::wire::PGM_CONTAINER_TAG, crate::wire::KIND_PGM, &out))
     }
 
-    /// Read a standalone checksummed container or a legacy raw v2/v3/v4 payload.
+    /// Read a standalone checksummed container or a raw v2/v3/v4/v6 payload.
     /// Trailing bytes are rejected; embedded payloads use the separate raw reader.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, PgmError> {
         let body = if bytes.first() == Some(&crate::wire::PGM_CONTAINER_TAG) {
@@ -514,8 +526,8 @@ impl PgmIndex {
         Ok(index)
     }
 
-    /// Wire format v4:
-    /// [u8 ver=4] [u32 epsilon] [u64 key_count] [u64 stored_keys] [keys×u64]
+    /// Wire format v4/v6:
+    /// [u8 ver] [u32 epsilon] [u64 key_count] [u64 stored_keys] [keys×u64]
     /// [u64 seg_len]
     /// segments contiguous SoA: slopes[u32 f32][intercepts][min_keys u64][max_keys u64]
     ///                          [max_errors u8] [u64 overflow_count]
@@ -523,9 +535,14 @@ impl PgmIndex {
     ///                          [starts u32][ends u32]
     /// [u8 has_bloom] [bloom payload if present]
     /// v2 (single key count) and v3 (with a `[filters u64]` array before `starts`)
-    /// are still read.
+    /// are still read. v6 replaces slopes/intercepts (4 + 4 bytes per segment)
+    /// with a relative f64 slope (8 bytes per segment).
     pub(crate) fn write_to(&self, out: &mut Vec<u8>) {
-        out.push(PGM_FORMAT_V4);
+        out.push(if self.segments.relative_slopes.is_some() {
+            PGM_FORMAT_V6
+        } else {
+            PGM_FORMAT_V4
+        });
         write_u32(out, self.epsilon);
         write_u64(out, self.key_count as u64);
         // Plain or EF — emit the materialized u64 stream either way. EF reload
@@ -544,8 +561,12 @@ impl PgmIndex {
         }
         let s = &self.segments;
         write_u64(out, s.len() as u64);
-        crate::wire::extend_le(out, &s.slopes);
-        crate::wire::extend_le(out, &s.intercepts);
+        if let Some(slopes) = &s.relative_slopes {
+            crate::wire::extend_le(out, slopes);
+        } else {
+            crate::wire::extend_le(out, &s.slopes);
+            crate::wire::extend_le(out, &s.intercepts);
+        }
         crate::wire::extend_le(out, &s.min_keys);
         crate::wire::extend_le(out, &s.max_keys);
         out.extend_from_slice(&s.max_errors_u8);
@@ -570,7 +591,7 @@ impl PgmIndex {
     pub(crate) fn read_from(bytes: &[u8], pos: &mut usize) -> Result<Self, PgmError> {
         let mut cur = Cursor { buf: bytes, pos: *pos };
         let ver = cur.read_u8().ok_or(PgmError::CorruptData)?;
-        if !(PGM_FORMAT_V2..=PGM_FORMAT_V4).contains(&ver) {
+        if !matches!(ver, PGM_FORMAT_V2 | PGM_FORMAT_V3 | PGM_FORMAT_V4 | PGM_FORMAT_V6) {
             return Err(PgmError::CorruptData);
         }
         let epsilon = cur.read_u32().ok_or(PgmError::CorruptData)?;
@@ -596,8 +617,11 @@ impl PgmIndex {
         if seg_len > remaining(&cur) / segment_bytes {
             return Err(PgmError::CorruptData);
         }
-        let slopes: Vec<f32> = cur.read_le(seg_len)?;
-        let intercepts: Vec<f32> = cur.read_le(seg_len)?;
+        let (relative_slopes, slopes, intercepts) = if ver == PGM_FORMAT_V6 {
+            (Some(cur.read_le::<f64>(seg_len)?), Vec::new(), Vec::new())
+        } else {
+            (None, cur.read_le::<f32>(seg_len)?, cur.read_le::<f32>(seg_len)?)
+        };
         let min_keys: Vec<u64> = cur.read_le(seg_len)?;
         let max_keys: Vec<u64> = cur.read_le(seg_len)?;
         let max_errors_u8 = cur.read_bytes(seg_len).ok_or(PgmError::CorruptData)?.to_vec();
@@ -636,6 +660,7 @@ impl PgmIndex {
             keys,
             keys_ef: None,
             segments: SegmentsSoA {
+                relative_slopes,
                 slopes,
                 intercepts,
                 min_keys,
@@ -660,8 +685,11 @@ impl PgmIndex {
     pub(crate) fn validate(&self) -> bool {
         let s = &self.segments;
         let m = s.max_keys.len();
-        if s.slopes.len() != m
-            || s.intercepts.len() != m
+        let valid_numeric_shape = match &s.relative_slopes {
+            Some(slopes) => slopes.len() == m && s.slopes.is_empty() && s.intercepts.is_empty(),
+            None => s.slopes.len() == m && s.intercepts.len() == m,
+        };
+        if !valid_numeric_shape
             || s.min_keys.len() != m
             || s.max_errors_u8.len() != m
             || s.starts.len() != m
@@ -673,7 +701,7 @@ impl PgmIndex {
         if n == 0 {
             return m == 0 && self.keys.is_empty() && s.overflow_errors.is_empty();
         }
-        if m == 0 || n > u32::MAX as usize {
+        if m == 0 || check_key_count(n).is_err() {
             return false;
         }
         if !self.keys.is_empty() && self.keys.len() != n {
@@ -697,7 +725,12 @@ impl PgmIndex {
             if s.min_keys[i] > s.max_keys[i] || (i > 0 && s.min_keys[i] <= s.max_keys[i - 1]) {
                 return false;
             }
-            if !s.slopes[i].is_finite() || s.slopes[i] < 0.0 || !s.intercepts[i].is_finite() {
+            let valid_line = if let Some(slopes) = &s.relative_slopes {
+                slopes[i].is_finite() && slopes[i] >= 0.0
+            } else {
+                s.slopes[i].is_finite() && s.slopes[i] >= 0.0 && s.intercepts[i].is_finite()
+            };
+            if !valid_line {
                 return false;
             }
             let max_error = if s.max_errors_u8[i] == 0xFF {
@@ -711,17 +744,26 @@ impl PgmIndex {
                 }
                 s.max_errors_u8[i] as u32
             };
+            // Legacy absolute models may have a much larger quantization error
+            // than their requested epsilon. Only relative v6 promises this cap.
+            if s.relative_slopes.is_some() && max_error > self.epsilon.saturating_add(1) {
+                return false;
+            }
             if !self.keys.is_empty() {
                 let start = st as usize;
                 let end = en as usize;
                 if s.min_keys[i] != self.keys[start] || s.max_keys[i] != self.keys[end - 1] {
                     return false;
                 }
-                let slope = s.slopes[i] as f64;
-                let intercept = s.intercepts[i] as f64;
                 for (local, &key) in self.keys[start..end].iter().enumerate() {
-                    let predicted = slope.mul_add(key as f64, intercept);
-                    if (predicted - (start + local) as f64).abs().ceil() > max_error as f64
+                    let predicted = predict_value(s, i, key);
+                    let valid_error = if s.relative_slopes.is_some() {
+                        (predicted as usize).abs_diff(start + local) <= max_error as usize
+                    } else {
+                        (predicted - (start + local) as f64).abs().ceil() <= max_error as f64
+                    };
+                    if !predicted.is_finite()
+                        || !valid_error
                         || self.bloom.as_ref().is_some_and(|bloom| !bloom.contains_u64(key))
                     {
                         return false;
@@ -736,15 +778,14 @@ impl PgmIndex {
         overflow.next().is_none()
     }
 
-    /// Convert `Vec<SegmentBuild>` (f64 working storage) into the SoA layout with
-    /// f32-quantized slopes/intercepts and u8 per-segment errors. After quantization
-    /// we re-measure max_error against quantized predictions — that's the cost of
-    /// the size win. Segments whose post-quant error exceeds 254 fall into
-    /// the overflow vec.
-    fn segments_to_soa(keys: &[u64], segments: Vec<SegmentBuild>) -> SegmentsSoA {
+    /// Store one relative f64 slope in the same eight bytes previously occupied
+    /// by an absolute f32 slope/intercept pair. Measure the exact integer
+    /// prediction used by lookup. Rare rounding failures fall back to singleton
+    /// segments, so the epsilon + 1 cap holds without an unbounded refit loop.
+    /// The fitting and verification passes visit each key O(1) times overall.
+    fn segments_to_soa(keys: &[u64], segments: Vec<SegmentBuild>, epsilon: u32) -> SegmentsSoA {
         let n = segments.len();
         let mut slopes = Vec::with_capacity(n);
-        let mut intercepts = Vec::with_capacity(n);
         let mut min_keys = Vec::with_capacity(n);
         let mut max_keys = Vec::with_capacity(n);
         let mut max_errors_u8 = Vec::with_capacity(n);
@@ -752,39 +793,51 @@ impl PgmIndex {
         let mut starts = Vec::with_capacity(n);
         let mut ends = Vec::with_capacity(n);
 
-        for (seg_idx, seg) in segments.iter().enumerate() {
-            let sq = seg.slope as f32;
-            let iq = seg.intercept as f32;
-            // Recompute max_error against quantized predictions over [start, end).
-            // The error must be rounded *up*: lookups truncate the prediction to an
-            // integer position and scan `[pos - err, pos + err]`, so a truncated error
-            // (3.9 → 3) would leave the true position just outside the window.
-            let mut err = 0u32;
-            for i in seg.start..seg.end {
-                let pred = (sq as f64).mul_add(keys[i] as f64, iq as f64);
-                let actual = i as f64;
-                let e = (pred - actual).abs().ceil() as u32;
-                if e > err {
-                    err = e;
+        let mut emit =
+            |slope: f64, min_key: u64, max_key: u64, start: usize, end: usize, err: u32| {
+                let seg_idx = slopes.len();
+                slopes.push(slope);
+                min_keys.push(min_key);
+                max_keys.push(max_key);
+                if err <= 254 {
+                    max_errors_u8.push(err as u8);
+                } else {
+                    max_errors_u8.push(0xFFu8);
+                    overflow_errors.push((seg_idx as u32, err));
+                }
+                starts.push(start as u32);
+                ends.push(end as u32);
+            };
+        let allowed = epsilon.saturating_add(1) as usize;
+        for seg in segments {
+            let mut err = 0usize;
+            let mut fits = true;
+            for (local, &key) in keys[seg.start..seg.end].iter().enumerate() {
+                let prediction = relative_prediction(seg.slope, seg.min_key, seg.start, key);
+                if !prediction.is_finite() || !seg.slope.is_finite() || seg.slope < 0.0 {
+                    fits = false;
+                    break;
+                }
+                err = err.max((prediction as usize).abs_diff(seg.start + local));
+                if err > allowed {
+                    fits = false;
+                    break;
                 }
             }
-            slopes.push(sq);
-            intercepts.push(iq);
-            min_keys.push(seg.min_key);
-            max_keys.push(seg.max_key);
-            if err <= 254 {
-                max_errors_u8.push(err as u8);
+            if fits {
+                emit(seg.slope, seg.min_key, seg.max_key, seg.start, seg.end, err as u32);
             } else {
-                max_errors_u8.push(0xFFu8);
-                overflow_errors.push((seg_idx as u32, err));
+                for (local, &key) in keys[seg.start..seg.end].iter().enumerate() {
+                    let start = seg.start + local;
+                    emit(0.0, key, key, start, start + 1, 0);
+                }
             }
-            starts.push(seg.start as u32);
-            ends.push(seg.end as u32);
         }
         // overflow_errors is built in segment-index order; binary_search_by_key works.
         SegmentsSoA {
-            slopes,
-            intercepts,
+            relative_slopes: Some(slopes),
+            slopes: Vec::new(),
+            intercepts: Vec::new(),
             min_keys,
             max_keys,
             max_errors_u8,
@@ -841,8 +894,19 @@ impl PgmIndex {
     pub fn write_to_sections(&self, writer: &mut crate::mmap_index::MmapIndexWriter) {
         use crate::mmap_index::SectionKind;
         let s = &self.segments;
-        writer.add_section(SectionKind::PgmKeys, bytes_of_u64(&self.keys));
-        writer.add_section(SectionKind::PgmSlopes, bytes_of_f32(&s.slopes));
+        let keys = if self.keys_ef.is_some() {
+            bytes_of_u64(&self.keys_iter().collect::<Vec<_>>())
+        } else {
+            bytes_of_u64(&self.keys)
+        };
+        writer.add_section(SectionKind::PgmKeys, keys);
+        writer.add_section(
+            SectionKind::PgmSlopes,
+            match &s.relative_slopes {
+                Some(slopes) => bytes_of_f64(slopes),
+                None => bytes_of_f32(&s.slopes),
+            },
+        );
         writer.add_section(SectionKind::PgmIntercepts, bytes_of_f32(&s.intercepts));
         writer.add_section(SectionKind::PgmMinKeys, bytes_of_u64(&s.min_keys));
         writer.add_section(SectionKind::PgmMaxKeys, bytes_of_u64(&s.max_keys));
@@ -851,10 +915,12 @@ impl PgmIndex {
         writer.add_section(SectionKind::PgmOverflowErrors, overflow_bytes);
         writer.add_section(SectionKind::PgmStarts, bytes_of_u32(&s.starts));
         writer.add_section(SectionKind::PgmEnds, bytes_of_u32(&s.ends));
-        // PgmMeta: [u32 epsilon][u8 has_bloom][padding..]
+        // PgmMeta: [u32 epsilon][u8 has_bloom][u8 relative][padding..].
+        // Legacy writers set all three padding bytes to zero.
         let mut meta = Vec::with_capacity(8);
         meta.extend_from_slice(&self.epsilon.to_le_bytes());
         meta.push(if self.bloom.is_some() { 1 } else { 0 });
+        meta.push(u8::from(s.relative_slopes.is_some()));
         // Pad to 8 bytes for alignment.
         while meta.len() < 8 {
             meta.push(0);
@@ -876,26 +942,39 @@ impl PgmIndex {
         header: &crate::mmap_index::Header,
     ) -> Option<Self> {
         use crate::mmap_index::SectionKind;
-        let keys = u64_vec_from_section(mmap.section(header, SectionKind::PgmKeys)?);
-        let slopes = f32_vec_from_section(mmap.section(header, SectionKind::PgmSlopes)?);
-        let intercepts = f32_vec_from_section(mmap.section(header, SectionKind::PgmIntercepts)?);
-        let min_keys = u64_vec_from_section(mmap.section(header, SectionKind::PgmMinKeys)?);
-        let max_keys = u64_vec_from_section(mmap.section(header, SectionKind::PgmMaxKeys)?);
-        let max_errors_u8 = mmap.section(header, SectionKind::PgmMaxErrors)?.to_vec();
-        let overflow_errors =
-            u32_pairs_from_section(mmap.section(header, SectionKind::PgmOverflowErrors)?);
-        let starts = u32_vec_from_section(mmap.section(header, SectionKind::PgmStarts)?);
-        let ends = u32_vec_from_section(mmap.section(header, SectionKind::PgmEnds)?);
         let meta = mmap.section(header, SectionKind::PgmMeta)?;
-        if meta.len() < 5 {
+        if !matches!(meta.len(), 5 | 8)
+            || meta[4] > 1
+            || (meta.len() == 8 && (meta[5] > 1 || meta[6] != 0 || meta[7] != 0))
+        {
             return None;
         }
+        let relative = meta.len() == 8 && meta[5] == 1;
+        let keys = u64_vec_from_section(mmap.section(header, SectionKind::PgmKeys)?)?;
+        let slope_bytes = mmap.section(header, SectionKind::PgmSlopes)?;
+        let (relative_slopes, slopes) = if relative {
+            (Some(f64_vec_from_section(slope_bytes)?), Vec::new())
+        } else {
+            (None, f32_vec_from_section(slope_bytes)?)
+        };
+        let intercepts = f32_vec_from_section(mmap.section(header, SectionKind::PgmIntercepts)?)?;
+        let min_keys = u64_vec_from_section(mmap.section(header, SectionKind::PgmMinKeys)?)?;
+        let max_keys = u64_vec_from_section(mmap.section(header, SectionKind::PgmMaxKeys)?)?;
+        let max_errors_u8 = mmap.section(header, SectionKind::PgmMaxErrors)?.to_vec();
+        let overflow_errors =
+            u32_pairs_from_section(mmap.section(header, SectionKind::PgmOverflowErrors)?)?;
+        let starts = u32_vec_from_section(mmap.section(header, SectionKind::PgmStarts)?)?;
+        let ends = u32_vec_from_section(mmap.section(header, SectionKind::PgmEnds)?)?;
         let epsilon = u32::from_le_bytes([meta[0], meta[1], meta[2], meta[3]]);
-        let has_bloom = meta[4] != 0;
+        let has_bloom = meta[4] == 1;
         let bloom = if has_bloom {
             let bf_bytes = mmap.section(header, SectionKind::PgmBloom)?;
             let mut pos = 0usize;
-            crate::block_bloom::BlockBloom::read_from(bf_bytes, &mut pos)
+            let bf = crate::block_bloom::BlockBloom::read_from(bf_bytes, &mut pos)?;
+            if pos != bf_bytes.len() {
+                return None;
+            }
+            Some(bf)
         } else {
             None
         };
@@ -904,6 +983,7 @@ impl PgmIndex {
             keys,
             keys_ef: None,
             segments: SegmentsSoA {
+                relative_slopes,
                 slopes,
                 intercepts,
                 min_keys,
@@ -970,6 +1050,12 @@ fn bytes_of_f32(v: &[f32]) -> Vec<u8> {
     out
 }
 
+fn bytes_of_f64(v: &[f64]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 8);
+    crate::wire::extend_le(&mut out, v);
+    out
+}
+
 fn bytes_of_u32_pairs(v: &[(u32, u32)]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 8);
     for &(a, b) in v {
@@ -979,19 +1065,38 @@ fn bytes_of_u32_pairs(v: &[(u32, u32)]) -> Vec<u8> {
     out
 }
 
-fn u64_vec_from_section(bytes: &[u8]) -> Vec<u64> {
-    crate::wire::read_le(bytes, bytes.len() / 8).unwrap_or_default()
+fn u64_vec_from_section(bytes: &[u8]) -> Option<Vec<u64>> {
+    if !bytes.len().is_multiple_of(8) {
+        return None;
+    }
+    crate::wire::read_le(bytes, bytes.len() / 8)
 }
 
-fn u32_vec_from_section(bytes: &[u8]) -> Vec<u32> {
-    crate::wire::read_le(bytes, bytes.len() / 4).unwrap_or_default()
+fn u32_vec_from_section(bytes: &[u8]) -> Option<Vec<u32>> {
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    crate::wire::read_le(bytes, bytes.len() / 4)
 }
 
-fn f32_vec_from_section(bytes: &[u8]) -> Vec<f32> {
-    crate::wire::read_le(bytes, bytes.len() / 4).unwrap_or_default()
+fn f32_vec_from_section(bytes: &[u8]) -> Option<Vec<f32>> {
+    if !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    crate::wire::read_le(bytes, bytes.len() / 4)
 }
 
-fn u32_pairs_from_section(bytes: &[u8]) -> Vec<(u32, u32)> {
+fn f64_vec_from_section(bytes: &[u8]) -> Option<Vec<f64>> {
+    if !bytes.len().is_multiple_of(8) {
+        return None;
+    }
+    crate::wire::read_le(bytes, bytes.len() / 8)
+}
+
+fn u32_pairs_from_section(bytes: &[u8]) -> Option<Vec<(u32, u32)>> {
+    if !bytes.len().is_multiple_of(8) {
+        return None;
+    }
     let n = bytes.len() / 8;
     let mut out = Vec::with_capacity(n);
     for chunk in bytes.as_chunks::<8>().0 {
@@ -1001,7 +1106,7 @@ fn u32_pairs_from_section(bytes: &[u8]) -> Vec<(u32, u32)> {
         b.copy_from_slice(&chunk[4..]);
         out.push((u32::from_le_bytes(a), u32::from_le_bytes(b)));
     }
-    out
+    Some(out)
 }
 
 // --------------------------------------------------------------------------------------
@@ -1011,16 +1116,26 @@ fn u32_pairs_from_section(bytes: &[u8]) -> Vec<(u32, u32)> {
 // and zero branches.
 // --------------------------------------------------------------------------------------
 
-/// Truncated position prediction. With `max_error` rounded up at build time,
-/// `|pred - actual| ≤ err` implies `actual ∈ [floor(pred) - err, floor(pred) + err]`,
-/// so the `[pos - err, pos + err]` scan window of the callers is always sufficient.
+/// Integer key subtraction preserves small local gaps at large absolute keys.
+#[inline]
+fn relative_prediction(slope: f64, min_key: u64, start: usize, key: u64) -> f64 {
+    slope.mul_add(key.saturating_sub(min_key) as f64, start as f64)
+}
+
+#[inline]
+fn predict_value(segments: &SegmentsSoA, idx: usize, key: u64) -> f64 {
+    if let Some(slopes) = &segments.relative_slopes {
+        relative_prediction(slopes[idx], segments.min_keys[idx], segments.starts[idx] as usize, key)
+    } else {
+        // Legacy absolute models must retain their original arithmetic on load.
+        (segments.slopes[idx] as f64).mul_add(key as f64, segments.intercepts[idx] as f64)
+    }
+}
+
+/// The error metadata bounds this exact truncated prediction at every fitted key.
 #[inline]
 fn predict_pos(segments: &SegmentsSoA, idx: usize, key: u64) -> usize {
-    // f32 mul_add for cache-friendly hot path; if intermediate precision matters
-    // we widen to f64 for the final accumulate.
-    let s = segments.slopes[idx] as f64;
-    let b = segments.intercepts[idx] as f64;
-    let prediction = s.mul_add(key as f64, b);
+    let prediction = predict_value(segments, idx, key);
     if prediction <= 0.0 { 0 } else { prediction as usize }
 }
 
@@ -1356,12 +1471,10 @@ impl PgmBuilder {
         }
     }
 
-    /// Maximum distance between the predicted and the true position of any key
-    /// (the local scan window is `2ε + 1` keys). The bound holds for the f64 fit;
-    /// after f32 quantization of the segment parameters the measured error can
-    /// exceed it by 1 for indexes beyond ~8M keys — `stats().max_error` reports
-    /// the exact value. Applies uniformly to every key (earlier versions silently
-    /// used `4ε` for the first and last 10% of the keys).
+    /// Error tolerance for fitting each segment. The measured integer prediction
+    /// error is at most `epsilon.saturating_add(1)`; the extra position accounts
+    /// for floating-point rounding and truncation. `stats().max_error` reports
+    /// the actual bound used by lookup, uniformly across all keys and offsets.
     pub fn with_epsilon(mut self, epsilon: u32) -> Self {
         self.epsilon = epsilon;
         self
@@ -1381,10 +1494,9 @@ impl PgmBuilder {
         self
     }
 
-    /// Compact key storage via Elias-Fano after build. Saves ~30–50% on key
-    /// memory at large N, costs an extra ~50 ns per lookup for the materialize
-    /// step. Net win for memory-bound workloads (100M+ keys) where the whole
-    /// `keys` array no longer fits comfortably in LLC.
+    /// Compact key storage via Elias-Fano after build when it saves memory.
+    /// Small search windows use a stack buffer; larger windows use O(log W)
+    /// bounded compressed reads without materializing the complete window.
     pub fn with_elias_fano(mut self, enabled: bool) -> Self {
         self.enable_elias_fano = enabled;
         self
@@ -1402,6 +1514,11 @@ impl PgmBuilder {
     /// Build a PGM index over `keys`. Empty input is permitted and yields an
     /// always-miss instance.
     pub fn build(self, keys: Vec<u64>) -> Result<PgmIndex, PgmError> {
+        crate::build_pool::run(self.enable_parallel, || self.build_inner(keys))
+    }
+
+    fn build_inner(self, keys: Vec<u64>) -> Result<PgmIndex, PgmError> {
+        check_key_count(keys.len())?;
         let mut sorted = keys;
         sorted.sort_unstable();
         if sorted.windows(2).any(|w| w[0] >= w[1]) {
@@ -1413,7 +1530,10 @@ impl PgmBuilder {
                 key_count: 0,
                 keys: Vec::new(),
                 keys_ef: None,
-                segments: SegmentsSoA::default(),
+                segments: SegmentsSoA {
+                    relative_slopes: Some(Vec::new()),
+                    ..SegmentsSoA::default()
+                },
                 epsilon: self.epsilon,
                 bloom: None,
             });
@@ -1427,10 +1547,8 @@ impl PgmBuilder {
         let raw_segments = {
             #[cfg(feature = "parallel")]
             {
-                if self.enable_parallel {
-                    crate::build_pool::run(true, || {
-                        PgmIndex::build_segments_parallel(&sorted, epsilon)
-                    })
+                if self.enable_parallel && crate::build_pool::parallel_enabled() {
+                    PgmIndex::build_segments_parallel(&sorted, epsilon)
                 } else {
                     PgmIndex::build_segments_greedy(&sorted, epsilon)
                 }
@@ -1440,7 +1558,7 @@ impl PgmBuilder {
                 PgmIndex::build_segments_greedy(&sorted, epsilon)
             }
         };
-        let segments = PgmIndex::segments_to_soa(&sorted, raw_segments);
+        let segments = PgmIndex::segments_to_soa(&sorted, raw_segments, epsilon);
 
         let bloom = if self.enable_bloom {
             Some(BlockBloom::build_from_u64(&sorted, 0xC1B5_4A32_D192_ED03))
@@ -1504,5 +1622,17 @@ impl PgmBuilder {
 impl Default for PgmBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn position_count_bound_does_not_truncate() {
+        assert!(super::check_key_count(0).is_ok());
+        assert!(super::check_key_count(u32::MAX as usize).is_ok());
+        if let Ok(too_many) = usize::try_from(u32::MAX as u64 + 1) {
+            assert!(matches!(super::check_key_count(too_many), Err(super::PgmError::TooManyKeys)));
+        }
     }
 }

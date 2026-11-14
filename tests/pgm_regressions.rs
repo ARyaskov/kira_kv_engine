@@ -187,7 +187,7 @@ fn legacy_pgm_rejects_a_structurally_valid_bloom_with_false_negatives() {
 }
 
 #[test]
-fn raw_v4_and_checksummed_pgm_load_multiple_segments_without_bloom() {
+fn raw_v6_and_checksummed_pgm_load_multiple_segments_without_bloom() {
     for keys in [
         vec![0, 1, 2, 1000, 1001],
         vec![0, 1, 2, 1000, 1001, 1002, 1_000_000, 1_000_001, 1_000_002],
@@ -202,9 +202,9 @@ fn raw_v4_and_checksummed_pgm_load_multiple_segments_without_bloom() {
         assert!(index.num_segments() >= if keys.len() == 5 { 2 } else { 3 });
         let sealed = index.to_bytes().unwrap();
         // Standalone header is nine bytes and its checksum is eight bytes.
-        let raw_v4 = sealed[9..sealed.len() - 8].to_vec();
-        assert_eq!(raw_v4[0], 4);
-        for bytes in [sealed, raw_v4] {
+        let raw_v6 = sealed[9..sealed.len() - 8].to_vec();
+        assert_eq!(raw_v6[0], 6);
+        for bytes in [sealed, raw_v6] {
             let restored = PgmIndex::from_bytes(&bytes).unwrap();
             for (position, &key) in keys.iter().enumerate() {
                 assert_eq!(restored.index(key).ok(), Some(position));

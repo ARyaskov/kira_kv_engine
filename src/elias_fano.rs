@@ -10,11 +10,13 @@
 //!   - `high`: unary high bits. For key i, write a single `1` at bit position
 //!     `(key[i] >> l) + i` of a bitvector of length N + (U >> l). All other bits
 //!     are `0`. Decoding recovers `high_i = select1(i) - i`.
-//!   - `select_sample`: every 64th set bit's position is stored explicitly so
-//!     `select1(i)` is O(1) amortized — find the right sample, then linear scan.
+//!   - A derived select directory groups 64 consecutive ranks. Dense blocks span
+//!     at most 2048 bits; sparse blocks retain their positions explicitly. This
+//!     bounds random access independently of gaps between key values.
 //!
-//! The decoder is branchless on the hot path; `select1` is the only non-trivial
-//! step and we keep it cheap with a 1-step sample table.
+//! The ordinary wire layout is unchanged. Its rank samples are checked while
+//! rebuilding the derived directory on load. A reserved-zero prefix identifies
+//! the wide-sample extension for positions that cannot fit in the legacy u32.
 
 /// Compact representation of a sorted u64 sequence.
 #[derive(Debug, Clone)]
@@ -29,19 +31,95 @@ pub struct EliasFano {
     /// Length of the high bitvector in bits.
     high_len: u64,
     high: Vec<u64>,
-    /// Position (in bits) of every 64th set bit in `high`. Length =
-    /// ceil(N / SAMPLE).
-    select_sample: Vec<u32>,
+    select_blocks: Vec<SelectBlock>,
+    sparse_positions: Vec<usize>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DENSE_SPAN, EliasFano, SelectBlock, WIDE_MAGIC};
+
+    #[test]
+    fn long_gap_select_uses_sparse_positions_and_bounds_dense_spans() {
+        let n = 4096u64;
+        let keys: Vec<_> = std::iter::once(0).chain(n * n - n + 2..=n * n).collect();
+        let index = EliasFano::from_sorted(&keys).unwrap();
+        assert!(matches!(index.select_blocks[0], SelectBlock::Sparse { .. }));
+        for (block, entry) in index.select_blocks.iter().enumerate() {
+            if let SelectBlock::Dense { first } = *entry {
+                let last_rank = ((block + 1) * 64).min(index.len()) - 1;
+                assert!(index.select1(last_rank) - first < DENSE_SPAN);
+            }
+        }
+        let mut output = [u64::MAX; 130];
+        assert_eq!(index.materialize_into(0, &mut output), output.len());
+        assert_eq!(output.as_slice(), &keys[..output.len()]);
+        let mut tail = [u64::MAX; 4];
+        assert_eq!(index.materialize_into(index.len() - 2, &mut tail), 2);
+        assert_eq!(&tail[..2], &keys[keys.len() - 2..]);
+        assert_eq!(&tail[2..], &[u64::MAX; 2]);
+        assert_eq!(index.materialize_into(usize::MAX, &mut tail), 0);
+    }
+
+    #[test]
+    fn wide_sample_extension_roundtrips_without_large_allocations() {
+        let keys = [0, 9, 10, 1000, u64::MAX];
+        let index = EliasFano::from_sorted(&keys).unwrap();
+        let mut bytes = vec![17];
+        index.write_format(&mut bytes, true);
+        let end = bytes.len();
+        bytes.extend_from_slice(b"next payload");
+        assert_eq!(&bytes[9..17], WIDE_MAGIC);
+        let mut cursor = 1;
+        let restored = EliasFano::read_from(&bytes, &mut cursor).unwrap();
+        assert_eq!(cursor, end);
+        for (rank, &key) in keys.iter().enumerate() {
+            assert_eq!(restored.get(rank), key);
+        }
+        let mut bad = bytes[..end].to_vec();
+        bad[9] ^= 1;
+        assert!(EliasFano::read_from(&bad, &mut 1).is_none());
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn sample_positions_above_u32_are_serialized_without_truncation() {
+        // Exercise the wire-width boundary without allocating the corresponding
+        // half-gigabyte high vector. Only serialization reads this synthetic slot.
+        for position in [u32::MAX as usize, u32::MAX as usize + 1] {
+            let mut index = EliasFano::from_sorted(&[0]).unwrap();
+            index.select_blocks[0] = SelectBlock::Dense { first: position };
+            let mut bytes = Vec::new();
+            index.write_to(&mut bytes);
+            if position == u32::MAX as usize {
+                assert_eq!(u64::from_le_bytes(bytes[..8].try_into().unwrap()), 1);
+                assert_eq!(&bytes[bytes.len() - 4..], &u32::MAX.to_le_bytes());
+            } else {
+                assert_eq!(u64::from_le_bytes(bytes[..8].try_into().unwrap()), 0);
+                assert_eq!(&bytes[8..16], WIDE_MAGIC);
+                assert_eq!(&bytes[bytes.len() - 8..], &(position as u64).to_le_bytes());
+            }
+        }
+    }
 }
 
 const SAMPLE_RATE: usize = 64;
+const DENSE_SPAN: usize = 2048;
+const WIDE_MAGIC: &[u8; 8] = b"KIRAEF02";
+
+#[derive(Debug, Clone, Copy)]
+enum SelectBlock {
+    Dense { first: usize },
+    Sparse { offset: usize },
+}
 
 impl EliasFano {
     /// Encode a sorted (ascending) unique u64 sequence.
     ///
-    /// Returns `None` if the sequence is empty.
+    /// Returns `None` if the sequence is empty, not strictly ascending, or its
+    /// representation exceeds the target's addressable range.
     pub fn from_sorted(keys: &[u64]) -> Option<Self> {
-        if keys.is_empty() {
+        if keys.is_empty() || keys.windows(2).any(|pair| pair[0] >= pair[1]) {
             return None;
         }
         let n = keys.len();
@@ -56,7 +134,7 @@ impl EliasFano {
         let low_mask = if low_bits == 0 { 0 } else { (1u64 << low_bits) - 1 };
 
         // Pack low bits.
-        let total_low_bits = n * low_bits as usize;
+        let total_low_bits = n.checked_mul(low_bits as usize)?;
         let low_words = total_low_bits.div_ceil(64);
         let mut low = vec![0u64; low_words];
         if low_bits > 0 {
@@ -73,8 +151,8 @@ impl EliasFano {
         }
 
         // High bitvector: bit `(k >> low_bits) + i` set for the i-th key.
-        let high_len = (max_key >> low_bits as u32).saturating_add(n as u64);
-        let high_words = high_len.div_ceil(64) as usize;
+        let high_len = (max_key >> low_bits as u32).checked_add(n as u64)?;
+        let high_words = usize::try_from(high_len.div_ceil(64)).ok()?;
         let mut high = vec![0u64; high_words];
         for (i, &k) in keys.iter().enumerate() {
             let pos = (k >> low_bits as u32) + i as u64;
@@ -83,29 +161,19 @@ impl EliasFano {
             high[word] |= 1u64 << off;
         }
 
-        // Build select1 sample table. select_sample[s] = bit position of the
-        // (s * SAMPLE_RATE)-th set bit (0-indexed). For s = 0 the answer is the
-        // bit position of the very first '1'.
-        let num_samples = n.div_ceil(SAMPLE_RATE);
-        let mut select_sample = Vec::with_capacity(num_samples);
-        let mut bit_count = 0usize;
-        for (word_idx, &w) in high.iter().enumerate() {
-            let popcnt = w.count_ones() as usize;
-            // We want to record any sample target that lies in this word.
-            let mut remaining = w;
-            for _ in 0..popcnt {
-                if bit_count.is_multiple_of(SAMPLE_RATE) {
-                    let bit_in_word = remaining.trailing_zeros() as usize;
-                    let abs_bit = word_idx * 64 + bit_in_word;
-                    select_sample.push(abs_bit as u32);
-                }
-                // Clear lowest set bit.
-                remaining &= remaining - 1;
-                bit_count += 1;
-            }
-        }
-
-        Some(EliasFano { n, universe, low_bits, low_mask, low, high_len, high, select_sample })
+        let (select_blocks, sparse_positions) =
+            Self::build_select(&high, usize::try_from(high_len).ok()?, n, None)?;
+        Some(EliasFano {
+            n,
+            universe,
+            low_bits,
+            low_mask,
+            low,
+            high_len,
+            high,
+            select_blocks,
+            sparse_positions,
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -120,11 +188,12 @@ impl EliasFano {
         self.universe
     }
 
-    /// Decode the i-th key in O(1) amortized. Out-of-range indices panic in
-    /// debug builds; in release the behavior is wrap-around (no UB).
+    /// Decode the i-th key with bounded O(1) work. Dense blocks visit at most 33
+    /// high words; sparse blocks use one indexed position. Out-of-range indices
+    /// panic in every build profile.
     #[inline]
     pub fn get(&self, i: usize) -> u64 {
-        debug_assert!(i < self.n);
+        assert!(i < self.n, "EliasFano index out of bounds");
         let low = self.read_low(i);
         let high_bit = self.select1(i) as u64;
         let high = high_bit - i as u64;
@@ -136,22 +205,58 @@ impl EliasFano {
     /// materialized at once into a stack-allocated buffer, then scanned with SIMD.
     pub fn materialize_range(&self, from: usize, count: usize, out: &mut Vec<u64>) {
         out.clear();
-        out.reserve(count);
         if from >= self.n || count == 0 {
             return;
         }
-        let end = (from + count).min(self.n);
-        // We could walk the high bitvector incrementally for O(1) per element after
-        // the first select1 — for now keep the simple `get`-per-index loop which is
-        // already O(1) amortized.
-        let mut hi_bit = self.select1(from);
-        let mut last_hi = (hi_bit as u64) - from as u64;
-        out.push((last_hi << self.low_bits as u32) | self.read_low(from));
-        for i in (from + 1)..end {
-            hi_bit = self.next_set_bit(hi_bit + 1);
-            last_hi = (hi_bit as u64) - i as u64;
-            out.push((last_hi << self.low_bits as u32) | self.read_low(i));
+        let count = count.min(self.n - from);
+        out.reserve(count);
+        self.decode_range(from, count, |key| out.push(key));
+    }
+
+    /// Fill existing storage without allocating; only the returned prefix is
+    /// overwritten. Dense blocks are walked once, with directory jumps across
+    /// sparse gaps and rank-block boundaries.
+    pub(crate) fn materialize_into(&self, from: usize, out: &mut [u64]) -> usize {
+        let count = out.len().min(self.n.saturating_sub(from));
+        let mut written = 0;
+        self.decode_range(from, count, |key| {
+            out[written] = key;
+            written += 1;
+        });
+        written
+    }
+
+    fn decode_range(&self, from: usize, count: usize, mut emit: impl FnMut(u64)) {
+        let end = from + count;
+        let mut rank = from;
+        while rank < end {
+            let block_index = rank / SAMPLE_RATE;
+            let block_start = block_index * SAMPLE_RATE;
+            let block_end = end.min(block_start.saturating_add(SAMPLE_RATE));
+            match self.select_blocks[block_index] {
+                SelectBlock::Sparse { offset } => {
+                    for i in rank..block_end {
+                        let position = self.sparse_positions[offset + i - block_start];
+                        emit(self.decode_key(i, position));
+                    }
+                }
+                SelectBlock::Dense { .. } => {
+                    let mut position = self.select1(rank);
+                    emit(self.decode_key(rank, position));
+                    for i in rank + 1..block_end {
+                        position = self.next_set_bit(position + 1);
+                        emit(self.decode_key(i, position));
+                    }
+                }
+            }
+            rank = block_end;
         }
+    }
+
+    #[inline]
+    fn decode_key(&self, rank: usize, position: usize) -> u64 {
+        let high = position as u64 - rank as u64;
+        (high << self.low_bits as u32) | self.read_low(rank)
     }
 
     #[inline]
@@ -169,14 +274,17 @@ impl EliasFano {
         v & self.low_mask
     }
 
-    /// Position (bit index) of the i-th set bit in `high`. O(1) amortized via
-    /// SAMPLE_RATE-th element table + popcount walk.
+    /// Position of the i-th set bit. The constructor and reader establish the
+    /// dense-span bound; sparse blocks bypass the high-vector walk completely.
     #[inline]
     fn select1(&self, i: usize) -> usize {
         debug_assert!(i < self.n);
-        let sample_idx = i / SAMPLE_RATE;
+        let block_index = i / SAMPLE_RATE;
         let mut bits_to_skip = i % SAMPLE_RATE;
-        let start_bit = self.select_sample[sample_idx] as usize;
+        let start_bit = match self.select_blocks[block_index] {
+            SelectBlock::Dense { first } => first,
+            SelectBlock::Sparse { offset } => return self.sparse_positions[offset + bits_to_skip],
+        };
         let mut word = start_bit / 64;
         let off = start_bit % 64;
         // Mask off bits below `off` (already counted in earlier samples). The
@@ -222,11 +330,29 @@ impl EliasFano {
     pub fn memory_usage(&self) -> usize {
         self.low.len() * 8
             + self.high.len() * 8
-            + self.select_sample.len() * 4
+            + self.select_blocks.capacity() * std::mem::size_of::<SelectBlock>()
+            + self.sparse_positions.capacity() * std::mem::size_of::<usize>()
             + std::mem::size_of::<Self>()
     }
 
     pub fn write_to(&self, out: &mut Vec<u8>) {
+        let wide = (0..self.select_blocks.len())
+            .any(|block| u32::try_from(self.block_first(block)).is_err());
+        self.write_format(out, wide);
+    }
+
+    fn block_first(&self, block: usize) -> usize {
+        match self.select_blocks[block] {
+            SelectBlock::Dense { first } => first,
+            SelectBlock::Sparse { offset } => self.sparse_positions[offset],
+        }
+    }
+
+    fn write_format(&self, out: &mut Vec<u8>, wide: bool) {
+        if wide {
+            out.extend_from_slice(&0u64.to_le_bytes());
+            out.extend_from_slice(WIDE_MAGIC);
+        }
         out.extend_from_slice(&(self.n as u64).to_le_bytes());
         out.extend_from_slice(&self.universe.to_le_bytes());
         out.push(self.low_bits);
@@ -235,78 +361,170 @@ impl EliasFano {
         out.extend_from_slice(&self.high_len.to_le_bytes());
         out.extend_from_slice(&(self.high.len() as u64).to_le_bytes());
         crate::wire::extend_le(out, &self.high);
-        out.extend_from_slice(&(self.select_sample.len() as u64).to_le_bytes());
-        crate::wire::extend_le(out, &self.select_sample);
+        out.extend_from_slice(&(self.select_blocks.len() as u64).to_le_bytes());
+        for block in 0..self.select_blocks.len() {
+            let position = self.block_first(block);
+            if wide {
+                out.extend_from_slice(&(position as u64).to_le_bytes());
+            } else {
+                out.extend_from_slice(&(position as u32).to_le_bytes());
+            }
+        }
+    }
+
+    fn build_select(
+        high: &[u64],
+        high_len: usize,
+        n: usize,
+        samples: Option<(&[u8], bool)>,
+    ) -> Option<(Vec<SelectBlock>, Vec<usize>)> {
+        let mut blocks = Vec::with_capacity(n.div_ceil(SAMPLE_RATE));
+        let mut sparse = Vec::new();
+        let mut positions = [0usize; SAMPLE_RATE];
+        let mut rank = 0usize;
+        for (word_index, &word) in high.iter().enumerate() {
+            let mut bits = word;
+            while bits != 0 {
+                if rank >= n {
+                    return None;
+                }
+                let position =
+                    word_index.checked_mul(64)?.checked_add(bits.trailing_zeros() as usize)?;
+                if position >= high_len {
+                    return None;
+                }
+                let local = rank % SAMPLE_RATE;
+                if local == 0
+                    && let Some((samples, wide)) = samples
+                {
+                    let width = if wide { 8 } else { 4 };
+                    let offset = (rank / SAMPLE_RATE).checked_mul(width)?;
+                    let raw = samples.get(offset..offset.checked_add(width)?)?;
+                    let expected = if wide {
+                        usize::try_from(u64::from_le_bytes(raw.try_into().ok()?)).ok()?
+                    } else {
+                        u32::from_le_bytes(raw.try_into().ok()?) as usize
+                    };
+                    if position != expected {
+                        return None;
+                    }
+                }
+                positions[local] = position;
+                rank += 1;
+                if local + 1 == SAMPLE_RATE {
+                    Self::push_select_block(&positions, &mut blocks, &mut sparse);
+                }
+                bits &= bits - 1;
+            }
+        }
+        if rank != n {
+            return None;
+        }
+        let tail = rank % SAMPLE_RATE;
+        if tail != 0 {
+            Self::push_select_block(&positions[..tail], &mut blocks, &mut sparse);
+        }
+        Some((blocks, sparse))
+    }
+
+    fn push_select_block(
+        positions: &[usize],
+        blocks: &mut Vec<SelectBlock>,
+        sparse: &mut Vec<usize>,
+    ) {
+        let first = positions[0];
+        if positions[positions.len() - 1] - first < DENSE_SPAN {
+            blocks.push(SelectBlock::Dense { first });
+        } else {
+            let offset = sparse.len();
+            sparse.extend_from_slice(positions);
+            blocks.push(SelectBlock::Sparse { offset });
+        }
     }
 
     pub fn read_from(bytes: &[u8], pos: &mut usize) -> Option<Self> {
+        fn rd_bytes<'a>(bytes: &'a [u8], pos: &mut usize, len: usize) -> Option<&'a [u8]> {
+            let end = pos.checked_add(len)?;
+            let value = bytes.get(*pos..end)?;
+            *pos = end;
+            Some(value)
+        }
         fn rd_u64(b: &[u8], p: &mut usize) -> Option<u64> {
-            if *p + 8 > b.len() {
-                return None;
-            }
-            let mut a = [0u8; 8];
-            a.copy_from_slice(&b[*p..*p + 8]);
-            *p += 8;
-            Some(u64::from_le_bytes(a))
+            Some(u64::from_le_bytes(rd_bytes(b, p, 8)?.try_into().ok()?))
         }
         fn rd_u8(b: &[u8], p: &mut usize) -> Option<u8> {
-            if *p + 1 > b.len() {
-                return None;
-            }
-            let v = b[*p];
-            *p += 1;
-            Some(v)
+            Some(rd_bytes(b, p, 1)?[0])
         }
         // Allocation sizes are capped by the bytes actually present; structural
         // invariants are checked so decoding can never index out of bounds.
-        let n = rd_u64(bytes, pos)? as usize;
-        let universe = rd_u64(bytes, pos)?;
-        let low_bits = rd_u8(bytes, pos)?;
+        let mut cursor = *pos;
+        let first = rd_u64(bytes, &mut cursor)?;
+        let wide = first == 0;
+        let n = if wide {
+            if rd_bytes(bytes, &mut cursor, WIDE_MAGIC.len())? != WIDE_MAGIC {
+                return None;
+            }
+            usize::try_from(rd_u64(bytes, &mut cursor)?).ok()?
+        } else {
+            usize::try_from(first).ok()?
+        };
+        let universe = rd_u64(bytes, &mut cursor)?;
+        let low_bits = rd_u8(bytes, &mut cursor)?;
         if low_bits > 56 || n == 0 {
             return None;
         }
         let low_mask = if low_bits == 0 { 0 } else { (1u64 << low_bits) - 1 };
-        let low_len = rd_u64(bytes, pos)? as usize;
-        let low: Vec<u64> = crate::wire::read_le_at(bytes, pos, low_len)?;
-        let high_len = rd_u64(bytes, pos)?;
-        let high_count = rd_u64(bytes, pos)? as usize;
-        let high: Vec<u64> = crate::wire::read_le_at(bytes, pos, high_count)?;
-        let sample_count = rd_u64(bytes, pos)? as usize;
-        let select_sample: Vec<u32> = crate::wire::read_le_at(bytes, pos, sample_count)?;
+        let low_len = usize::try_from(rd_u64(bytes, &mut cursor)?).ok()?;
+        let low: Vec<u64> = crate::wire::read_le_at(bytes, &mut cursor, low_len)?;
+        let high_len = rd_u64(bytes, &mut cursor)?;
+        let high_count = usize::try_from(rd_u64(bytes, &mut cursor)?).ok()?;
+        let high: Vec<u64> = crate::wire::read_le_at(bytes, &mut cursor, high_count)?;
+        let sample_count = usize::try_from(rd_u64(bytes, &mut cursor)?).ok()?;
+        if sample_count != n.div_ceil(SAMPLE_RATE) {
+            return None;
+        }
+        let samples =
+            rd_bytes(bytes, &mut cursor, sample_count.checked_mul(if wide { 8 } else { 4 })?)?;
         // low: n * low_bits bits must fit; high: high_len bits must fit and hold
         // exactly n set bits; samples: one per SAMPLE_RATE keys, each inside `high`.
-        let need_low = (n as u64).checked_mul(low_bits as u64)?.div_ceil(64) as usize;
+        let need_low = n.checked_mul(low_bits as usize)?.div_ceil(64);
         if low.len() < need_low || (high.len() as u64) < high_len.div_ceil(64) {
             return None;
         }
-        let ones: u64 = high.iter().map(|w| w.count_ones() as u64).sum();
-        if ones != n as u64 || high_len < n as u64 {
+        if high_len < n as u64 || universe < n as u64 {
             return None;
         }
-        if select_sample.len() != n.div_ceil(SAMPLE_RATE)
-            || select_sample.iter().any(|&s| s as u64 >= high_len)
-        {
+        let (select_blocks, sparse_positions) =
+            Self::build_select(&high, usize::try_from(high_len).ok()?, n, Some((samples, wide)))?;
+        let value = EliasFano {
+            n,
+            universe,
+            low_bits,
+            low_mask,
+            low,
+            high_len,
+            high,
+            select_blocks,
+            sparse_positions,
+        };
+        let highest = value.select1(n - 1) as u64 - (n - 1) as u64;
+        if highest > (u64::MAX >> low_bits) {
             return None;
         }
-        // A sample must point to the corresponding set bit, not merely inside
-        // the array. Otherwise corrupted samples can make select1 run past high.
-        let mut rank = 0usize;
-        for (word_idx, &word) in high.iter().enumerate() {
-            let mut bits = word;
-            while bits != 0 {
-                let pos = word_idx.checked_mul(64)?.checked_add(bits.trailing_zeros() as usize)?;
-                if pos as u64 >= high_len {
-                    return None;
-                }
-                if rank.is_multiple_of(SAMPLE_RATE)
-                    && select_sample[rank / SAMPLE_RATE] as usize != pos
-                {
-                    return None;
-                }
-                rank += 1;
-                bits &= bits - 1;
+        let mut previous = None;
+        let mut valid = true;
+        value.decode_range(0, n, |key| {
+            if previous.is_some_and(|prev| prev >= key)
+                || (key >= universe && !(universe == u64::MAX && key == u64::MAX))
+            {
+                valid = false;
             }
+            previous = Some(key);
+        });
+        if !valid {
+            return None;
         }
-        Some(EliasFano { n, universe, low_bits, low_mask, low, high_len, high, select_sample })
+        *pos = cursor;
+        Some(value)
     }
 }

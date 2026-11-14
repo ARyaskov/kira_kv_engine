@@ -503,6 +503,136 @@ impl Default for BuildConfig {
     }
 }
 
+/// Internal validation keeps the stable low-level error enum source-compatible.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum BuildValidationError {
+    InvalidConfig(&'static str),
+    CapacityExceeded(&'static str),
+}
+
+impl From<BuildValidationError> for PtrHash25Error {
+    fn from(_: BuildValidationError) -> Self {
+        Self::Unresolvable
+    }
+}
+
+fn check_array_capacity<T>(len: usize) -> Result<(), BuildValidationError> {
+    if len > (isize::MAX as usize) / std::mem::size_of::<T>() {
+        return Err(BuildValidationError::CapacityExceeded("table exceeds addressable memory"));
+    }
+    Ok(())
+}
+
+fn checked_dimension(value: f64) -> Result<usize, BuildValidationError> {
+    if !value.is_finite() || value > u32::MAX as f64 {
+        return Err(BuildValidationError::CapacityExceeded("MPH geometry exceeds u32 addressing"));
+    }
+    Ok((value as usize).max(1))
+}
+
+impl BuildConfig {
+    /// Validate options and necessary size bounds before hashing or allocating.
+    pub(crate) fn validate_for_len(&self, n: usize) -> Result<(), BuildValidationError> {
+        if !self.lambda.is_finite() || self.lambda <= 0.0 {
+            return Err(BuildValidationError::InvalidConfig("lambda must be finite and positive"));
+        }
+        if !self.alpha.is_finite() || self.alpha <= 0.0 || self.alpha > 1.0 {
+            return Err(BuildValidationError::InvalidConfig("alpha must be finite and in (0, 1]"));
+        }
+        if n > u32::MAX as usize {
+            return Err(BuildValidationError::CapacityExceeded(
+                "MPH addresses at most 2^32 - 1 keys",
+            ));
+        }
+        check_array_capacity::<u64>(n)?;
+        if n != 0 {
+            // The sum of per-part bucket counts is at least this global count.
+            checked_dimension((n as f64 / self.lambda).ceil())?;
+            // Some part must contain at least ceil(n / parts) keys. Avoid rejecting
+            // valid partitioned tables whose total searched slots exceed u32.
+            checked_dimension((n.div_ceil(parts_for(n)) as f64 / self.alpha).ceil())?;
+            if n as f64 / self.alpha - n as f64 > u32::MAX as f64 {
+                return Err(BuildValidationError::CapacityExceeded(
+                    "too many remap entries for u32 addressing",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Validate actual part geometry before narrowing counts or allocating tables.
+pub(crate) fn validate_partitioned(
+    part: &Partitioned,
+    cfg: &BuildConfig,
+) -> Result<(), BuildValidationError> {
+    cfg.validate_for_len(part.len())?;
+    let mut total_buckets = 0usize;
+    let mut total_remap = 0usize;
+    for p in 0..part.num_parts() {
+        let m = part.part_offsets[p + 1] - part.part_offsets[p];
+        let slots = checked_dimension((m as f64 / cfg.alpha).ceil())?.max(m);
+        let buckets = checked_dimension((m as f64 / cfg.lambda).ceil())?;
+        check_array_capacity::<u32>(slots)?;
+        check_array_capacity::<u32>(
+            buckets
+                .checked_add(1)
+                .ok_or(BuildValidationError::CapacityExceeded("bucket count overflow"))?,
+        )?;
+        total_buckets = total_buckets
+            .checked_add(buckets)
+            .ok_or(BuildValidationError::CapacityExceeded("bucket count overflow"))?;
+        total_remap = total_remap
+            .checked_add(slots - m)
+            .ok_or(BuildValidationError::CapacityExceeded("remap count overflow"))?;
+        if total_buckets > u32::MAX as usize || total_remap > u32::MAX as usize {
+            return Err(BuildValidationError::CapacityExceeded("MPH tables exceed u32 addressing"));
+        }
+    }
+    check_array_capacity::<u8>(total_buckets)?;
+    check_array_capacity::<u32>(total_remap)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod build_validation_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_unaddressable_key_counts_without_allocating() {
+        #[cfg(target_pointer_width = "64")]
+        assert!(matches!(
+            BuildConfig::default().validate_for_len(u32::MAX as usize + 1),
+            Err(BuildValidationError::CapacityExceeded(_))
+        ));
+        assert!(matches!(
+            check_array_capacity::<u64>(isize::MAX as usize / 8 + 1),
+            Err(BuildValidationError::CapacityExceeded(_))
+        ));
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn checks_actual_part_geometry_before_narrowing_counts() {
+        let n = 70_000;
+        let cfg = BuildConfig {
+            alpha: n as f64 / (u32::MAX as f64 + 35_000.0),
+            ..BuildConfig::default()
+        };
+        assert!(cfg.validate_for_len(n).is_ok());
+        let part = Partitioned {
+            keys: crate::hugepage::HugeVec::zeroed(n),
+            part_offsets: vec![0, n, n, n],
+            part_salt: 0,
+            prerotate: 0,
+        };
+        assert!(matches!(
+            validate_partitioned(&part, &cfg),
+            Err(BuildValidationError::CapacityExceeded(_))
+        ));
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum PtrHash25Error {
     #[error("could not place all keys after max rehash rounds")]
@@ -540,7 +670,10 @@ impl Builder {
     /// Build an MPHF over `keys` (must be unique). Partitions, then builds every part
     /// in parallel (when the `parallel` feature is on and there is more than one part).
     pub fn build(self, keys: &[u64]) -> Result<PtrHash25Mphf, PtrHash25Error> {
-        assert!(!keys.is_empty(), "empty key set");
+        self.cfg.validate_for_len(keys.len())?;
+        if keys.is_empty() {
+            return Err(PtrHash25Error::Unresolvable);
+        }
         let part = partition_keys(keys, &self.cfg);
         build_partitioned(&part, &self.cfg).map(|(mph, _)| mph)
     }
@@ -551,7 +684,10 @@ impl Builder {
         self,
         keys: &[u64],
     ) -> Result<(PtrHash25Mphf, Partitioned, Vec<u32>), PtrHash25Error> {
-        assert!(!keys.is_empty(), "empty key set");
+        self.cfg.validate_for_len(keys.len())?;
+        if keys.is_empty() {
+            return Err(PtrHash25Error::Unresolvable);
+        }
         let part = partition_keys(keys, &self.cfg);
         let (mph, slots) = build_partitioned(&part, &self.cfg)?;
         Ok((mph, part, slots))
@@ -620,6 +756,9 @@ impl<T> SyncPtr<T> {
 fn partition_ranges(n: usize) -> usize {
     #[cfg(feature = "parallel")]
     {
+        if !crate::build_pool::parallel_enabled() {
+            return 1;
+        }
         let threads = rayon::current_num_threads().max(1);
         // ≥ 64K keys per range so the per-range histograms amortize.
         (threads * 2).min(n / 65_536).max(1)
@@ -676,8 +815,12 @@ pub fn partition_keys_into(
     };
     #[cfg(feature = "parallel")]
     {
-        use rayon::prelude::*;
-        hist.par_chunks_mut(parts).enumerate().for_each(|(r, row)| count_range(r, row));
+        if crate::build_pool::parallel_enabled() {
+            use rayon::prelude::*;
+            hist.par_chunks_mut(parts).enumerate().for_each(|(r, row)| count_range(r, row));
+        } else {
+            hist.chunks_mut(parts).enumerate().for_each(|(r, row)| count_range(r, row));
+        }
     }
     #[cfg(not(feature = "parallel"))]
     {
@@ -745,8 +888,12 @@ pub fn partition_keys_into(
     };
     #[cfg(feature = "parallel")]
     {
-        use rayon::prelude::*;
-        hist.par_chunks_mut(parts).enumerate().for_each(|(r, row)| scatter_range(r, row));
+        if crate::build_pool::parallel_enabled() {
+            use rayon::prelude::*;
+            hist.par_chunks_mut(parts).enumerate().for_each(|(r, row)| scatter_range(r, row));
+        } else {
+            hist.chunks_mut(parts).enumerate().for_each(|(r, row)| scatter_range(r, row));
+        }
     }
     #[cfg(not(feature = "parallel"))]
     {
@@ -1177,17 +1324,17 @@ fn run_jobs(jobs: Vec<PartJob<'_>>, cfg: &BuildConfig) -> Result<Vec<u64>, PtrHa
     }
     #[cfg(feature = "parallel")]
     {
-        use rayon::prelude::*;
-        jobs.into_par_iter()
-            .map_init(Scratch::default, |sc, mut job| build_part(&mut job, sc, cfg))
-            .collect()
+        if crate::build_pool::parallel_enabled() {
+            use rayon::prelude::*;
+            return jobs
+                .into_par_iter()
+                .map_init(Scratch::default, |sc, mut job| build_part(&mut job, sc, cfg))
+                .collect();
+        }
     }
-    #[cfg(not(feature = "parallel"))]
-    {
-        let mut jobs = jobs;
-        let mut sc = Scratch::default();
-        jobs.iter_mut().map(|job| build_part(job, &mut sc, cfg)).collect()
-    }
+    let mut jobs = jobs;
+    let mut sc = Scratch::default();
+    jobs.iter_mut().map(|job| build_part(job, &mut sc, cfg)).collect()
 }
 
 /// Build the MPHF from partitioned keys. Returns the structure plus the local position
@@ -1211,9 +1358,10 @@ pub fn build_partitioned_with(
     outputs: BuildOutputs,
 ) -> Result<(PtrHash25Mphf, Option<Vec<u32>>, Option<Vec<u16>>), PtrHash25Error> {
     let n = part.len();
-    assert!(n > 0, "empty key set");
-    assert!(n <= u32::MAX as usize, "PtrHash25 addresses at most 2^32 - 1 keys");
-    assert!(cfg.lambda > 0.0 && cfg.alpha > 0.0 && cfg.alpha <= 1.0, "invalid lambda/alpha");
+    validate_partitioned(part, cfg)?;
+    if n == 0 {
+        return Err(PtrHash25Error::Unresolvable);
+    }
     let parts = part.num_parts();
 
     // Per-part geometry from the actual part sizes.
@@ -1240,8 +1388,6 @@ pub fn build_partitioned_with(
         slot_off += m as u64;
         bucket_off += buckets as u64;
         remap_off += (slots - m) as u64;
-        assert!(bucket_off <= u32::MAX as u64, "too many buckets for u32 addressing");
-        assert!(remap_off <= u32::MAX as u64, "too many remap entries for u32 addressing");
     }
     let total_buckets = bucket_off as usize;
     let total_remap = remap_off as usize;

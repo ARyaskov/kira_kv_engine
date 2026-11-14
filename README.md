@@ -236,9 +236,9 @@ Lookups: `hybrid.lookup(&[u8])`, `lookup_u64(u64)`, `lookup_batch_u64_simd(&[u64
 use kira_kv_engine::PgmBuilder;
 
 PgmBuilder::new()
-    .with_epsilon(64)                  // every key within 64 positions of its prediction
+    .with_epsilon(64)                  // fitting tolerance; measured error <= epsilon + 1
     .with_bloom_filter(true)           // negative-fast
-    .with_elias_fano(true)             // -40% key memory
+    .with_elias_fano(true)             // compact keys when it saves memory
     .with_target_lookup_ns(50)         // auto-tune ε
     .build(u64_keys)?                  // sorted here; duplicates are an error
 ```
@@ -266,7 +266,12 @@ Files are portable between x86_64, aarch64 and other targets.
 New builds use length-delimited hashing for short byte keys. Previously written
 Index, mmap and Hybrid files keep their original hash and lookup positions when
 loaded or saved again. Standalone PGM now uses a checksummed envelope; legacy raw
-PGM versions 2, 3 and 4 remain readable.
+PGM versions 2, 3 and 4 remain readable. New u64 PGM models use relative f64
+slopes (raw v6), keeping dense keys precise even near `u64::MAX`; loaded legacy
+models retain their absolute representation on resave. Elias-Fano keeps its
+ordinary wire layout while rebuilding a bounded select directory on load.
+See [the PGM/Elias-Fano comparison](performance/PGM_EF_REPORT.md) for measured
+speed and memory tradeoffs.
 
 ```rust
 // Index: streaming save/load, or in-memory bytes
@@ -447,6 +452,12 @@ aarch64. Run-to-run spread on memory-bound rows is about ±10% on this machine.
    pool uses every core (`available_parallelism`), or the P-cores on hybrid CPUs
    where the workers are pinned; `KIRA_BUILD_THREADS`, `KIRA_BUILD_CORE_IDS` and
    `KIRA_BUILD_PIN=0` override that.
+
+Use `with_parallel_build(false)` to keep the entire Index build, including
+owned-key destruction, on the caller thread. PGM and Hybrid provide
+`with_parallel(false)` with the same guarantee. The public `MphConfig` alias
+exposes the existing MPH configuration; invalid options return typed
+`IndexError::InvalidConfig` or `IndexError::CapacityExceeded` errors.
 
 ## Hugepages (Windows / Linux)
 

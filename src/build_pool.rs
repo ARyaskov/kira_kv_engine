@@ -31,7 +31,30 @@
 //! pure linear sweep over memory (~3 GB/s).
 
 #[cfg(feature = "parallel")]
+use std::cell::Cell;
+#[cfg(feature = "parallel")]
 use std::sync::OnceLock;
+
+#[cfg(feature = "parallel")]
+thread_local! {
+    static SEQUENTIAL_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Whether a build phase may dispatch Rayon work in the current build scope.
+#[cfg(feature = "parallel")]
+pub(crate) fn parallel_enabled() -> bool {
+    SEQUENTIAL_DEPTH.with(|depth| depth.get() == 0)
+}
+
+#[cfg(feature = "parallel")]
+struct SequentialScope;
+
+#[cfg(feature = "parallel")]
+impl Drop for SequentialScope {
+    fn drop(&mut self) {
+        SEQUENTIAL_DEPTH.with(|depth| depth.set(depth.get() - 1));
+    }
+}
 
 #[cfg(feature = "parallel")]
 static GLOBAL_BUILD_POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
@@ -91,17 +114,43 @@ fn pick_pinning_cores() -> Option<Vec<usize>> {
     None
 }
 
-/// Run `f` on the build pool when `parallel` is set (no-op wrapper otherwise, and
-/// when the `parallel` feature is off). Nested calls from inside the pool run
-/// inline.
+/// Run `f` on the build pool when allowed. A sequential scope stays on the caller
+/// thread and suppresses parallel phases, including nested builds requesting a pool.
 #[cfg(feature = "parallel")]
 pub fn run<T: Send>(parallel: bool, f: impl FnOnce() -> T + Send) -> T {
-    if parallel { pool().install(f) } else { f() }
+    if parallel && parallel_enabled() {
+        pool().install(f)
+    } else {
+        SEQUENTIAL_DEPTH.with(|depth| depth.set(depth.get() + 1));
+        let _scope = SequentialScope;
+        f()
+    }
 }
 
 #[cfg(not(feature = "parallel"))]
 pub fn run<T>(_parallel: bool, f: impl FnOnce() -> T) -> T {
     f()
+}
+
+#[cfg(all(test, feature = "parallel"))]
+mod tests {
+    #[test]
+    fn sequential_scope_is_nested_and_restored_after_panic() {
+        let caller = std::thread::current().id();
+        assert!(super::parallel_enabled());
+        super::run(false, || {
+            assert!(!super::parallel_enabled());
+            super::run(true, || {
+                assert_eq!(std::thread::current().id(), caller);
+                assert!(!super::parallel_enabled());
+            });
+            assert!(!super::parallel_enabled());
+        });
+        assert!(super::parallel_enabled());
+        let result = std::panic::catch_unwind(|| super::run(false, || panic!("scope test")));
+        assert!(result.is_err());
+        assert!(super::parallel_enabled());
+    }
 }
 
 /// LSD radix sort for `(u64 key, u32 payload)` pairs, sorted by the u64 key.

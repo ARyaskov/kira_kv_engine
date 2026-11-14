@@ -33,3 +33,14 @@ The dynamic fixture inserts `alice`, `bob`, `carol` with IDs 0, 1, 2, deletes
 `bob`, and flushes. It retains `alice → 0`, `carol → 2`; the next new ID is 3.
 Its configuration is flush threshold 2, maximum 4 tiers, fingerprints enabled
 and sequential tier building.
+
+The following precision/select fixtures were generated from immutable revision
+`9f7bdb2` with Rust 1.100.0, using public builders (PGM parallelism disabled):
+
+- `pgm_absolute_v081.bin`: 256 keys `13*i + 7`, epsilon 8, sealed absolute raw v4.
+- `pgm_absolute_offset_v081.bin`: `[B, B+1, B+2]`, `B = 2^52 + 2^27`, epsilon 0.
+  Its legacy stored error is 134217728; loading must preserve this error budget.
+- `hybrid_absolute_pgm_v081.bin`: 256 u64 keys `13*i + 7`, epsilon 0, original
+  input positions 0 through 255, with the absolute PGM locator embedded.
+- `elias_fano_v081.bin`: 256 keys `13*i + 7`, legacy u32 rank samples. Tests
+  require byte-identical resaving and correct cursor continuation.

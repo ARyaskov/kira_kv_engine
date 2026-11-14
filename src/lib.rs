@@ -57,8 +57,10 @@ pub use hot_tier_dynamic::{DynamicHotTier, SpaceSaving};
 pub use hugepage::hugepages_available;
 pub use hybrid_engine::{HybridBuilder, HybridError, HybridIndex, HybridStorageStats};
 pub use membership::MembershipMode;
-pub use pgm::{PgmBuilder, PgmIndex, PgmStats};
+pub use pgm::{PgmBuilder, PgmError, PgmIndex, PgmStats};
 pub use pgm_u128::{PgmIndexU128, PgmU128Error};
+/// Geometry and hashing options for the MPH builder used by [`IndexConfig`].
+pub use ptrhash25::BuildConfig as MphConfig;
 
 /// Test-only re-exports of crate-internal items. Hidden from rustdoc; not part
 /// of the stable API. Used exclusively by `tests/` for internal-state tests.

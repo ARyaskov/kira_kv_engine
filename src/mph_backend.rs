@@ -112,14 +112,19 @@ pub(crate) enum PtrHash25Storage {
 impl MphBackend for PtrHash25Backend {
     fn build(keys: &[u64], config: &BuildConfig) -> Self {
         let cfg = config.mph_config();
-        let part = ptrhash25::partition_keys(keys, &cfg);
-        match Self::build_from_partitioned(&part, config, false) {
-            Ok((backend, _)) => backend,
-            // Duplicate u64 keys: keep the historical behaviour of this low-level entry
-            // point (a map that keeps the last occurrence) — `Index` handles duplicates
-            // explicitly before ever reaching here.
-            Err(_) => Self { storage: PtrHash25Storage::Map(build_fallback_map_original(keys)) },
-        }
+        crate::build_pool::run(config.enable_parallel_build, || {
+            if cfg.validate_for_len(keys.len()).is_err() || keys.is_empty() {
+                return Self { storage: PtrHash25Storage::Map(build_fallback_map_original(keys)) };
+            }
+            let part = ptrhash25::partition_keys(keys, &cfg);
+            match Self::build_from_partitioned(&part, config, false) {
+                Ok((backend, _)) => backend,
+                // Keep the historical map behavior for duplicate keys in this API.
+                Err(_) => {
+                    Self { storage: PtrHash25Storage::Map(build_fallback_map_original(keys)) }
+                }
+            }
+        })
     }
 
     #[inline]
