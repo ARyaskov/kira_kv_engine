@@ -509,11 +509,52 @@ impl Index {
     /// foreign key and [`Index::contains`] can only answer `true`.
     #[inline]
     pub fn supports_negative_lookups(&self) -> bool {
-        match &self.engine {
-            Some(engine) => engine.filter.is_some() || engine.fingerprints.is_some(),
-            // An empty index rejects every key exactly.
-            None => true,
+        self.membership_mode() != crate::MembershipMode::ClosedWorld
+    }
+
+    /// Membership guarantee of [`Index::lookup`]. Fingerprints, including fp32,
+    /// only provide probabilistic membership. Empty indexes reject every key.
+    pub fn membership_mode(&self) -> crate::MembershipMode {
+        let Some(engine) = &self.engine else {
+            return crate::MembershipMode::Exact;
+        };
+        let BackendDispatch::PtrHash25(backend) = &engine.backend;
+        // The MPH backend uses index_u64, so its optional inner fingerprints
+        // are not consulted by Index lookups. Only the canonical-hash map can
+        // reject a missing hash independently of the outer membership tables.
+        let backend_membership =
+            matches!(&backend.storage, crate::mph_backend::PtrHash25Storage::Map(_));
+        if engine.filter.is_some() || engine.fingerprints.is_some() || backend_membership {
+            crate::MembershipMode::Probabilistic
+        } else {
+            crate::MembershipMode::ClosedWorld
         }
+    }
+
+    /// Use every configured membership check, exactly as [`Index::lookup`] does.
+    /// A positive answer remains probabilistic unless the index is empty.
+    /// Unlike [`Index::contains`], this also checks fingerprints when Bloom exists.
+    pub fn may_contain(&self, key: &[u8]) -> bool {
+        self.lookup(key).is_ok()
+    }
+
+    /// Batched [`Index::may_contain`], preserving input order.
+    pub fn may_contain_batch(&self, keys: &[&[u8]]) -> Vec<bool> {
+        keys.iter().map(|key| self.may_contain(key)).collect()
+    }
+
+    /// Verify a candidate against the caller's authoritative key storage.
+    /// `verify(slot, requested_key)` must compare the full stored key at `slot`
+    /// with `requested_key`; accepting a fingerprint comparison is not exact.
+    /// The callback runs at most once, only after the configured checks pass.
+    /// This also supports lean indexes, whose ordinary lookups assume known keys.
+    pub fn lookup_verified(
+        &self,
+        key: &[u8],
+        verify: impl FnOnce(usize, &[u8]) -> bool,
+    ) -> Result<usize, IndexError> {
+        let slot = self.lookup(key)?;
+        if verify(slot, key) { Ok(slot) } else { Err(IndexError::KeyNotFound) }
     }
 
     /// Probabilistic membership test: `false` means the key is definitely absent,

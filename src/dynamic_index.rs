@@ -29,8 +29,8 @@
 //! ```
 //!
 //! Tombstones (deleted keys) live in a separate `HashSet` and are checked
-//! before any tier. They are dropped by `compact()`, which materialises the
-//! live set.
+//! before any tier. Full compaction drops them after building the live set;
+//! maintenance boundaries also collect sufficiently dense deletion garbage.
 //!
 //! ### Stable IDs and compaction
 //!
@@ -53,6 +53,48 @@ use crate::index::{Index, IndexBuilder, IndexConfig, IndexError};
 use hashbrown::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
+use thiserror::Error;
+
+/// Automatic merge policy. The legacy policies retain the configured hard tier
+/// cap; geometric merging uses a logarithmic run budget instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompactionPolicy {
+    /// Historical default: merge the full set when the hard tier cap is exceeded.
+    #[default]
+    Full,
+    /// Size-based merges with the historical hard total tier cap.
+    SizeTiered,
+    /// Level-promoting merges with an explicit logarithmic run allowance.
+    Geometric,
+}
+
+/// Insertion failures distinguish an uncommitted write from an inserted key
+/// whose automatic maintenance failed. Retry maintenance, not the inserted key.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum DynamicInsertError {
+    #[error("DynamicIndex: id space exhausted")]
+    IdExhausted,
+    #[error("DynamicIndex: maintenance is blocked: {0}")]
+    Backpressure(String),
+    #[error(
+        "DynamicIndex: key was inserted with id {committed_id}, but maintenance failed: {source}"
+    )]
+    Maintenance {
+        committed_id: StableId,
+        #[source]
+        source: IndexError,
+    },
+}
+
+impl DynamicInsertError {
+    pub fn committed_id(&self) -> Option<StableId> {
+        match self {
+            Self::Maintenance { committed_id, .. } => Some(*committed_id),
+            _ => None,
+        }
+    }
+}
 
 /// A stable external id assigned by [`DynamicIndex`] on insert. Never
 /// invalidated by flushes or compactions.
@@ -64,7 +106,8 @@ pub struct DynamicConfig {
     /// Flush the write buffer to a new tier when it reaches this size.
     /// 64K is a good default (~10 ms flush cost, ~1 MB index size).
     pub flush_threshold: usize,
-    /// Maximum number of immutable tiers; writers wait for selected merges above it.
+    /// Hard tier cap in Full/SizeTiered mode; minimum adaptive allowance in
+    /// explicit Geometric mode. Writers wait for selected merges above the limit.
     /// More tiers = slower lookups (linear in tier count) but cheaper writes.
     pub max_tiers: usize,
     /// Lean mode for tier indexes (no Bloom, no fingerprints): ~4 B/key less
@@ -93,11 +136,12 @@ pub struct DynamicIndex {
     buffer: HashMap<Vec<u8>, StableId>,
     /// Deleted keys that still exist in some tier (must be checked before any tier).
     tombstones: HashSet<Vec<u8>>,
+    tombstone_bytes: usize,
     /// Immutable tiers, youngest at index 0. Lookup checks them in order.
     tiers: Vec<Arc<Tier>>,
     pending: Option<CompactionJob>,
     background_compaction: bool,
-    size_tiering: bool,
+    compaction_policy: CompactionPolicy,
     compaction_ratio: usize,
     compaction_count: u64,
     rebuilt_keys: u64,
@@ -106,6 +150,11 @@ pub struct DynamicIndex {
     /// Exact number of live keys.
     live: usize,
     cfg: DynamicConfig,
+    maintenance_error: Option<String>,
+    #[cfg(test)]
+    fail_next_build: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    build_attempts: std::sync::atomic::AtomicUsize,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -120,6 +169,9 @@ struct Tier {
     /// Direct MPH-slot metadata: no slot-to-entry indirection or per-key allocation.
     entries: Box<[Entry]>,
     arena: Box<[u8]>,
+    /// Number of level-zero flush units represented by the run, including
+    /// versions discarded by merges. Deduplication cannot demote a level.
+    weight: usize,
 }
 impl Tier {
     #[inline]
@@ -154,52 +206,73 @@ impl DynamicIndex {
         Self {
             buffer: HashMap::with_capacity(capacity),
             tombstones: HashSet::new(),
+            tombstone_bytes: 0,
             tiers: Vec::new(),
             pending: None,
             background_compaction: false,
-            size_tiering: false,
+            compaction_policy: CompactionPolicy::Full,
             compaction_ratio: 4,
             compaction_count: 0,
             rebuilt_keys: 0,
             next_id: 0,
             live: 0,
             cfg,
+            maintenance_error: None,
+            #[cfg(test)]
+            fail_next_build: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            build_attempts: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
     /// Insert a new key. Returns its stable id. If the key is already present
-    /// (in the buffer or a tier), the existing id is returned and the binding
-    /// is promoted into the buffer so later writes see it first.
+    /// (in the buffer or a tier), the existing id is returned without rewriting it.
     ///
     /// A key deleted earlier gets a fresh id — deletion is final for the old id.
+    /// Automatic maintenance failures leave the inserted binding readable and
+    /// are exposed by `last_maintenance_error`. New writes then stop until an
+    /// explicit successful `flush` or `compact`. Use `try_insert` to handle these
+    /// cases without panicking. ID exhaustion and blocked writes panic before
+    /// changing any key/id binding.
     pub fn insert(&mut self, key: Vec<u8>) -> StableId {
-        if let Some(&id) = self.buffer.get(&key) {
-            return id;
+        match self.try_insert(key) {
+            Ok(id) | Err(DynamicInsertError::Maintenance { committed_id: id, .. }) => id,
+            Err(error) => panic!("{error}"),
         }
-        // A revived key gets a fresh id; the stale tier copy is shadowed by the
-        // buffer now and by the younger tier after the next flush.
-        let revived = self.tombstones.remove(&key);
-        if !revived && let Some(id) = self.lookup_in_tiers(&key) {
-            // Promote into the buffer so future writes/deletes see the live
-            // value first.
-            self.buffer.insert(key, id);
-            self.maybe_flush();
-            return id;
-        }
-        let id = self.next_id;
-        self.next_id = self.next_id.checked_add(1).expect("DynamicIndex: id space exhausted");
-        self.buffer.insert(key, id);
-        self.live += 1;
-        self.maybe_flush();
-        id
     }
 
-    #[inline]
-    fn maybe_flush(&mut self) {
+    pub fn try_insert(&mut self, key: Vec<u8>) -> Result<StableId, DynamicInsertError> {
+        if let Some(id) = self.lookup(&key) {
+            return Ok(id);
+        }
+        if let Some(error) = &self.maintenance_error {
+            return Err(DynamicInsertError::Backpressure(error.clone()));
+        }
+        let id = self.next_id;
+        let next_id = id.checked_add(1).ok_or(DynamicInsertError::IdExhausted)?;
+        // Every fallible state check precedes removal of a revival's tombstone.
+        if self.tombstones.remove(&key) {
+            self.tombstone_bytes -= key.len() + std::mem::size_of::<Entry>();
+        }
+        self.next_id = next_id;
+        self.buffer.insert(key, id);
+        self.live += 1;
         if self.buffer.len() >= self.cfg.flush_threshold {
-            // A failed flush keeps every entry in the buffer; the next insert
-            // retries. Nothing is lost, so the error is safe to drop here.
-            let _ = self.flush();
+            self.flush()
+                .map_err(|source| DynamicInsertError::Maintenance { committed_id: id, source })?;
+        }
+        Ok(id)
+    }
+
+    pub fn last_maintenance_error(&self) -> Option<&str> {
+        self.maintenance_error.as_deref()
+    }
+
+    fn record_maintenance_result(&mut self, result: &Result<(), IndexError>, clear: bool) {
+        match result {
+            Err(error) => self.maintenance_error = Some(error.to_string()),
+            Ok(()) if clear => self.maintenance_error = None,
+            Ok(()) => {}
         }
     }
 
@@ -214,8 +287,8 @@ impl DynamicIndex {
         if prior.is_some() {
             self.live -= 1;
             // A tombstone is only needed while some tier still holds the key.
-            if in_tiers.is_some() {
-                self.tombstones.insert(key.to_vec());
+            if in_tiers.is_some() && self.tombstones.insert(key.to_vec()) {
+                self.tombstone_bytes += key.len() + std::mem::size_of::<Entry>();
             }
         }
         prior
@@ -260,6 +333,12 @@ impl DynamicIndex {
     /// Flush the buffer and schedule a size-tiered merge. On a tier-build error
     /// the buffer stays intact; maintenance errors never lose key/id bindings.
     pub fn flush(&mut self) -> Result<(), IndexError> {
+        let result = self.flush_inner();
+        self.record_maintenance_result(&result, true);
+        result
+    }
+
+    fn flush_inner(&mut self) -> Result<(), IndexError> {
         self.poll_compaction(false)?;
         if !self.buffer.is_empty() {
             let entries: Vec<(&[u8], StableId)> =
@@ -268,10 +347,13 @@ impl DynamicIndex {
             self.buffer.clear();
             self.tiers.insert(0, tier);
         }
-        if !self.size_tiering {
+        if self.should_collect_deleted() {
+            return self.collect_deleted();
+        }
+        if self.compaction_policy == CompactionPolicy::Full {
             if self.tiers.len() > self.cfg.max_tiers {
                 let rebuilt = self.tiers.iter().map(|t| t.entries.len() as u64).sum::<u64>();
-                self.compact()?;
+                self.compact_inner()?;
                 self.compaction_count += 1;
                 self.rebuilt_keys += rebuilt;
             }
@@ -280,12 +362,74 @@ impl DynamicIndex {
         self.schedule_compaction()?;
         // Backpressure bounds the read amplification and retained generations.
         // Only an already-running merge is awaited; never rebuild the full set here.
-        while self.tiers.len() > self.cfg.max_tiers {
+        while self.tiers.len() > self.tier_limit() {
             if self.pending.is_some() {
                 self.poll_compaction(true)?;
             }
             self.schedule_compaction()?;
         }
+        Ok(())
+    }
+
+    /// Effective number of retained runs. Geometric mode allows the run budget
+    /// to grow with the number of size levels instead of repeatedly rebuilding
+    /// an arbitrarily large base to enforce a fixed global cap.
+    pub fn tier_limit(&self) -> usize {
+        if self.compaction_policy != CompactionPolicy::Geometric {
+            return self.cfg.max_tiers;
+        }
+        let mut runs = self
+            .tiers
+            .iter()
+            .map(|tier| tier.weight)
+            .sum::<usize>()
+            .saturating_add(self.buffer.len().div_ceil(self.cfg.flush_threshold));
+        let mut levels = 1usize;
+        while runs >= self.compaction_ratio {
+            runs /= self.compaction_ratio;
+            levels += 1;
+        }
+        self.cfg.max_tiers.max(levels.saturating_mul(self.compaction_ratio - 1))
+    }
+
+    pub fn compaction_policy(&self) -> CompactionPolicy {
+        self.compaction_policy
+    }
+
+    /// Select an automatic policy without changing the serialized key/id format.
+    /// Geometric mode deliberately uses `tier_limit()` instead of a hard global
+    /// `max_tiers`; Full and SizeTiered retain the historical hard bound.
+    pub fn set_compaction_policy(&mut self, policy: CompactionPolicy) -> Result<(), IndexError> {
+        self.finish_background_compaction()?;
+        if policy == CompactionPolicy::Geometric
+            && self.compaction_policy != policy
+            && self.tiers.len() > 1
+        {
+            self.compact()?;
+        }
+        self.compaction_policy = policy;
+        self.flush()
+    }
+
+    fn should_collect_deleted(&self) -> bool {
+        if self.tombstones.is_empty() {
+            return false;
+        }
+        let resident = self
+            .tiers
+            .iter()
+            .map(|tier| tier.arena.len() + std::mem::size_of_val(tier.entries.as_ref()))
+            .sum::<usize>();
+        self.live == 0 || self.tombstone_bytes >= resident.div_ceil(4)
+    }
+
+    fn collect_deleted(&mut self) -> Result<(), IndexError> {
+        self.finish_merges()?;
+        let rebuilt = self.tiers.iter().map(|tier| tier.entries.len() as u64).sum::<u64>()
+            + self.buffer.len() as u64;
+        self.compact_inner()?;
+        self.compaction_count += 1;
+        self.rebuilt_keys += rebuilt;
         Ok(())
     }
 
@@ -296,8 +440,8 @@ impl DynamicIndex {
             self.finish_background_compaction()?;
         }
         self.background_compaction = enabled;
-        if enabled {
-            self.size_tiering = true;
+        if enabled && self.compaction_policy == CompactionPolicy::Full {
+            self.compaction_policy = CompactionPolicy::SizeTiered;
         }
         Ok(())
     }
@@ -309,13 +453,27 @@ impl DynamicIndex {
             return Err(IndexError::Unsupported("compaction ratio must be at least two"));
         }
         self.finish_background_compaction()?;
+        if self.compaction_policy == CompactionPolicy::Geometric && self.compaction_ratio != ratio {
+            self.compact()?;
+        }
         self.compaction_ratio = ratio;
-        self.size_tiering = true;
+        if self.compaction_policy == CompactionPolicy::Full {
+            self.compaction_policy = CompactionPolicy::SizeTiered;
+        }
         Ok(())
     }
 
     /// Wait for all currently eligible merges. Includes background work in timings.
     pub fn finish_background_compaction(&mut self) -> Result<(), IndexError> {
+        let result = self.finish_merges().and_then(|()| {
+            if self.should_collect_deleted() { self.collect_deleted() } else { Ok(()) }
+        });
+        // Only flush/compact retries an unsuccessful write-buffer build.
+        self.record_maintenance_result(&result, false);
+        result
+    }
+
+    fn finish_merges(&mut self) -> Result<(), IndexError> {
         loop {
             self.poll_compaction(true)?;
             self.schedule_compaction()?;
@@ -331,8 +489,8 @@ impl DynamicIndex {
     }
 
     fn merge_range(&self) -> Option<std::ops::Range<usize>> {
-        let level = |len: usize| {
-            let mut n = len / self.cfg.flush_threshold;
+        let level = |weight: usize| {
+            let mut n = weight;
             let mut l = 0;
             while n >= self.compaction_ratio {
                 n /= self.compaction_ratio;
@@ -342,25 +500,39 @@ impl DynamicIndex {
         };
         let mut start = 0;
         while start < self.tiers.len() {
-            let current = level(self.tiers[start].entries.len());
+            let current = level(self.tiers[start].weight);
             let mut end = start + 1;
-            while end < self.tiers.len() && level(self.tiers[end].entries.len()) == current {
+            while end < self.tiers.len() && level(self.tiers[end].weight) == current {
                 end += 1;
             }
             if end - start >= self.compaction_ratio {
-                return Some(start..start + self.compaction_ratio);
+                // Merge the oldest cohort so its carried level stays behind
+                // any younger runs accumulated while a worker was in flight.
+                return Some(end - self.compaction_ratio..end);
             }
             start = end;
         }
-        if self.tiers.len() > self.cfg.max_tiers && self.tiers.len() >= 2 {
-            Some(self.tiers.len() - 2..self.tiers.len())
+        if self.compaction_policy == CompactionPolicy::SizeTiered
+            && self.tiers.len() > self.cfg.max_tiers
+            && self.tiers.len() >= 2
+        {
+            // Merging the smallest adjacent pair avoids repeatedly rewriting a
+            // large oldest base when the cap cannot accommodate all levels.
+            let start = self
+                .tiers
+                .windows(2)
+                .enumerate()
+                .min_by_key(|(_, pair)| pair[0].entries.len().saturating_add(pair[1].entries.len()))
+                .map(|(index, _)| index)
+                .unwrap();
+            Some(start..start + 2)
         } else {
             None
         }
     }
 
     fn schedule_compaction(&mut self) -> Result<(), IndexError> {
-        if !self.size_tiering || self.pending.is_some() {
+        if self.compaction_policy == CompactionPolicy::Full || self.pending.is_some() {
             return Ok(());
         }
         while let Some(range) = self.merge_range() {
@@ -435,20 +607,25 @@ impl DynamicIndex {
     ///
     /// On error all logical key/id bindings remain unchanged.
     pub fn compact(&mut self) -> Result<(), IndexError> {
-        self.finish_background_compaction()?;
+        let result = self.compact_inner();
+        self.record_maintenance_result(&result, true);
+        result
+    }
+
+    fn compact_inner(&mut self) -> Result<(), IndexError> {
+        self.finish_merges()?;
         // Collect all live entries: tiers oldest-first so newer wins, then the
         // buffer, then drop tombstoned keys.
         let mut merged: HashMap<&[u8], StableId> = HashMap::with_capacity(self.live);
         for tier in self.tiers.iter().rev() {
             for (k, id) in tier.iter() {
-                merged.insert(k, id);
+                if !self.tombstones.contains(k) {
+                    merged.insert(k, id);
+                }
             }
         }
         for (k, id) in self.buffer.iter() {
             merged.insert(k.as_slice(), *id);
-        }
-        for tomb in self.tombstones.iter() {
-            merged.remove(tomb.as_slice());
         }
         debug_assert_eq!(merged.len(), self.live);
         let new_tier = if merged.is_empty() {
@@ -461,7 +638,8 @@ impl DynamicIndex {
         // Only now is the old state replaced.
         self.tiers.clear();
         self.buffer.clear();
-        self.tombstones.clear();
+        self.tombstones = HashSet::new();
+        self.tombstone_bytes = 0;
         if let Some(t) = new_tier {
             self.tiers.push(Arc::new(t));
         }
@@ -469,6 +647,13 @@ impl DynamicIndex {
     }
 
     fn build_tier(&self, entries: Vec<(&[u8], StableId)>) -> Result<Tier, IndexError> {
+        #[cfg(test)]
+        {
+            self.build_attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.fail_next_build.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                return Err(IndexError::Unresolvable);
+            }
+        }
         build_tier(&self.cfg, entries)
     }
 
@@ -588,6 +773,9 @@ impl Default for DynamicIndex {
 }
 
 fn build_tier(cfg: &DynamicConfig, input: Vec<(&[u8], StableId)>) -> Result<Tier, IndexError> {
+    // Even an explicit partial flush consumes one level-zero run. A virtual
+    // minimum weight guarantees promotion after merging one complete cohort.
+    let weight = input.len().div_ceil(cfg.flush_threshold).max(1);
     let keys: Vec<&[u8]> = input.iter().map(|&(k, _)| k).collect();
     let mut index_cfg = IndexConfig::default();
     index_cfg.lean_mph = cfg.lean_tiers;
@@ -605,7 +793,7 @@ fn build_tier(cfg: &DynamicConfig, input: Vec<(&[u8], StableId)>) -> Result<Tier
         entries[slot] = Entry { offset: arena.len(), len, id };
         arena.extend_from_slice(key);
     }
-    Ok(Tier { index, entries: entries.into_boxed_slice(), arena: arena.into_boxed_slice() })
+    Ok(Tier { index, entries: entries.into_boxed_slice(), arena: arena.into_boxed_slice(), weight })
 }
 
 struct CompactionJob {
@@ -623,13 +811,139 @@ fn merge_tiers(cfg: &DynamicConfig, tiers: &[Arc<Tier>]) -> Result<Tier, IndexEr
             merged.insert(key, id);
         }
     }
-    build_tier(cfg, merged.into_iter().collect())
+    let mut tier = build_tier(cfg, merged.into_iter().collect())?;
+    tier.weight = tiers.iter().map(|tier| tier.weight).sum();
+    Ok(tier)
 }
 
 impl Drop for DynamicIndex {
     fn drop(&mut self) {
         if let Some(job) = self.pending.take() {
             let _ = job.handle.join();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CompactionPolicy, DynamicConfig, DynamicIndex, DynamicInsertError};
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn failed_automatic_flush_latches_backpressure_until_explicit_retry() {
+        let mut index = DynamicIndex::with_config(DynamicConfig {
+            flush_threshold: 2,
+            parallel_build: false,
+            ..DynamicConfig::default()
+        });
+        assert_eq!(index.try_insert(b"first".to_vec()).unwrap(), 0);
+        index.fail_next_build.store(true, Ordering::Relaxed);
+        let error = index.try_insert(b"second".to_vec()).unwrap_err();
+        assert_eq!(error.committed_id(), Some(1));
+        assert!(matches!(error, DynamicInsertError::Maintenance { .. }));
+        assert_eq!(index.lookup(b"second"), Some(1));
+        assert!(index.last_maintenance_error().is_some());
+        let attempts = index.build_attempts.load(Ordering::Relaxed);
+        for _ in 0..16 {
+            let error = index.try_insert(b"blocked".to_vec()).unwrap_err();
+            assert_eq!(error.committed_id(), None);
+            assert!(matches!(error, DynamicInsertError::Backpressure(_)));
+        }
+        assert_eq!(index.build_attempts.load(Ordering::Relaxed), attempts);
+        assert_eq!(index.buffer_len(), 2);
+        assert_eq!(index.len(), 2);
+        assert_eq!(index.try_insert(b"first".to_vec()).unwrap(), 0);
+        index.finish_background_compaction().unwrap();
+        assert!(index.last_maintenance_error().is_some());
+        index.flush().unwrap();
+        assert!(index.last_maintenance_error().is_none());
+        assert_eq!(index.buffer_len(), 0);
+        assert_eq!(index.try_insert(b"unblocked".to_vec()).unwrap(), 2);
+    }
+
+    #[test]
+    fn legacy_insert_keeps_committed_ids_and_panics_before_a_blocked_write() {
+        let mut index = DynamicIndex::with_config(DynamicConfig {
+            flush_threshold: 1,
+            parallel_build: false,
+            ..DynamicConfig::default()
+        });
+        index.fail_next_build.store(true, Ordering::Relaxed);
+        assert_eq!(index.insert(b"committed".to_vec()), 0);
+        assert!(index.last_maintenance_error().is_some());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            index.insert(b"blocked".to_vec());
+        }));
+        assert!(result.is_err());
+        assert_eq!(index.lookup(b"blocked"), None);
+        assert_eq!(index.len(), 1);
+        assert_eq!(index.next_id, 1);
+        assert_eq!(index.insert(b"committed".to_vec()), 0);
+        index.flush().unwrap();
+        assert_eq!(index.insert(b"next".to_vec()), 1);
+    }
+
+    #[test]
+    fn failed_deletion_collection_preserves_masks_and_live_bindings() {
+        let mut index = DynamicIndex::with_config(DynamicConfig {
+            flush_threshold: 8,
+            lean_tiers: true,
+            parallel_build: false,
+            ..DynamicConfig::default()
+        });
+        for key in [b"a", b"b", b"c", b"d"] {
+            index.insert(key.to_vec());
+        }
+        index.flush().unwrap();
+        assert_eq!(index.delete(b"a"), Some(0));
+        assert_eq!(index.delete(b"b"), Some(1));
+        index.fail_next_build.store(true, Ordering::Relaxed);
+        assert!(index.flush().is_err());
+        assert_eq!(index.lookup(b"a"), None);
+        assert_eq!(index.lookup(b"b"), None);
+        assert_eq!(index.lookup(b"c"), Some(2));
+        assert_eq!(index.lookup(b"d"), Some(3));
+        assert_eq!(index.tombstone_count(), 2);
+        assert!(index.last_maintenance_error().is_some());
+        index.compact().unwrap();
+        assert_eq!(index.tombstone_count(), 0);
+        assert!(index.last_maintenance_error().is_none());
+        assert_eq!(index.try_insert(b"a".to_vec()).unwrap(), 4);
+    }
+
+    #[test]
+    fn collection_joins_pending_merge_before_preserving_a_buffer_revival() {
+        let mut index = DynamicIndex::with_config(DynamicConfig {
+            flush_threshold: 4,
+            lean_tiers: true,
+            parallel_build: false,
+            ..DynamicConfig::default()
+        });
+        index.set_compaction_policy(CompactionPolicy::Geometric).unwrap();
+        index.set_background_compaction(true).unwrap();
+        for key in 0..16u64 {
+            assert_eq!(index.insert(key.to_le_bytes().to_vec()), key as u32);
+        }
+        // Publication only occurs at maintenance boundaries, independently of
+        // whether the worker has finished computing its immutable replacement.
+        assert!(index.pending.is_some());
+        for key in 0..8u64 {
+            assert_eq!(index.delete(&key.to_le_bytes()), Some(key as u32));
+        }
+        let revived = 1u64.to_le_bytes();
+        assert_eq!(index.try_insert(revived.to_vec()).unwrap(), 16);
+        assert_eq!(index.buffer_len(), 1);
+        assert!(index.pending.is_some());
+        index.finish_background_compaction().unwrap();
+        assert!(index.pending.is_none());
+        assert_eq!(index.tombstone_count(), 0);
+        assert_eq!(index.len(), 9);
+        assert_eq!(index.lookup(&revived), Some(16));
+        for key in [0u64, 2, 3, 4, 5, 6, 7] {
+            assert_eq!(index.lookup(&key.to_le_bytes()), None);
+        }
+        for key in 8..16u64 {
+            assert_eq!(index.lookup(&key.to_le_bytes()), Some(key as u32));
         }
     }
 }

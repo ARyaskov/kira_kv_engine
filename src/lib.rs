@@ -31,6 +31,7 @@ mod hybrid_engine;
 #[cfg(feature = "parallel")]
 mod hybrid_topology;
 pub mod index;
+mod membership;
 mod mini_chd;
 mod mmap_index;
 mod mph_backend;
@@ -47,12 +48,15 @@ pub use index::{
 pub use mph_backend::{BackendKind, BuildConfig as BackendBuildConfig, BuildProfile, MphBackend};
 
 // PGM extensions exposed for advanced users:
-pub use dynamic_index::{DynamicConfig, DynamicIndex, StableId};
+pub use dynamic_index::{
+    CompactionPolicy, DynamicConfig, DynamicIndex, DynamicInsertError, StableId,
+};
 pub use elias_fano::EliasFano;
-pub use hot_tier::HotTierIndex;
+pub use hot_tier::{HotTierError, HotTierIndex};
 pub use hot_tier_dynamic::{DynamicHotTier, SpaceSaving};
 pub use hugepage::hugepages_available;
 pub use hybrid_engine::{HybridBuilder, HybridError, HybridIndex, HybridStorageStats};
+pub use membership::MembershipMode;
 pub use pgm::{PgmBuilder, PgmIndex, PgmStats};
 pub use pgm_u128::{PgmIndexU128, PgmU128Error};
 

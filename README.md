@@ -76,7 +76,7 @@ let token_index = IndexBuilder::new()
 
 ```rust
 let url_index = IndexBuilder::new()
-    // lean_mph=false (default) — returns KeyNotFound for foreign IDs
+    // lean_mph=false (default) — rejects most foreign IDs, probabilistically
     .build_index(short_codes)?;  // 3.8 B/key, misses rejected by the Bloom filter
 ```
 
@@ -167,7 +167,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         b"user:3".to_vec(),
     ];
 
-    // Default — Bloom + fingerprints, safe for foreign keys.
+    // Default — Bloom + fingerprints, probabilistic membership.
     let index = IndexBuilder::new().build_index(keys)?;
 
     let id = index.lookup_str("user:1")?;
@@ -206,6 +206,13 @@ Lookups: `index.lookup(&[u8])`, `lookup_u64(u64)`, `lookup_batch_pipelined(&[&[u
 `contains()` is the Bloom-filter answer (definite "no", probabilistic "yes"); in
 lean mode there is no filter and it always returns `true` — check
 `supports_negative_lookups()`.
+
+`membership_mode()` explicitly reports `ClosedWorld`, `Probabilistic` or
+`Exact`. `may_contain()` applies the same full membership checks as `lookup`;
+`lookup_verified(key, |slot, requested| stored_keys[slot] == requested)` adds
+an exact comparison against caller-owned full keys. Newly built hot tiers retain
+and compare their original u64 keys; legacy fingerprint-only hot tiers remain
+readable and are bypassed by the dynamic cache's exact-hit path.
 
 ### `HybridBuilder` (PGM + per-segment mini-MPH)
 
@@ -299,13 +306,22 @@ MPH/fingerprint probe. Membership remains probabilistic. Lean mode disables both
 
 `DynamicIndex` stores tier keys in byte arenas with metadata directly in MPH-slot
 order. Its default full-compaction policy is preserved. Write-heavy workloads can
-opt into geometric background compaction with `idx.set_background_compaction(true)?`:
+opt into capped background compaction with `idx.set_background_compaction(true)?`:
 four similarly sized tiers merge on one worker while old tiers remain readable.
 Publication occurs at flush boundaries. Use `finish_background_compaction` to
 include outstanding maintenance in measurements and `compact()` for single-tier
-reads. `set_background_compaction(false)` keeps geometric merges synchronous;
+reads. `set_background_compaction(false)` keeps size-tiered merges synchronous;
 `set_compaction_ratio` also opts into size tiering. Deserialization restores the
 default full-compaction policy. Multiple tiers can increase lookup latency.
+
+`idx.set_compaction_policy(CompactionPolicy::Geometric)?` explicitly selects
+logarithmic geometric rebuilding with an adaptive tier budget. Existing modes
+retain the hard `max_tiers` cap. Deletion-heavy indexes automatically reclaim
+dead keys and tombstone capacity at maintenance boundaries. `try_insert` reports
+ID exhaustion and whether an inserted ID was committed before maintenance
+failed; after failure, new writes stop until an explicit successful retry.
+See [the compaction comparison](performance/COMPACTION_REPORT.md) for measured
+write speed, lookup cost and resident/peak allocated memory.
 
 
 The stage-by-stage 10M-key verification and measured before/after results are in

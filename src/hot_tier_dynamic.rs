@@ -274,7 +274,7 @@ impl DynamicHotTier {
     pub fn lookup_u64(&self, key: u64) -> Option<u32> {
         self.observe(key);
         let guard = self.index.read().unwrap_or_else(|e| e.into_inner());
-        guard.as_ref().and_then(|h| h.lookup_u64(key))
+        guard.as_ref().and_then(|h| h.lookup_exact_u64(key))
     }
 
     /// Record an observation without a lookup (e.g. for keys served from the

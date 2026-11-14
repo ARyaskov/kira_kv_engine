@@ -8,7 +8,7 @@ use kira_kv_engine::{
     // Static MPH (PtrHash25)
     Index, IndexBuilder, IndexConfig, IndexError, IndexStats,
     // Dynamic MPH (LSM-style)
-    DynamicIndex, DynamicConfig, StableId,
+    DynamicIndex, DynamicConfig, DynamicInsertError, CompactionPolicy, StableId,
     // PGM learned index
     PgmIndex, PgmBuilder, PgmStats, PgmError,
     PgmIndexU128, PgmU128Error,
@@ -17,7 +17,7 @@ use kira_kv_engine::{
     // Compact key storage
     EliasFano,
     // Workload-aware caching
-    HotTierIndex, DynamicHotTier, SpaceSaving,
+    HotTierIndex, HotTierError, DynamicHotTier, SpaceSaving, MembershipMode,
     // GPU export (PtrHash25 snapshot for off-host lookup)
     GpuExport, GpuPart, BloomExport,
     // Diagnostics
@@ -102,7 +102,8 @@ impl Index {
     /// Exclusive upper bound of every lookup result (== len() for 0.7 builds).
     pub fn slot_capacity(&self) -> usize;
 
-    // Point lookups (Err(KeyNotFound) on a miss)
+    // Point lookups: configured checks may reject a key; positive candidates
+    // remain probabilistic unless verified against authoritative full keys.
     pub fn lookup(&self, key: &[u8]) -> Result<usize, IndexError>;
     pub fn lookup_str(&self, key: &str) -> Result<usize, IndexError>;
     pub fn lookup_u64(&self, key: u64) -> Result<usize, IndexError>;
@@ -112,6 +113,11 @@ impl Index {
     pub fn supports_negative_lookups(&self) -> bool;
     pub fn contains(&self, key: &[u8]) -> bool;
     pub fn contains_batch(&self, keys: &[&[u8]]) -> Vec<bool>;
+    pub fn membership_mode(&self) -> MembershipMode;
+    pub fn may_contain(&self, key: &[u8]) -> bool;
+    pub fn may_contain_batch(&self, keys: &[&[u8]]) -> Vec<bool>;
+    pub fn lookup_verified(&self, key: &[u8], verify: impl FnOnce(usize, &[u8]) -> bool)
+        -> Result<usize, IndexError>;
 
     // Batched (SIMD hashing and a three-stage pilot/Bloom/fingerprint pipeline)
     pub fn lookup_batch(&self, keys: &[&[u8]]) -> Vec<Option<usize>>;
@@ -188,6 +194,8 @@ impl DynamicIndex {
     pub fn with_config(cfg: DynamicConfig) -> Self;
 
     pub fn insert(&mut self, key: Vec<u8>) -> StableId;      // existing key → its id
+    pub fn try_insert(&mut self, key: Vec<u8>) -> Result<StableId, DynamicInsertError>;
+    pub fn last_maintenance_error(&self) -> Option<&str>;
     pub fn delete(&mut self, key: &[u8]) -> Option<StableId>; // prior id, if any
     pub fn lookup(&self, key: &[u8]) -> Option<StableId>;
 
@@ -198,6 +206,9 @@ impl DynamicIndex {
     pub fn finish_background_compaction(&mut self) -> Result<(), IndexError>;
     pub fn set_background_compaction(&mut self, enabled: bool) -> Result<(), IndexError>;
     pub fn set_compaction_ratio(&mut self, ratio: usize) -> Result<(), IndexError>;
+    pub fn set_compaction_policy(&mut self, policy: CompactionPolicy) -> Result<(), IndexError>;
+    pub fn compaction_policy(&self) -> CompactionPolicy;
+    pub fn tier_limit(&self) -> usize;
     pub fn compaction_stats(&self) -> (u64, u64); // automatic merges and input keys rebuilt
 
     pub fn len(&self) -> usize;                 // exact live count
@@ -214,13 +225,35 @@ impl DynamicIndex {
 
 pub struct DynamicConfig {
     pub flush_threshold: usize,  // default 64K
-    pub max_tiers: usize,        // default 8
+    pub max_tiers: usize,        // default 8; hard cap for Full/SizeTiered
     pub lean_tiers: bool,        // default false; memory only, answers stay exact
     pub parallel_build: bool,    // default true
 }
 
 pub type StableId = u32;
+
+pub enum CompactionPolicy { Full, SizeTiered, Geometric }
+
+#[non_exhaustive]
+pub enum DynamicInsertError {
+    IdExhausted,
+    Backpressure(String),
+    Maintenance { committed_id: StableId, source: IndexError },
+}
+
+impl DynamicInsertError {
+    pub fn committed_id(&self) -> Option<StableId>;
+}
 ```
+
+`try_insert` checks ID exhaustion and maintenance backpressure before changing
+bindings, including revival of a deleted key. A `Maintenance` error means the key
+was inserted and its ID remains readable; retry `flush` or `compact`, not the key.
+After a maintenance failure new writes are blocked until a successful explicit
+retry. Existing-key inserts still return their ID and do not rewrite a tier.
+The original `insert` signature is unchanged: it returns a committed ID after a
+maintenance failure and exposes its diagnostic through `last_maintenance_error`;
+an uncommitted blocked write or exhausted ID space panics before mutation.
 
 ---
 
@@ -408,9 +441,13 @@ impl EliasFano {
 pub struct HotTierIndex { /* opaque */ }
 
 impl HotTierIndex {
-    /// keys[i] → indices[i]; Bloom + u16 fingerprints, foreign keys rejected.
+    /// New builds compare the original u64 key and reject foreign keys exactly.
     pub fn build_from_u64(keys: &[u64], indices: &[u32], seed: u64) -> Option<Self>;
+    pub fn try_build_from_u64(keys: &[u64], indices: &[u32], seed: u64)
+        -> Result<Self, HotTierError>;
+    pub fn membership_mode(&self) -> MembershipMode;
     pub fn lookup_u64(&self, key: u64) -> Option<u32>;
+    pub fn lookup_exact_u64(&self, key: u64) -> Option<u32>;
     pub fn memory_usage(&self) -> usize;
     pub fn write_to(&self, out: &mut Vec<u8>);
     pub fn read_from(bytes: &[u8], pos: &mut usize) -> Option<Self>;
@@ -444,6 +481,14 @@ impl DynamicHotTier {
 ```
 
 ---
+
+New hot tiers retain the original u64 in MPH-slot order, adding 8 bytes per slot.
+The checked constructor rejects mismatched lengths, empty/duplicate key sets and
+the reserved `u32::MAX` position. The original `Option` constructor remains.
+Legacy hot payloads contain only fingerprints: they load as `Probabilistic` and
+preserve their old `lookup_u64` behavior and serialized bytes. Their
+`lookup_exact_u64` returns `None`; `DynamicHotTier` uses this conservative path so
+an unverifiable legacy cache hit falls back to the backing index.
 
 ## `GpuExport` / `GpuPart` / `BloomExport` (off-host lookup)
 
@@ -513,6 +558,11 @@ buffer on demand rather than reserving the persisted flush threshold.
 New aligned mmap metadata includes the canonical hash version (88 bytes);
 the previous 80-byte metadata remains readable with the legacy hash.
 
+New hot tiers use a length-bounded, checksummed frame starting with `KIRA_HOT`
+and version word 1, followed by the legacy payload and original slot keys.
+That second word is an invalid legacy Bloom length, making detection unambiguous.
+Legacy hot payloads are still readable and reserialize in their original layout.
+
 ---
 
 ## Deprecated
@@ -530,6 +580,12 @@ non-lean mode; a wider fingerprint reduces false acceptance. `GpuExport` carries
 `fingerprint_bits` and packed `fingerprint_bytes`; the older `fingerprints`
 field is populated only for fp16.
 
+`MembershipMode::{ClosedWorld, Probabilistic, Exact}` makes these guarantees
+explicit. For compatibility, `contains` still returns the Bloom-only answer when
+Bloom exists; `may_contain` uses all the checks used by `lookup`. Neither makes
+a nonempty static Index exact. `lookup_verified` adds a full-key comparison
+against authoritative caller-owned storage, including for lean indexes.
+
 The aligned mmap container has a checksum covering its header and sections.
 Windows `open_mmap` retains a read handle that denies write/delete sharing.
 Safe opens on other platforms retain an owned byte buffer; immutable-file
@@ -538,13 +594,30 @@ Big-endian and unaligned tables fall back to owned, endian-converted arrays.
 Old payload-based mmap containers remain readable through the copying decoder.
 
 Dynamic tiers use one byte arena and slot-ordered metadata. The default full-merge
-policy is preserved. `set_background_compaction(true)` opts into size tiering:
+policy is preserved. `set_background_compaction(true)` opts into capped size tiering:
 four similarly sized tiers merge on one worker and publication occurs at flush
 boundaries. Disabling the worker keeps size-tiered merges synchronous;
 `set_compaction_ratio` also enables size tiering. `max_tiers` applies writer
 backpressure. Explicit `compact` restores single-tier reads. Multiple tiers can
 increase lookup latency. `finish_background_compaction` waits for eligible merges
-and belongs in end-to-end write timing. Tombstones remain until full compaction.
+and belongs in end-to-end write timing. When deleted key/metadata bytes reach
+one quarter of resident tier bytes, or no live keys remain, `flush` or
+`finish_background_compaction` performs a full deletion collection. It joins
+workers, filters dead keys before building the temporary map, and releases
+tombstone storage only after successful publication.
 The serialized key/id/config layout stays compatible; restored indexes use the
 default full-compaction policy. `memory_usage` excludes in-flight worker scratch
 and unpublished output.
+
+For logarithmic rebuilding, explicitly select
+`set_compaction_policy(CompactionPolicy::Geometric)`. With fanout `r`, this uses
+up to `(r-1)` runs per level and an adaptive `tier_limit()` whose minimum is
+`max_tiers`. Every merge promotes a level, including tiny explicit flushes.
+For `F` flush runs, cumulative rebuilt records are `O(n log_r F)`; with full
+`B`-key flushes, `F` is approximately `n/B`. Lookup can probe `O(r log_r F)` runs.
+These bounds assume expected linear MPH construction and bounded key width;
+hashing/comparison additionally depends on key bytes. Existing Full and
+SizeTiered modes retain the hard cap and do not promise these bounds.
+
+The measured compaction comparison and memory tradeoffs are in
+[`performance/COMPACTION_REPORT.md`](performance/COMPACTION_REPORT.md).

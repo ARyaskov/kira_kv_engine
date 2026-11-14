@@ -1,0 +1,3 @@
+label,policy,keys,append_ns_per_key,lookup_ns_per_key,append_heap_bytes,append_peak_heap_bytes,append_estimated_bytes,append_tiers,rebuilt_keys,before_gc_heap_bytes,gc_ms,after_gc_heap_bytes,gc_peak_heap_bytes,after_gc_estimated_bytes,tombstones,correctness
+after,size,1000000,841.805,296.039,28114458,49135246,28072702,6,4190208,60728874,116.346,5832654,76942690,5791668,0,pass
+after,geometric,1000000,611.550,288.870,28115111,43407871,28073047,8,2768896,60729527,96.078,5832659,76943404,5791673,0,pass
