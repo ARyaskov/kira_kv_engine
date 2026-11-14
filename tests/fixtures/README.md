@@ -44,3 +44,11 @@ The following precision/select fixtures were generated from immutable revision
   input positions 0 through 255, with the absolute PGM locator embedded.
 - `elias_fano_v081.bin`: 256 keys `13*i + 7`, legacy u32 rank samples. Tests
   require byte-identical resaving and correct cursor continuation.
+
+`mmap_stream_fp24_v081.bin` was generated from immutable revision `d10dc11`
+with Rust 1.100.0 before streaming mmap output changed. It contains 257 numeric
+keys `0..257`, encoded as little-endian u64 bytes, using default Index options
+with sequential building and fp24. Public tests rebuild the same index, compare
+the complete aligned file bytes, and load/resave the frozen file identically.
+The optional `fixtures` command of the isolated baseline comparison driver
+records its public-builder recipe.

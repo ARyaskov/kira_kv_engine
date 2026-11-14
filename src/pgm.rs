@@ -867,6 +867,11 @@ impl PgmIndex {
         Some((self.segments.starts[idx], self.segments.ends[idx]))
     }
 
+    /// Ordered key bounds for derived segment routing; the PGM owns the slices.
+    pub(crate) fn segment_key_ranges(&self) -> (&[u64], &[u64]) {
+        (&self.segments.min_keys, &self.segments.max_keys)
+    }
+
     /// Raw pointer to the segments `max_keys` array — exposed for prefetch
     /// chains in higher-level engines (e.g. HybridIndex batch lookup).
     pub(crate) fn max_keys_ptr(&self) -> *const u64 {

@@ -9,7 +9,7 @@
 //! guaranteeing file immutability can use `open_unchecked` for zero-copy access.
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -284,8 +284,7 @@ pub struct MmapIndexWriter {
 
 impl MmapIndexWriter {
     pub fn create<P: AsRef<Path>>(path: P, key_count: u64) -> std::io::Result<Self> {
-        let file =
-            OpenOptions::new().create(true).truncate(true).read(true).write(true).open(path)?;
+        let file = OpenOptions::new().create(true).truncate(true).write(true).open(path)?;
         Ok(Self { file, pending_sections: Vec::new(), key_count })
     }
 
@@ -294,74 +293,190 @@ impl MmapIndexWriter {
     }
 
     /// Finalize: write header + section table + sections, each 64-byte aligned.
-    pub fn finalize(mut self) -> std::io::Result<()> {
-        let section_count = self.pending_sections.len();
-        let header_size = std::mem::size_of::<MmapHeader>();
-        let table_size = section_count * std::mem::size_of::<SectionEntry>();
-        let mut cursor = align_up(header_size + table_size, 64);
+    pub fn finalize(self) -> std::io::Result<()> {
+        let sections: Vec<_> =
+            self.pending_sections.iter().map(|(kind, bytes)| (*kind, bytes.len() as u64)).collect();
+        write_sections(self.file, self.key_count, &sections, |index, out| {
+            out.write_all(&self.pending_sections[index].1)
+        })
+        .map(|_| ())
+    }
+}
 
-        let mut entries = Vec::with_capacity(section_count);
-        for (kind, bytes) in &self.pending_sections {
-            entries.push(SectionEntry {
-                kind: *kind as u32,
-                _pad: 0,
-                offset: cursor as u64,
-                length: bytes.len() as u64,
-            });
-            cursor = align_up(cursor + bytes.len(), 64);
-        }
+/// Stream a pre-sized section container without reading or seeking its output.
+/// The callback borrows source tables; only O(section count) metadata and fixed
+/// checksum/output buffers are retained. Padding and final bytes match v2.
+pub(crate) fn write_sections<W: Write>(
+    writer: W,
+    key_count: u64,
+    sections: &[(SectionKind, u64)],
+    mut write_section: impl FnMut(usize, &mut dyn Write) -> io::Result<()>,
+) -> io::Result<W> {
+    let section_count = u32::try_from(sections.len()).map_err(|_| invalid("too many sections"))?;
+    let header_size = std::mem::size_of::<MmapHeader>();
+    let table_size = sections
+        .len()
+        .checked_mul(std::mem::size_of::<SectionEntry>())
+        .and_then(|size| size.checked_add(header_size))
+        .ok_or_else(|| invalid("section table size overflow"))?;
+    let mut cursor = checked_align(table_size as u64)?;
+    let mut entries = Vec::with_capacity(sections.len());
+    for &(kind, length) in sections {
+        entries.push(SectionEntry { kind: kind as u32, _pad: 0, offset: cursor, length });
+        cursor = checked_align(
+            cursor.checked_add(length).ok_or_else(|| invalid("section size overflow"))?,
+        )?;
+    }
 
-        // Write header.
-        let header = MmapHeader {
-            magic: *MAGIC,
-            version: 2,
-            section_count: section_count as u32,
-            key_count: self.key_count,
-            flags: 0,
-            _reserved: [0; 4],
-        };
-        self.file.write_all(&header.magic)?;
-        self.file.write_all(&header.version.to_le_bytes())?;
-        self.file.write_all(&header.section_count.to_le_bytes())?;
-        self.file.write_all(&header.key_count.to_le_bytes())?;
-        self.file.write_all(&header.flags.to_le_bytes())?;
-        self.file.write_all(&[0; 32])?;
-        for entry in &entries {
-            self.file.write_all(&entry.kind.to_le_bytes())?;
-            self.file.write_all(&entry._pad.to_le_bytes())?;
-            self.file.write_all(&entry.offset.to_le_bytes())?;
-            self.file.write_all(&entry.length.to_le_bytes())?;
-        }
+    let mut out = crate::wire::ChecksumWriter::new(BufWriter::new(writer));
+    out.write_all(MAGIC)?;
+    out.write_all(&2u32.to_le_bytes())?;
+    out.write_all(&section_count.to_le_bytes())?;
+    out.write_all(&key_count.to_le_bytes())?;
+    out.write_all(&[0; 40])?;
+    for entry in &entries {
+        out.write_all(&entry.kind.to_le_bytes())?;
+        out.write_all(&entry._pad.to_le_bytes())?;
+        out.write_all(&entry.offset.to_le_bytes())?;
+        out.write_all(&entry.length.to_le_bytes())?;
+    }
 
-        // Write sections with alignment padding.
-        let mut written = header_size + table_size;
-        for ((_, bytes), entry) in self.pending_sections.iter().zip(entries.iter()) {
-            let target = entry.offset as usize;
-            if target > written {
-                let pad = vec![0u8; target - written];
-                self.file.write_all(&pad)?;
-                written = target;
-            }
-            self.file.write_all(bytes)?;
-            written += bytes.len();
+    let mut written = table_size as u64;
+    for (index, entry) in entries.iter().enumerate() {
+        let padding = (entry.offset - written) as usize;
+        debug_assert!(padding < 64);
+        out.write_all(&[0; 64][..padding])?;
+        let mut section = SizedWriter { inner: &mut out, remaining: entry.length };
+        write_section(index, &mut section)?;
+        if section.remaining != 0 {
+            return Err(invalid("section shorter than declared length"));
         }
-        self.file.flush()?;
-        self.file.rewind()?;
-        let mut checksum = crate::checksum::Checksum::new();
-        let mut buffer = [0; 65536];
-        loop {
-            let n = self.file.read(&mut buffer)?;
-            if n == 0 {
-                break;
-            }
-            checksum.update(&buffer[..n]);
+        written = entry.offset + entry.length;
+    }
+    let mut buffered = out.finish()?;
+    buffered.flush()?;
+    buffered.into_inner().map_err(|error| error.into_error())
+}
+
+fn checked_align(value: u64) -> io::Result<u64> {
+    value
+        .checked_add(63)
+        .map(|value| value & !63)
+        .ok_or_else(|| invalid("section alignment overflow"))
+}
+
+struct SizedWriter<'a, W: Write> {
+    inner: &'a mut W,
+    remaining: u64,
+}
+
+impl<W: Write> Write for SizedWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() as u64 > self.remaining {
+            return Err(invalid("section longer than declared length"));
         }
-        self.file.write_all(&checksum.finish().to_le_bytes())?;
-        self.file.flush()?;
-        Ok(())
+        let written = self.inner.write(bytes)?;
+        self.remaining -= written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
 fn align_up(n: usize, align: usize) -> usize {
     (n + align - 1) & !(align - 1)
+}
+
+#[cfg(test)]
+mod streaming_tests {
+    use super::{SectionKind, write_sections};
+    use std::io::{self, Write};
+
+    // Deliberately implements only Write: the encoder cannot read or seek output.
+    struct WriteOnly {
+        bytes: Vec<u8>,
+        limit: usize,
+    }
+
+    impl Write for WriteOnly {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let count = bytes.len().min(self.limit);
+            self.bytes.extend_from_slice(&bytes[..count]);
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_only_short_writes_preserve_v2_layout_padding_and_checksum() {
+        let data = [vec![1, 2, 3], vec![7; 129], Vec::new()];
+        let sections = [
+            (SectionKind::PtrHash25Pilots, 3),
+            (SectionKind::BlockBloomWords, 129),
+            (SectionKind::OuterFingerprints, 0),
+        ];
+        let sink = WriteOnly { bytes: Vec::new(), limit: 3 };
+        let sink =
+            write_sections(sink, 17, &sections, |index, out| out.write_all(&data[index])).unwrap();
+        let bytes = sink.bytes;
+        assert_eq!(&bytes[..8], b"KIRA_V01");
+        assert_eq!(u32::from_le_bytes(bytes[8..12].try_into().unwrap()), 2);
+        assert_eq!(u32::from_le_bytes(bytes[12..16].try_into().unwrap()), 3);
+        assert_eq!(u64::from_le_bytes(bytes[16..24].try_into().unwrap()), 17);
+        assert_eq!(&bytes[24..64], &[0; 40]);
+        for (index, offset, length) in [(0, 192u64, 3u64), (1, 256, 129), (2, 448, 0)] {
+            let entry = &bytes[64 + index * 24..88 + index * 24];
+            assert_eq!(
+                u32::from_le_bytes(entry[..4].try_into().unwrap()),
+                sections[index].0 as u32
+            );
+            assert_eq!(&entry[4..8], &[0; 4]);
+            assert_eq!(u64::from_le_bytes(entry[8..16].try_into().unwrap()), offset);
+            assert_eq!(u64::from_le_bytes(entry[16..24].try_into().unwrap()), length);
+        }
+        assert_eq!(&bytes[136..192], &[0; 56]);
+        assert_eq!(&bytes[192..195], &[1, 2, 3]);
+        assert_eq!(&bytes[195..256], &[0; 61]);
+        assert_eq!(&bytes[256..385], &[7; 129]);
+        assert_eq!(&bytes[385..448], &[0; 63]);
+        assert_eq!(bytes.len(), 456);
+        assert_eq!(
+            u64::from_le_bytes(bytes[448..].try_into().unwrap()),
+            crate::checksum::checksum(&bytes[..448])
+        );
+    }
+
+    #[test]
+    fn lengths_and_alignment_overflow_are_rejected_before_content_is_written() {
+        for length in [u64::MAX, u64::MAX - 128] {
+            let result =
+                write_sections(Vec::new(), 0, &[(SectionKind::LegacyPayload, length)], |_, _| {
+                    panic!("invalid geometry must fail before the callback")
+                });
+            assert!(result.is_err());
+        }
+        for output in [Vec::new(), vec![1, 2]] {
+            let result =
+                write_sections(Vec::new(), 0, &[(SectionKind::LegacyPayload, 1)], |_, out| {
+                    out.write_all(&output)
+                });
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn callback_and_output_errors_are_propagated() {
+        let callback = write_sections(Vec::new(), 0, &[(SectionKind::LegacyPayload, 1)], |_, _| {
+            Err(io::Error::other("callback failure"))
+        });
+        assert_eq!(callback.unwrap_err().to_string(), "callback failure");
+        let blocked = WriteOnly { bytes: Vec::new(), limit: 0 };
+        let output = write_sections(blocked, 0, &[], |_, _| unreachable!());
+        assert!(matches!(output, Err(error) if error.kind() == io::ErrorKind::WriteZero));
+    }
 }

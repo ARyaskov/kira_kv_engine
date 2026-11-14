@@ -1,0 +1,11 @@
+label,component,dataset,keys,operations,build_ms,operation_ns,extract_ns,retained_bytes,peak_extra_bytes,allocations,segments,wire_bytes,correctness
+before,mmap,fp32_bloom,1000000,1,0,5777200.000,0,0,5858605,23,0,5793033,pass
+before,mmap,lean,1000000,1,0,1928200.000,0,0,482172,19,0,416684,pass
+before,tracker,mixed_observe,4096,500000,0,14.549,0,327680,0,0,0,0,pass
+before,tracker,colliding_eviction,2048,256,0,941073.438,0,163840,0,0,0,0,pass
+before,tracker,top16,65536,1,0,0,274600.000,5242880,2097152,2,0,0,pass
+before,tracker,dynamic_take16,65536,1,0,0,555600.000,5242880,2097152,2,0,0,pass
+before,hybrid,epsilon0,262144,100000,38.799,309.623,0,31424516,42958852,0,131072,9011308,pass
+before,hybrid,epsilon64,262144,100000,64.005,46.073,0,1806268,11243804,0,22,1803672,pass
+before,hybrid,default,262144,100000,41.709,33.220,0,1780542,12782710,0,1,1780473,pass
+before,hybrid,tiny,32,100000,0.014,18.742,0,16985,18153,0,1,16918,pass

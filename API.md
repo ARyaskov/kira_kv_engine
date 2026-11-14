@@ -468,7 +468,7 @@ impl HotTierIndex {
     pub fn read_from(bytes: &[u8], pos: &mut usize) -> Option<Self>;
 }
 
-pub struct SpaceSaving { /* opaque */ }   // O(log K) per observation
+pub struct SpaceSaving { /* opaque */ }   // expected O(log K) per observation
 
 impl SpaceSaving {
     pub fn new(capacity: usize) -> Self;
@@ -504,6 +504,19 @@ Legacy hot payloads contain only fingerprints: they load as `Probabilistic` and
 preserve their old `lookup_u64` behavior and serialized bytes. Their
 `lookup_exact_u64` returns `None`; `DynamicHotTier` uses this conservative path so
 an unverifiable legacy cache hit falls back to the backing index.
+
+Space-Saving uses backward-shift deletion in its probe table. An observation is
+expected `O(log K)` with ordinary hashing and worst-case `O(K + log K)` under
+collisions, rather than repeated quadratic reinsertion of a probe cluster.
+`top_k(k)` selects in `O(K + k log k)` time with `O(K)` scratch, retaining the
+count-descending, key-ascending order. A zero request returns without allocation.
+`DynamicHotTier::take_top_k` allocates a replacement tracker before locking,
+swaps trackers and clears the old rebuild hint under the mutex, then processes
+and drops the detached snapshot after releasing the lock. Observations after
+the swap belong to the next epoch and can set its rebuild hint independently.
+Extraction temporarily retains an additional `O(K)` tracker. Frequency bounds
+apply to accepted observations; contention drops remain counted and can bias
+the observed stream. This tracker has no persisted wire representation.
 
 ## `GpuExport` / `GpuPart` / `BloomExport` (off-host lookup)
 
@@ -630,6 +643,29 @@ Safe opens on other platforms retain an owned byte buffer; immutable-file
 applications can use `unsafe open_mmap_unchecked` for OS-backed mapping there.
 Big-endian and unaligned tables fall back to owned, endian-converted arrays.
 Old payload-based mmap containers remain readable through the copying decoder.
+
+`Index::save_mmap` streams borrowed tables and updates the checksum during the
+same output pass. For `M` bytes and `S` sections it takes `O(M)` time and
+`O(S + fixed buffers)` auxiliary space, without rereading the output. Aligned
+section order, padding, fingerprints, canonical hash metadata and checksums
+retain their previous bytes; the rare map fallback streams its nested sealed
+payload too. The existing `MmapIndexWriter` API continues to own the `Vec`
+sections supplied by callers, while its finalization also avoids the reread.
+
+Hybrid builds and loads derive a radix directory from existing PGM segment
+bounds. It is enabled for at least 32 segments, uses four to eight prefix buckets
+per segment until the 65,536-bucket cap, and stores one u32 boundary per bucket
+plus a sentinel (at most 262,148 heap bytes). One-candidate prefixes route
+directly; intersecting prefixes use local binary search with exact bound checks.
+For `S` segments and `P` buckets, directory construction is `O(S + P)`, storage
+`O(P)`, and routing `O(1 + log S_bucket)`, worst-case `O(log S)` under skew.
+Small indexes keep the original locator. This directory is rebuilt on load,
+included in `memory_usage`, and omitted from serialization, preserving Hybrid
+bytes and original input positions across scalar, hash and batch APIs.
+
+Measured storage, tracker and Hybrid comparisons, including temporary memory
+costs and unchanged small-index cases, are in
+[`performance/STORAGE_HOT_HYBRID_REPORT.md`](performance/STORAGE_HOT_HYBRID_REPORT.md).
 
 Dynamic tiers use one byte arena and slot-ordered metadata. The default full-merge
 policy is preserved. `set_background_compaction(true)` opts into capped size tiering:

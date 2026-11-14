@@ -128,15 +128,22 @@ impl Fingerprints {
             Storage::Packed(v) => w.write_all(&v[..self.memory_usage()]),
         }
     }
-    pub(crate) fn mmap_bytes(&self) -> Vec<u8> {
+    pub(crate) fn mmap_len(&self) -> usize {
         match &self.storage {
-            Storage::U16(v) => {
-                let mut bytes = Vec::new();
-                crate::wire::extend_le(&mut bytes, v.as_slice());
-                bytes
-            }
-            Storage::Packed(v) => v.to_vec(),
+            Storage::U16(v) => v.len() * 2,
+            Storage::Packed(v) => v.len(),
         }
+    }
+    pub(crate) fn write_mmap_into<W: Write + ?Sized>(&self, out: &mut W) -> std::io::Result<()> {
+        match &self.storage {
+            Storage::U16(v) => crate::wire::write_le(out, v.as_slice()),
+            Storage::Packed(v) => out.write_all(v.as_slice()),
+        }
+    }
+    pub(crate) fn mmap_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(self.mmap_len());
+        self.write_mmap_into(&mut bytes).expect("writing fingerprints to Vec cannot fail");
+        bytes
     }
     pub(crate) fn export_low16(&self) -> Option<Vec<u16>> {
         if let Storage::U16(v) = &self.storage { Some(v[..self.count].to_vec()) } else { None }

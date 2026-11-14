@@ -14,7 +14,7 @@
 //!     ├─▶ BlockBloom global filter (1 cache line, ~99% miss rejection)
 //!     │
 //!     ▼
-//!   PGM on sorted hashes  →  segment_id
+//!   radix prefix → narrowed PGM segment range → segment_id
 //!     │
 //!     ▼
 //!   SegmentStorage[segment_id]:
@@ -44,9 +44,10 @@
 //!
 //! ## Trade-offs
 //!
-//! - **Point lookup adds the PGM segment-find step** (a binary search over the
-//!   segment table) on top of the per-segment structure, so a pure point-lookup
-//!   workload is still better served by `Index`.
+//! - **Point lookup adds a segment-routing step** on top of per-segment storage.
+//!   An adaptive radix directory directly routes single-candidate prefixes and
+//!   bounds a local binary search otherwise. Skew can still require O(log S)
+//!   comparisons for S segments. Small indexes keep the original PGM locator.
 //! - Segment-storage variance: workloads with heavy hash clustering produce
 //!   uneven segments; tune `target_segment_size` to balance.
 //!
@@ -80,6 +81,8 @@ use std::arch::x86_64::{
 pub struct HybridIndex {
     /// PGM built over sorted u64 hashes — predicts which segment a hash falls into.
     pgm: PgmIndex,
+    /// Derived from segment key bounds on build/load; never serialized.
+    router: SegmentRouter,
     /// Per-segment storage. Index by `segment_id` from `pgm.segment_for_key`.
     segments: Vec<SegmentStorage>,
     /// Start position of each segment in the global sorted-hash array. Used to
@@ -92,6 +95,93 @@ pub struct HybridIndex {
     bloom: Option<BlockBloom>,
     /// Number of input keys.
     n: usize,
+}
+
+/// A bounded-size radix directory over the existing ordered segment maxima.
+/// Prefix boundaries name the first segment whose maximum reaches that prefix.
+/// A bucket also includes that first segment of the following prefix because a
+/// segment can straddle a boundary. No assumption of uniform hashes is required.
+#[derive(Debug, Default)]
+struct SegmentRouter {
+    shift: u8,
+    boundaries: Box<[u32]>,
+}
+
+impl SegmentRouter {
+    const MIN_SEGMENTS: usize = 32;
+    const MAX_PREFIX_BITS: u32 = 16;
+
+    fn build(max_keys: &[u64]) -> Self {
+        if max_keys.len() < Self::MIN_SEGMENTS {
+            return Self::default();
+        }
+        // Four to eight buckets per segment until the 2^16-bucket directory cap.
+        // Compute the exponent first so usize multiplication cannot overflow.
+        let bits =
+            (usize::BITS - (max_keys.len() - 1).leading_zeros() + 2).min(Self::MAX_PREFIX_BITS);
+        let shift = (64 - bits) as u8;
+        let buckets = 1usize << bits;
+        let mut boundaries = Vec::with_capacity(buckets + 1);
+        let mut segment = 0;
+        for prefix in 0..buckets {
+            let first = (prefix as u64) << shift;
+            while segment < max_keys.len() && max_keys[segment] < first {
+                segment += 1;
+            }
+            boundaries.push(segment as u32);
+        }
+        boundaries.push(max_keys.len() as u32);
+        Self { shift, boundaries: boundaries.into_boxed_slice() }
+    }
+
+    #[inline]
+    fn candidates(&self, hash: u64, segments: usize) -> std::ops::Range<usize> {
+        let prefix = (hash >> self.shift) as usize;
+        let start = self.boundaries[prefix] as usize;
+        let end = (self.boundaries[prefix + 1] as usize).saturating_add(1).min(segments);
+        start..end
+    }
+
+    #[inline]
+    fn segment_for_key(&self, pgm: &PgmIndex, hash: u64) -> Option<usize> {
+        if self.boundaries.is_empty() {
+            return pgm.segment_for_key(hash);
+        }
+        let (min_keys, max_keys) = pgm.segment_key_ranges();
+        let range = self.candidates(hash, max_keys.len());
+        if range.is_empty() {
+            return None;
+        }
+        let segment = if range.len() == 1 {
+            range.start
+        } else {
+            range.start + max_keys[range.clone()].partition_point(|&max| max < hash)
+        };
+        if segment == range.end || hash < min_keys[segment] || hash > max_keys[segment] {
+            return None;
+        }
+        Some(segment)
+    }
+
+    /// Prefetch the first binary-search probe for the same range as lookup.
+    #[inline]
+    fn prefetch(&self, pgm: &PgmIndex, hash: u64) {
+        let num_segments = pgm.num_segments();
+        let range = if self.boundaries.is_empty() {
+            0..num_segments
+        } else {
+            self.candidates(hash, num_segments)
+        };
+        if !range.is_empty() {
+            let midpoint = range.start + range.len() / 2;
+            // SAFETY: the nonempty candidate range is within the segment array.
+            prefetch_read(unsafe { pgm.max_keys_ptr().add(midpoint) });
+        }
+    }
+
+    fn memory_usage(&self) -> usize {
+        self.boundaries.len() * std::mem::size_of::<u32>()
+    }
 }
 
 #[derive(Debug)]
@@ -478,8 +568,10 @@ impl HybridBuilder {
             Some(BlockBloom::build_from_u64(&sorted_hashes, self.seed ^ 0xBB00_BB00_BB00_BB00))
         };
 
+        let router = SegmentRouter::build(pgm.segment_key_ranges().1);
         Ok(HybridIndex {
             pgm,
+            router,
             segments,
             seg_offsets,
             seed: self.seed,
@@ -515,6 +607,7 @@ impl HybridIndex {
     pub fn empty(seed: u64) -> Self {
         HybridIndex {
             pgm: PgmBuilder::new().build(Vec::new()).expect("empty PGM never fails"),
+            router: SegmentRouter::default(),
             segments: Vec::new(),
             seg_offsets: vec![0],
             seed,
@@ -526,7 +619,8 @@ impl HybridIndex {
 
     /// Serialize into a self-contained, checksummed byte vector.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut body = Vec::with_capacity(self.memory_usage() + 64);
+        let mut body =
+            Vec::with_capacity(self.memory_usage().saturating_sub(self.router.memory_usage()) + 64);
         body.extend_from_slice(&self.seed.to_le_bytes());
         body.extend_from_slice(&(self.n as u64).to_le_bytes());
         body.extend_from_slice(&(self.seg_offsets.len() as u64).to_le_bytes());
@@ -680,7 +774,8 @@ impl HybridIndex {
         if pos != body.len() {
             return Err(bad());
         }
-        Ok(HybridIndex { pgm, segments, seg_offsets, seed, hash_version, bloom, n })
+        let router = SegmentRouter::build(pgm.segment_key_ranges().1);
+        Ok(HybridIndex { pgm, router, segments, seg_offsets, seed, hash_version, bloom, n })
     }
 
     /// Look up `key`. Returns `Some(original_position)` on hit, `None` on miss.
@@ -707,7 +802,7 @@ impl HybridIndex {
         {
             return None;
         }
-        let seg_id = self.pgm.segment_for_key(hash)?;
+        let seg_id = self.router.segment_for_key(&self.pgm, hash)?;
         let seg = &self.segments[seg_id];
         seg.lookup(hash)
     }
@@ -736,29 +831,24 @@ impl HybridIndex {
 
         // Phase 2: prefetch chain. We prefetch two things WINDOW iters ahead:
         //   - The Bloom block for hashes[i + WINDOW]
-        //   - The PGM max_keys "binary-search starting point" for hashes[i + WINDOW]
+        //   - The narrowed max_keys search midpoint for hashes[i + WINDOW]
         const WINDOW: usize = 16;
-        let max_keys_ptr = self.pgm.max_keys_ptr();
-        let num_segs = self.pgm.num_segments();
 
         for &h in &hashes[..WINDOW.min(hashes.len())] {
             if let Some(bf) = &self.bloom {
                 prefetch_read(bf.block_ptr(h));
             }
-            // Prefetch the middle of the max_keys array — first binary
-            // search step will land near there.
-            if num_segs > 0 {
-                // SAFETY: `num_segs / 2 < num_segs`; a prefetch is a hint.
-                prefetch_read(unsafe { max_keys_ptr.add(num_segs / 2) });
-            }
+            self.router.prefetch(&self.pgm, h);
         }
 
         for i in 0..hashes.len() {
             // Issue prefetch for i+WINDOW.
-            if let Some(bf) = &self.bloom
-                && i + WINDOW < hashes.len()
-            {
-                prefetch_read(bf.block_ptr(hashes[i + WINDOW]));
+            if i + WINDOW < hashes.len() {
+                let future = hashes[i + WINDOW];
+                if let Some(bf) = &self.bloom {
+                    prefetch_read(bf.block_ptr(future));
+                }
+                self.router.prefetch(&self.pgm, future);
             }
 
             let hash = hashes[i];
@@ -769,7 +859,7 @@ impl HybridIndex {
                 continue;
             }
             // Segment find + lookup.
-            if let Some(seg_id) = self.pgm.segment_for_key(hash) {
+            if let Some(seg_id) = self.router.segment_for_key(&self.pgm, hash) {
                 out[i] = self.segments[seg_id].lookup(hash);
             }
         }
@@ -814,6 +904,7 @@ impl HybridIndex {
         let seg_mem: usize = self.segments.iter().map(|s| s.memory_usage()).sum();
         let bloom_mem = self.bloom.as_ref().map(|b| b.memory_usage()).unwrap_or(0);
         self.pgm.stats().memory_usage
+            + self.router.memory_usage()
             + seg_mem
             + self.seg_offsets.len() * 4
             + bloom_mem
@@ -887,5 +978,100 @@ impl HybridStorageStats {
             "  Keys: {} linear / {} chd / {} mph",
             self.linear_keys, self.chd_keys, self.mph_keys
         );
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::{HybridBuilder, HybridIndex, SegmentRouter};
+    use crate::pgm::PgmBuilder;
+
+    #[test]
+    fn radix_candidates_cover_prefix_boundaries_and_full_u64_extremes() {
+        let maxima: Vec<u64> = (0..128).map(|i| (i as u64) << 57).chain([u64::MAX]).collect();
+        let router = SegmentRouter::build(&maxima);
+        assert!(!router.boundaries.is_empty());
+        for prefix in 0..router.boundaries.len() - 1 {
+            let first = (prefix as u64) << router.shift;
+            let last = first | (u64::MAX >> (64 - router.shift));
+            for query in [first.saturating_sub(1), first, last, last.saturating_add(1)] {
+                let expected = maxima.partition_point(|&max| max < query);
+                let range = router.candidates(query, maxima.len());
+                if expected < maxima.len() {
+                    assert!(range.contains(&expected), "query={query} range={range:?}");
+                } else {
+                    assert!(range.is_empty());
+                }
+            }
+        }
+        assert_eq!(router.candidates(0, maxima.len()), 0..2);
+        assert_eq!(router.candidates(u64::MAX, maxima.len()), 128..129);
+        assert!(router.boundaries.len() <= (1 << 16) + 1);
+    }
+
+    #[test]
+    fn radix_locator_matches_ordered_bounds_for_gaps_and_clustered_hashes() {
+        for base in [0, 7u64 << 60, u64::MAX - (512u64 << 20)] {
+            let keys: Vec<_> = (0..512u64)
+                .flat_map(|group| [base + (group << 20), base + (group << 20) + 1])
+                .collect();
+            let pgm =
+                PgmBuilder::new().with_parallel(false).with_epsilon(0).build(keys.clone()).unwrap();
+            let (minima, maxima) = pgm.segment_key_ranges();
+            let router = SegmentRouter::build(maxima);
+            assert!(maxima.len() >= SegmentRouter::MIN_SEGMENTS);
+            for query in keys
+                .iter()
+                .flat_map(|&key| [key.saturating_sub(1), key, key.saturating_add(1)])
+                .chain([0, u64::MAX])
+            {
+                let expected = maxima.partition_point(|&max| max < query);
+                let expected =
+                    (expected < maxima.len() && query >= minima[expected]).then_some(expected);
+                assert_eq!(router.segment_for_key(&pgm, query), expected, "query={query}");
+            }
+            // Skewed prefixes deliberately use the binary fallback, without
+            // changing membership or allocating an unbounded directory.
+            let widest = (0..router.boundaries.len() - 1)
+                .map(|prefix| {
+                    router.candidates((prefix as u64) << router.shift, maxima.len()).len()
+                })
+                .max()
+                .unwrap();
+            assert!(widest > 1);
+        }
+    }
+
+    #[test]
+    fn tiny_indexes_skip_directory_and_large_indexes_rebuild_it_on_load() {
+        for count in [0, 2, 100, 4096] {
+            let keys: Vec<u64> = (0..count).map(|key| key * 7919 + 7).collect();
+            let index = HybridBuilder::new()
+                .with_parallel(false)
+                .with_pgm_epsilon(0)
+                .build_from_u64(&keys)
+                .unwrap();
+            let has_directory = index.num_segments() >= SegmentRouter::MIN_SEGMENTS;
+            assert_eq!(!index.router.boundaries.is_empty(), has_directory);
+            let bytes = index.to_bytes();
+            let restored = HybridIndex::from_bytes(&bytes).unwrap();
+            assert_eq!(restored.router.shift, index.router.shift);
+            assert_eq!(restored.router.boundaries, index.router.boundaries);
+            assert_eq!(restored.to_bytes(), bytes);
+            if has_directory {
+                // Uniform hashes narrow typical prefixes to a handful of
+                // candidates, instead of searching the complete segment array.
+                let widest = (0..index.router.boundaries.len() - 1)
+                    .map(|prefix| {
+                        index
+                            .router
+                            .candidates((prefix as u64) << index.router.shift, index.num_segments())
+                            .len()
+                    })
+                    .max()
+                    .unwrap();
+                assert!(widest < index.num_segments() / 4);
+            }
+        }
     }
 }

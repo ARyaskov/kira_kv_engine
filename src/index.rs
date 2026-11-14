@@ -812,12 +812,13 @@ impl Index {
     }
 
     /// Save aligned, checksummed tables for zero-copy loading. The rare map
-    /// fallback is stored as a legacy payload and remains readable.
+    /// fallback is stored as a legacy payload and remains readable. Tables are
+    /// streamed from borrowed storage with bounded buffers and no file reread.
     pub fn save_mmap<P: AsRef<std::path::Path>>(&self, path: P) -> Result<(), IndexError> {
-        use crate::mmap_index::{MmapIndexWriter, SectionKind};
-        let mut w = MmapIndexWriter::create(path, self.key_count as u64)?;
+        use crate::mmap_index::{SectionKind, write_sections};
+        use crate::mph_backend::PtrHash25Storage;
+        let file = std::fs::File::create(path)?;
         if let Some(e) = &self.engine {
-            use crate::mph_backend::PtrHash25Storage;
             let BackendDispatch::PtrHash25(b) = &e.backend;
             if let PtrHash25Storage::Mph(m) = &b.storage {
                 let (bseed, bshift) = e
@@ -841,47 +842,138 @@ impl Index {
                     bshift,
                     e.hash_version as u64,
                 ];
-                let mut meta = Vec::new();
-                crate::wire::extend_le(&mut meta, &fields);
-                w.add_section(SectionKind::PtrHash25Meta, meta);
-                w.add_section(SectionKind::PtrHash25Pilots, m.pilots.as_slice().to_vec());
-                let mut parts = Vec::new();
-                for p in &m.parts {
-                    crate::wire::extend_le(&mut parts, &[p.slot_off, p.salt]);
-                    crate::wire::extend_le(
-                        &mut parts,
-                        &[
-                            p.bucket_off,
-                            p.num_keys,
-                            p.num_slots,
-                            p.num_buckets,
-                            p.large_buckets,
-                            p.remap_off,
-                        ],
-                    );
-                }
-                w.add_section(SectionKind::PtrHash25Parts, parts);
-                let mut remap = Vec::new();
-                crate::wire::extend_le(&mut remap, &m.remap);
-                w.add_section(SectionKind::PtrHash25Remap, remap);
+                let mut sections = vec![
+                    (SectionKind::PtrHash25Meta, std::mem::size_of_val(&fields) as u64),
+                    (SectionKind::PtrHash25Pilots, m.pilots.len() as u64),
+                    (SectionKind::PtrHash25Parts, mmap_byte_len(m.parts.len(), 40)?),
+                    (SectionKind::PtrHash25Remap, mmap_byte_len(m.remap.len(), 4)?),
+                ];
                 if !m.fingerprints.is_empty() {
-                    w.add_section(SectionKind::PtrHash25Fingerprints, m.fingerprints.to_vec());
+                    sections
+                        .push((SectionKind::PtrHash25Fingerprints, m.fingerprints.len() as u64));
                 }
                 if let Some(f) = &e.filter {
-                    let mut words = Vec::new();
-                    crate::wire::extend_le(&mut words, f.mmap_data().2);
-                    w.add_section(SectionKind::BlockBloomWords, words);
+                    sections.push((
+                        SectionKind::BlockBloomWords,
+                        mmap_byte_len(f.mmap_data().2.len(), 8)?,
+                    ));
                 }
                 if let Some(f) = &e.fingerprints {
-                    w.add_section(SectionKind::OuterFingerprints, f.mmap_bytes());
+                    sections.push((SectionKind::OuterFingerprints, f.mmap_len() as u64));
                 }
-            } else {
-                w.add_section(SectionKind::LegacyPayload, self.to_bytes()?);
+                write_sections(
+                    file,
+                    self.key_count as u64,
+                    &sections,
+                    |index, out| match sections[index].0 {
+                        SectionKind::PtrHash25Meta => crate::wire::write_le(out, &fields),
+                        SectionKind::PtrHash25Pilots => out.write_all(m.pilots.as_slice()),
+                        SectionKind::PtrHash25Parts => {
+                            for p in &m.parts {
+                                let mut bytes = [0; 40];
+                                bytes[..8].copy_from_slice(&p.slot_off.to_le_bytes());
+                                bytes[8..16].copy_from_slice(&p.salt.to_le_bytes());
+                                for (chunk, value) in
+                                    bytes[16..].as_chunks_mut::<4>().0.iter_mut().zip([
+                                        p.bucket_off,
+                                        p.num_keys,
+                                        p.num_slots,
+                                        p.num_buckets,
+                                        p.large_buckets,
+                                        p.remap_off,
+                                    ])
+                                {
+                                    chunk.copy_from_slice(&value.to_le_bytes());
+                                }
+                                out.write_all(&bytes)?;
+                            }
+                            Ok(())
+                        }
+                        SectionKind::PtrHash25Remap => crate::wire::write_le(out, &m.remap),
+                        SectionKind::PtrHash25Fingerprints => out.write_all(&m.fingerprints),
+                        SectionKind::BlockBloomWords => {
+                            crate::wire::write_le(out, e.filter.as_ref().unwrap().mmap_data().2)
+                        }
+                        SectionKind::OuterFingerprints => {
+                            e.fingerprints.as_ref().unwrap().write_mmap_into(out)
+                        }
+                        _ => unreachable!("only declared MPH sections are written"),
+                    },
+                )?;
+                return Ok(());
             }
-        } else {
-            w.add_section(SectionKind::LegacyPayload, self.to_bytes()?);
         }
-        Ok(w.finalize()?)
+        let sections = [(SectionKind::LegacyPayload, self.mmap_legacy_payload_len()?)];
+        write_sections(file, self.key_count as u64, &sections, |_, out| {
+            self.write_mmap_legacy_payload(out)
+        })?;
+        Ok(())
+    }
+
+    /// The fallback keeps the ordinary sealed Index payload inside one section.
+    /// Its size is known from table lengths, without materializing the payload.
+    fn mmap_legacy_payload_len(&self) -> std::io::Result<u64> {
+        let mut length = 25u64; // Sealed header, key count and checksum.
+        if let Some(engine) = &self.engine {
+            let BackendDispatch::PtrHash25(backend) = &engine.backend;
+            let crate::mph_backend::PtrHash25Storage::Map(map) = &backend.storage else {
+                return Err(std::io::Error::other("MPH uses aligned sections"));
+            };
+            length = length
+                .checked_add(20)
+                .and_then(|v| v.checked_add(mmap_byte_len(map.len(), 12).ok()?))
+                .ok_or_else(mmap_length_overflow)?;
+            if let Some(filter) = &engine.filter {
+                length = length
+                    .checked_add(16)
+                    .and_then(|v| v.checked_add(mmap_byte_len(filter.mmap_data().2.len(), 8).ok()?))
+                    .ok_or_else(mmap_length_overflow)?;
+            }
+            if let Some(fp) = &engine.fingerprints {
+                length = length
+                    .checked_add(8)
+                    .and_then(|v| v.checked_add(fp.memory_usage() as u64))
+                    .ok_or_else(mmap_length_overflow)?;
+            }
+        }
+        Ok(length)
+    }
+
+    fn write_mmap_legacy_payload<W: std::io::Write>(&self, writer: W) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut out = crate::wire::ChecksumWriter::new(writer);
+        out.write_all(&[TAG_V3])?;
+        out.write_all(FORMAT_MAGIC)?;
+        out.write_all(&FORMAT_VERSION.to_le_bytes())?;
+        let hash = self.engine.as_ref().map_or(CanonicalHashVersion::Current, |e| e.hash_version);
+        out.write_all(&[hash as u8, 0])?;
+        out.write_all(&(self.key_count as u64).to_le_bytes())?;
+        if let Some(engine) = &self.engine {
+            let BackendDispatch::PtrHash25(backend) = &engine.backend;
+            let crate::mph_backend::PtrHash25Storage::Map(map) = &backend.storage else {
+                return Err(std::io::Error::other("MPH uses aligned sections"));
+            };
+            out.write_all(&engine.prehash_seed.to_le_bytes())?;
+            out.write_all(&[0, 1])?; // PtrHash25 dispatch, map fallback storage.
+            out.write_all(&(map.len() as u64).to_le_bytes())?;
+            for (key, slot) in map {
+                out.write_all(&key.to_le_bytes())?;
+                out.write_all(&slot.to_le_bytes())?;
+            }
+            if let Some(filter) = &engine.filter {
+                out.write_all(&[1])?;
+                filter.write_into(&mut out)?;
+            } else {
+                out.write_all(&[0])?;
+            }
+            if let Some(fp) = &engine.fingerprints {
+                out.write_all(&[fp.wire_flag()])?;
+                fp.write_into(&mut out)?;
+            } else {
+                out.write_all(&[0])?;
+            }
+        }
+        out.finish().map(|_| ())
     }
 
     /// Open aligned tables without copying on little-endian Windows. A retained
@@ -1466,6 +1558,14 @@ fn hash_chunk<K: AsRef<[u8]>>(out: &mut [u64], keys: &[K], seed: u64) {
     for (o, k) in out.iter_mut().zip(keys) {
         *o = canonical_hash_key(k.as_ref(), seed);
     }
+}
+
+fn mmap_byte_len(count: usize, width: u64) -> std::io::Result<u64> {
+    (count as u64).checked_mul(width).ok_or_else(mmap_length_overflow)
+}
+
+fn mmap_length_overflow() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, "mmap section size overflow")
 }
 
 /// Drop a large key vector using all build threads. Freeing 10M small allocations

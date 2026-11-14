@@ -273,6 +273,15 @@ ordinary wire layout while rebuilding a bounded select directory on load.
 See [the PGM/Elias-Fano comparison](performance/PGM_EF_REPORT.md) for measured
 speed and memory tradeoffs.
 
+Aligned `save_mmap` streams borrowed tables with an incremental checksum, using
+fixed buffers instead of table-sized copies and a second file read. Its bytes
+and legacy readers stay compatible. Hybrid derives a bounded radix directory
+for larger segment sets; the directory narrows routing and is rebuilt on load,
+so the serialized format stays unchanged. Hot-tier extraction swaps trackers
+briefly under the mutex and selects top-k outside it, with temporary extra
+tracker memory. See [the storage/hot-tier/Hybrid comparison](performance/STORAGE_HOT_HYBRID_REPORT.md)
+for speed, memory and accuracy evidence.
+
 ```rust
 // Index: streaming save/load, or in-memory bytes
 index.save("keys.idx")?;                       // streams, ~0.5 B/key transient
