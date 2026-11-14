@@ -39,6 +39,15 @@ impl CanonicalHashVersion {
             Self::Current => crate::aes_hash::hash_bytes_v2(key, seed),
         }
     }
+
+    /// Preserve scalar hash values while hoisting version and CPU dispatch out
+    /// of the individual key loop.
+    pub(crate) fn hash_batch(self, keys: &[&[u8]], seed: u64, out: &mut [u64]) {
+        match self {
+            Self::Legacy => crate::aes_hash::hash_canonical_batch::<false>(keys, seed, out),
+            Self::Current => crate::aes_hash::hash_canonical_batch::<true>(keys, seed, out),
+        }
+    }
 }
 
 #[inline(always)]

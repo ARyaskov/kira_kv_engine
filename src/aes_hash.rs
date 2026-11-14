@@ -160,6 +160,53 @@ pub fn hash_bytes_v2(key: &[u8], seed: u64) -> u64 {
     }
 }
 
+/// Hash canonical byte keys with one instruction-set dispatch for the batch.
+/// `CURRENT` selects the same short-key encoding as the scalar canonical path.
+pub(crate) fn hash_canonical_batch<const CURRENT: bool>(
+    keys: &[&[u8]],
+    seed: u64,
+    out: &mut [u64],
+) {
+    debug_assert_eq!(keys.len(), out.len());
+    #[cfg(target_arch = "x86_64")]
+    if hw_available() {
+        // SAFETY: the hardware probe establishes the AES/SSE2 requirements.
+        unsafe { x86::hash_canonical_batch::<CURRENT>(keys, seed, out) };
+        return;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if hw_available() {
+        // SAFETY: the hardware probe establishes the ARM crypto requirement.
+        unsafe { arm::hash_canonical_batch::<CURRENT>(keys, seed, out) };
+        return;
+    }
+    // SAFETY: the software implementation has no instruction-set requirements.
+    unsafe { hash_canonical_batch_impl::<SoftAes, CURRENT>(keys, seed, out) };
+}
+
+#[inline(always)]
+unsafe fn hash_canonical_batch_impl<E: AesEnc, const CURRENT: bool>(
+    keys: &[&[u8]],
+    seed: u64,
+    out: &mut [u64],
+) {
+    for (&key, hash) in keys.iter().zip(out) {
+        *hash = if key.len() == 8 {
+            let value = u64::from_le_bytes(key.try_into().unwrap());
+            crate::simd_hash::hash_u64_one(value, seed)
+        } else if CURRENT && (1..8).contains(&key.len()) {
+            let mut payload = [0u8; 8];
+            payload[..key.len()].copy_from_slice(key);
+            let encoded = u64::from_le_bytes(payload) | (1u64 << (8 * key.len()));
+            // SAFETY: E is selected by the caller's ISA dispatch.
+            unsafe { hash_u64_impl::<E>(encoded, seed) }
+        } else {
+            // SAFETY: E is selected by the caller's ISA dispatch.
+            unsafe { hash_bytes_impl::<E>(key, seed) }
+        };
+    }
+}
+
 /// Hash a single u64 with two AES rounds. Same value on every platform.
 #[inline]
 pub fn hash_u64(key: u64, seed: u64) -> u64 {
@@ -263,6 +310,16 @@ mod x86 {
     pub unsafe fn hash_u64(key: u64, seed: u64) -> u64 {
         unsafe { super::hash_u64_impl::<HwAes>(key, seed) }
     }
+
+    #[target_feature(enable = "aes,sse2")]
+    pub unsafe fn hash_canonical_batch<const CURRENT: bool>(
+        keys: &[&[u8]],
+        seed: u64,
+        out: &mut [u64],
+    ) {
+        // SAFETY: this function's target features satisfy HwAes requirements.
+        unsafe { super::hash_canonical_batch_impl::<HwAes, CURRENT>(keys, seed, out) };
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -300,6 +357,16 @@ mod arm {
     #[target_feature(enable = "aes")]
     pub unsafe fn hash_u64(key: u64, seed: u64) -> u64 {
         unsafe { super::hash_u64_impl::<HwAes>(key, seed) }
+    }
+
+    #[target_feature(enable = "aes")]
+    pub unsafe fn hash_canonical_batch<const CURRENT: bool>(
+        keys: &[&[u8]],
+        seed: u64,
+        out: &mut [u64],
+    ) {
+        // SAFETY: this function's target features satisfy HwAes requirements.
+        unsafe { super::hash_canonical_batch_impl::<HwAes, CURRENT>(keys, seed, out) };
     }
 }
 
@@ -399,4 +466,49 @@ fn splitmix64(mut x: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use crate::canonical_hash::CanonicalHashVersion;
+
+    #[test]
+    fn canonical_batch_preserves_all_scalar_lengths_seeds_and_software_values() {
+        let buffers: Vec<Vec<u8>> = (0..=129)
+            .chain([255, 256, 257, 4097])
+            .map(|length| (0..=length).map(|offset| (length * 17 + offset * 31) as u8).collect())
+            .collect();
+        // Start one byte into each allocation to include unaligned key payloads.
+        let keys: Vec<_> = buffers.iter().map(|bytes| &bytes[1..]).collect();
+        for seed in [0, 17, 0x9e37_79b9_7f4a_7c15, u64::MAX] {
+            for version in [CanonicalHashVersion::Legacy, CanonicalHashVersion::Current] {
+                let expected: Vec<_> = keys.iter().map(|key| version.hash(key, seed)).collect();
+                let mut dispatched = vec![0; keys.len()];
+                version.hash_batch(&keys, seed, &mut dispatched);
+                assert_eq!(dispatched, expected, "seed={seed} version={version:?}");
+                let mut software = vec![0; keys.len()];
+                // SAFETY: SoftAes uses only portable arithmetic and no ISA extensions.
+                unsafe {
+                    match version {
+                        CanonicalHashVersion::Legacy => {
+                            super::hash_canonical_batch_impl::<super::SoftAes, false>(
+                                &keys,
+                                seed,
+                                &mut software,
+                            );
+                        }
+                        CanonicalHashVersion::Current => {
+                            super::hash_canonical_batch_impl::<super::SoftAes, true>(
+                                &keys,
+                                seed,
+                                &mut software,
+                            );
+                        }
+                    }
+                }
+                assert_eq!(software, expected, "seed={seed} version={version:?}");
+            }
+        }
+        CanonicalHashVersion::Current.hash_batch(&[], 0, &mut []);
+    }
 }

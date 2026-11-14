@@ -7,6 +7,8 @@ from the crate root:
 use kira_kv_engine::{
     // Static MPH (PtrHash25)
     Index, IndexBuilder, IndexConfig, IndexError, IndexStats, MphConfig,
+    // One-pass, bounded-working-memory u64 MPH construction
+    MphExternalBuilder, MphExternalBuildError, MphIndex,
     // Dynamic MPH (LSM-style)
     DynamicIndex, DynamicConfig, DynamicInsertError, CompactionPolicy, StableId,
     // PGM learned index
@@ -51,7 +53,7 @@ impl IndexBuilder {
     pub fn with_bloom_filter(self, enabled: bool) -> Self;
     pub fn with_fingerprint_bits(self, width: FingerprintBits) -> Self;
 
-    /// Drop Bloom + fingerprints: 0.42 B/key, ~4x faster lookups.
+    /// Drop Bloom + fingerprints: about 0.42 B/key; speed depends on workload.
     /// Foreign keys return arbitrary in-range positions — closed-world only.
     pub fn with_lean_mph(self, enabled: bool) -> Self;
 
@@ -134,6 +136,8 @@ impl Index {
     // Batched (SIMD hashing and a three-stage pilot/Bloom/fingerprint pipeline)
     pub fn lookup_batch(&self, keys: &[&[u8]]) -> Vec<Option<usize>>;
     pub fn lookup_batch_pipelined(&self, keys: &[&[u8]]) -> Vec<Option<usize>>;
+    /// Zero-allocation byte pipeline; out.len() must be >= keys.len().
+    pub fn lookup_batch_pipelined_into(&self, keys: &[&[u8]], out: &mut [Option<usize>]);
     pub fn lookup_batch_u64_simd(&self, keys: &[u64]) -> Vec<Option<usize>>;
     /// Zero-allocation variant: caller-owned `canon` and `out` scratch (>= keys.len()).
     pub fn lookup_batch_u64_simd_into(&self, keys: &[u64], canon: &mut [u64], out: &mut [Option<usize>]);
@@ -160,6 +164,11 @@ impl Index {
     // exists_batch, serialize, deserialize, lookup_u64_fast, range, get_all
 }
 ```
+
+`lookup_batch_pipelined_into` preserves query order and overwrites every element
+of `out[..keys.len()]`, including misses. Any extra output suffix is unchanged;
+an undersized output slice panics. It uses bounded 64-query stack scratch. The
+existing allocating methods retain their signatures and behavior.
 
 ### `IndexStats`
 
@@ -191,6 +200,61 @@ pub enum IndexError {
     Pgm(String),                 // other PGM failures
 }
 ```
+
+---
+
+## `MphExternalBuilder` / `MphIndex` (streamed u64 MPH)
+
+An additive low-level construction option for a one-pass iterator of unique
+`u64` keys. Byte-key callers must canonicalize/prehash their keys themselves;
+this API does not perform `Index` byte hashing.
+
+```rust
+pub struct MphExternalBuilder { /* opaque */ }
+pub struct MphIndex { /* opaque */ }
+
+impl MphExternalBuilder {
+    pub fn new() -> Self; // default auxiliary budget: 8 MiB
+    pub fn with_config(self, config: MphConfig) -> Self;
+    pub fn with_memory_budget_bytes(self, bytes: usize) -> Self;
+    pub fn build<I: IntoIterator<Item = u64>, P: AsRef<Path>>(
+        self, keys: I, expected_len: usize, scratch_dir: P,
+    ) -> Result<MphIndex, MphExternalBuildError>;
+}
+
+impl MphIndex {
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+    pub fn index_u64(&self, key: u64) -> u32;
+    pub fn lookup_u64(&self, key: u64) -> Option<u32>;
+    pub fn memory_usage(&self) -> usize;
+    pub fn to_bytes(&self) -> Vec<u8>;
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, MphExternalBuildError>;
+}
+```
+
+The iterator must yield exactly `expected_len` keys; zero keys return
+`EmptyInput`. The budget bounds auxiliary key/sort/scratch arrays, I/O buffers
+and temporary bookkeeping. It excludes final resident index tables and storage
+already owned by the caller or iterator, so it is not a total-process RAM cap.
+Construction spools temporary files beneath `scratch_dir`, partitions with
+fanout at most 64, and builds parts sequentially. For `N` keys and `P` parts,
+partition I/O is `O(N * (1 + ceil(log_64 P)))` records; resident output is `O(N)`.
+A skewed part that exceeds the budget returns
+`MphExternalBuildError::BudgetExceeded { required, budget }` before loading its
+key array. This error enum is non-exhaustive; other typed errors are `InvalidConfig`, `CapacityExceeded`,
+`KeyCountMismatch { expected, observed }`, `EmptyInput`, `Build`, `Io` and
+`CorruptData`. Owned temporary files are removed before successful return;
+failure/unwind cleanup is best effort, and existing caller files are untouched.
+
+`index_u64` is closed-world: foreign keys receive an arbitrary in-range slot.
+`lookup_u64` applies the configured inner fp8 check; positive answers remain
+probabilistic, and disabling fingerprints removes membership checking.
+Prerotation is fixed at zero, so mappings can differ from the ordinary builder.
+Serialization uses the existing raw PtrHash25 payload with structural validation
+and full input consumption, **without an outer checksum**. It is distinct from
+the checksummed `Index` container. Existing `IndexConfig` fields and formats are
+unchanged.
 
 ---
 
@@ -559,12 +623,20 @@ pub struct GpuPart {
 
 pub struct BloomExport {
     pub bit_shift: u32,       // 26 (6-bit lane index); 27 for filters from 0.6 files
-    pub blocks: usize,        // multiple of 256
+    pub blocks: usize,        // positive; tiny builds need not be a multiple of 256
     pub words: Vec<u64>,      // length = blocks * 8
     //   block = ((hash >> 32) * blocks) >> 32
     //   bit_w = (((hash & 0xFFFFFFFF) * SALT[w]) >> bit_shift) & 0x3F
 }
 ```
+
+Bloom consumers must accept every positive block count. New tiny filters use
+the required number of complete 64-byte blocks (minimum one), while large
+filters retain the existing geometry rounded to 256-block groups. Existing
+serialized filters retain their stored block count and bit shift on load and
+resave; fresh tiny builds can therefore differ in size and bytes from an older
+build of the same keys without changing the wire interpretation or lookup
+positions.
 
 ---
 
@@ -648,7 +720,7 @@ Old payload-based mmap containers remain readable through the copying decoder.
 same output pass. For `M` bytes and `S` sections it takes `O(M)` time and
 `O(S + fixed buffers)` auxiliary space, without rereading the output. Aligned
 section order, padding, fingerprints, canonical hash metadata and checksums
-retain their previous bytes; the rare map fallback streams its nested sealed
+retain their previous bytes when resaving a loaded index; the rare map fallback streams its nested sealed
 payload too. The existing `MmapIndexWriter` API continues to own the `Vec`
 sections supplied by callers, while its finalization also avoids the reread.
 

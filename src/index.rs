@@ -261,7 +261,8 @@ pub struct BloomExport {
     /// Lane bit-index shift: 26 for filters built by this version (6-bit index), 27
     /// for filters loaded from 0.6 files (5-bit index). See `BlockBloom::export_words`.
     pub bit_shift: u32,
-    /// Number of 64-byte blocks. Always a multiple of 256 (no longer a power of two
+    /// Number of 64-byte blocks. Small filters use any positive count; large
+    /// builds round up to a multiple of 256 (no longer a power of two
     /// since the partitioned build; the multiply-high reduction is unbiased regardless).
     pub blocks: usize,
     /// Concatenated 64-bit words. Length is `blocks * 8`.
@@ -437,14 +438,31 @@ impl Index {
         }
         let PtrHash25Storage::Mph(mph) = &backend.storage else {
             for (&hash, result) in hashes.iter().zip(out) {
-                *result =
+                *result = if engine.filter.as_ref().is_some_and(|bf| !bf.contains_hash(hash)) {
+                    None
+                } else {
                     engine.backend.lookup(hash).map(|s| s as usize).filter(|&s| {
                         engine.fingerprints.as_ref().is_none_or(|fp| fp.matches(s, hash))
-                    });
+                    })
+                };
             }
             return;
         };
         const LANES: usize = 64;
+        if engine.filter.is_none() && engine.fingerprints.is_none() {
+            // Lean indexes have no membership checks. Produce their results in
+            // the pilot stage instead of creating a third pass and slot scratch.
+            for (hashes, out) in hashes.chunks(LANES).zip(out.chunks_mut(LANES)) {
+                let mut prepared = [crate::ptrhash25::PreparedLookup::default(); LANES];
+                for (query, &hash) in prepared.iter_mut().zip(hashes) {
+                    *query = mph.prepare_lookup(hash);
+                }
+                for (query, result) in prepared.iter().zip(out) {
+                    *result = Some(mph.finish_lookup(*query));
+                }
+            }
+            return;
+        }
         for (hashes, out) in hashes.chunks(LANES).zip(out.chunks_mut(LANES)) {
             let mut prepared = [crate::ptrhash25::PreparedLookup::default(); LANES];
             let mut slots = [usize::MAX; LANES];
@@ -671,16 +689,48 @@ impl Index {
     /// API. Uses bounded stack scratch and preserves query order, including misses.
     pub fn lookup_batch_pipelined(&self, keys: &[&[u8]]) -> Vec<Option<usize>> {
         let Some(engine) = self.engine.as_ref() else { return vec![None; keys.len()] };
-        let mut out = vec![None; keys.len()];
-        // Bounded scratch; byte-key batches no longer allocate a full hash array.
-        let mut hashes = [0u64; 64];
-        for (input, result) in keys.chunks(64).zip(out.chunks_mut(64)) {
-            for (h, key) in hashes.iter_mut().zip(input) {
-                *h = engine.hash_version.hash(key, engine.prehash_seed);
-            }
-            Self::lookup_canonical_batch(engine, &hashes[..input.len()], result);
+        // Each output is produced once; avoid first initializing a potentially
+        // large result allocation only to overwrite it in the pipeline.
+        let mut out = Vec::with_capacity(keys.len());
+        let mut results = [None; 64];
+        for input in keys.chunks(64) {
+            Self::lookup_byte_chunk(engine, input, &mut results[..input.len()]);
+            out.extend_from_slice(&results[..input.len()]);
         }
         out
+    }
+
+    /// Allocation-free byte-key pipeline with caller-owned output. Every result
+    /// in the requested prefix is overwritten, including misses; extra output
+    /// elements are left untouched.
+    ///
+    /// # Panics
+    /// Panics if `out.len() < keys.len()`.
+    pub fn lookup_batch_pipelined_into(&self, keys: &[&[u8]], out: &mut [Option<usize>]) {
+        assert!(out.len() >= keys.len(), "out slice too small");
+        let Some(engine) = self.engine.as_ref() else {
+            out[..keys.len()].fill(None);
+            return;
+        };
+        for (input, result) in keys.chunks(64).zip(out[..keys.len()].chunks_mut(64)) {
+            Self::lookup_byte_chunk(engine, input, result);
+        }
+    }
+
+    #[inline]
+    fn lookup_byte_chunk(engine: &MphEngine, input: &[&[u8]], result: &mut [Option<usize>]) {
+        // A whole block of independent payload addresses is known before any
+        // hash is needed. Warm those bytes while prior keys are processed.
+        if input.len() == 64 {
+            for key in input {
+                if !key.is_empty() {
+                    prefetch_read(key.as_ptr());
+                }
+            }
+        }
+        let mut hashes = [0u64; 64];
+        engine.hash_version.hash_batch(input, engine.prehash_seed, &mut hashes[..input.len()]);
+        Self::lookup_canonical_batch(engine, &hashes[..input.len()], result);
     }
 
     pub fn len(&self) -> usize {

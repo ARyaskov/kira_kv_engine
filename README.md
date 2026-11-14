@@ -201,7 +201,9 @@ detected exactly and reported as `IndexError::DuplicateKey`. Key types need
 `String`, `&[u8]`, `&str`, arrays.
 
 Lookups: `index.lookup(&[u8])`, `lookup_u64(u64)`, `lookup_batch_pipelined(&[&[u8]])`,
-`lookup_batch_u64_simd(&[u64])` / `lookup_batch_u64_simd_into` (zero allocation).
+`lookup_batch_u64_simd(&[u64])`. The caller-owned variants
+`lookup_batch_pipelined_into` and `lookup_batch_u64_simd_into` avoid result
+allocation.
 
 `contains()` is the Bloom-filter answer (definite "no", probabilistic "yes"); in
 lean mode there is no filter and it always returns `true` — check
@@ -258,8 +260,8 @@ let range: std::ops::Range<usize> = idx.range(uuid_a, uuid_b);
 
 ## Serialization
 
-Every engine has a self-contained byte form with a magic, a format version and a
-64-bit checksum; loading verifies the checksum and every structural invariant, so
+Each of the six engines has a self-contained byte form with a magic, a format
+version and a 64-bit checksum; loading verifies the checksum and every structural invariant, so
 a corrupt or hostile file is rejected instead of being read out of bounds.
 Files are portable between x86_64, aarch64 and other targets.
 
@@ -317,6 +319,17 @@ let index = IndexBuilder::new()
 Defaults remain Bloom + fp16. fp16/fp24/fp32 consume 2/3/4 bytes per slot; removing
 Bloom saves about 1.38 B/key at large scale. Without Bloom, misses cost a full
 MPH/fingerprint probe. Membership remains probabilistic. Lean mode disables both.
+Tiny Bloom filters now use complete 64-byte blocks instead of a 16 KiB minimum;
+large-filter geometry is unchanged. Existing files retain their original filter
+bytes on load/resave; fresh tiny builds can have smaller serialized output.
+
+`MphExternalBuilder` is an additive low-level option for one-pass `u64` input
+with a scratch directory and an auxiliary-memory budget. The budget excludes
+caller-owned input and final resident index tables. Oversized/skewed partitions
+return a typed error before their key arrays are loaded. Its opaque `MphIndex`
+uses the existing structurally validated raw PtrHash25 payload without an outer
+checksum; byte-key callers must supply their own canonical hashes. See
+[`API.md`](API.md) for signatures and membership guarantees.
 
 `DynamicIndex` stores tier keys in byte arenas with metadata directly in MPH-slot
 order. Its default full-compaction policy is preserved. Write-heavy workloads can
@@ -351,6 +364,27 @@ cargo run --release --example million_build       # Index build/lookup, multi-th
 # KIRA_BENCH_N / KIRA_BENCH_OPS / KIRA_BENCH_RUNS → key count, lookups, repetitions;
 # KIRA_BUILD_TRACE=1 prints build phases.
 ```
+
+### Current static Index: `million_build`, 40M mixed keys
+
+The paired Windows x86-64 run compares `824e0d1` with the current changes using
+40M keys, 10M queries per workload, 20 lookup workers and one pass per state.
+All six default-mode lookup rows took 6.3% to 19.4% less time. These are aggregate
+ns/query across workers, with unchanged reported index size:
+
+| Metric | Before | After |
+|---|---:|---:|
+| Default build, ms | 897.93 | 817.01 |
+| Lean build, ms | 757.49 | 743.06 |
+| Default index, B/key | 3.79 | 3.79 |
+| Lean index, B/key | 0.42 | 0.42 |
+
+The first three lean baseline timings were outliers; their apparent fourfold
+gain is not a reliable speedup estimate. Separate 1M-key single-thread phase
+diagnostics include default-pipeline regressions of 0.65% and 2.2%, so these
+results do not establish an improvement for every workload. The complete twelve
+rows, process-memory comparison, correctness checks and measurement limits are
+in [the static Index report](performance/STATIC_INDEX_REPORT.md).
 
 ### 10M random keys, Apple M-series, single thread (`cargo bench --bench engines`)
 
@@ -444,7 +478,8 @@ aarch64. Run-to-run spread on memory-bound rows is about ±10% on this machine.
 
 ## Performance tuning checklist
 
-1. **Closed key set?** Enable `lean_mph(true)` → -89% memory, 4× faster lookups.
+1. **Closed key set?** Enable `lean_mph(true)` → about 89% less index memory at
+   large scale; lookup speed depends on the working set and hardware.
 2. **Hugepages on Linux/Windows?** -10–20 ns per lookup at 100M scale. See
    [Hugepages section](#hugepages-windows-linux) below.
 3. **Read-heavy after build?** `Index::save` / `Index::load`: a 10M-key index

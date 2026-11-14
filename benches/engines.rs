@@ -67,8 +67,17 @@ fn main() {
         let idx = IndexBuilder::new().with_config(cfg).build_index_ref(&keys_bytes).unwrap();
         let build = t.elapsed().as_secs_f64();
         let bpk = idx.stats().total_memory as f64 / n as f64;
+        // Independent of query timing: every input must map bijectively into
+        // the minimal output range. Never turn a missing known key into slot0.
+        let mut seen = vec![false; n];
+        for key in &keys_bytes {
+            let slot = idx.lookup(key).expect("known static key was rejected");
+            assert!(slot < n && !seen[slot], "static output is not a bijection");
+            seen[slot] = true;
+        }
         let (lookup, s) = ns_per(q, || {
-            hits.iter().fold(0usize, |a, &k| a.wrapping_add(idx.lookup_u64(k).unwrap_or(0)))
+            hits.iter()
+                .fold(0usize, |a, &k| a.wrapping_add(idx.lookup_u64(k).expect("known static hit")))
         });
         sink = sink.wrapping_add(s);
         let mut out = vec![None; q];
@@ -77,6 +86,9 @@ fn main() {
             idx.lookup_batch_u64_simd_into(black_box(&hits), &mut canon, &mut out);
             black_box(&out);
         });
+        for (&key, result) in hits.iter().zip(&out) {
+            assert_eq!(*result, idx.lookup_u64(key).ok());
+        }
         let miss = if lean {
             None
         } else {
@@ -101,12 +113,19 @@ fn main() {
             .unwrap();
         let build = t.elapsed().as_secs_f64();
         let bpk = idx.memory_usage() as f64 / n as f64;
+        for (position, &key) in keys_u64.iter().enumerate() {
+            assert_eq!(idx.lookup_u64(key), Some(position as u32));
+        }
         let (lookup, s) = ns_per(q, || {
-            hits.iter()
-                .fold(0usize, |a, &k| a.wrapping_add(idx.lookup_u64(k).unwrap_or(0) as usize))
+            hits.iter().fold(0usize, |a, &k| {
+                a.wrapping_add(idx.lookup_u64(k).expect("known Hybrid hit") as usize)
+            })
         });
         sink = sink.wrapping_add(s);
-        let (batch, _) = ns_per(q, || idx.lookup_batch_u64_simd(&hits));
+        let (batch, results) = ns_per(q, || idx.lookup_batch_u64_simd(&hits));
+        for (&key, result) in hits.iter().zip(&results) {
+            assert_eq!(*result, idx.lookup_u64(key));
+        }
         let miss = if lean {
             None
         } else {
@@ -130,8 +149,11 @@ fn main() {
         let pgm = PgmBuilder::new().with_epsilon(64).build(sorted.clone()).unwrap();
         let build = t.elapsed().as_secs_f64();
         let bpk = pgm.stats().memory_usage as f64 / sorted.len() as f64;
+        for (rank, &key) in sorted.iter().enumerate() {
+            assert_eq!(pgm.index(key).ok(), Some(rank));
+        }
         let (lookup, s) = ns_per(q, || {
-            hits.iter().fold(0usize, |a, &k| a.wrapping_add(pgm.index(k).unwrap_or(0)))
+            hits.iter().fold(0usize, |a, &k| a.wrapping_add(pgm.index(k).expect("known PGM hit")))
         });
         sink = sink.wrapping_add(s);
         let (miss, _) = ns_per(q, || misses.iter().filter(|&&k| pgm.index(k).is_ok()).count());
@@ -149,10 +171,14 @@ fn main() {
         let idx = PgmIndexU128::build(keys.clone(), 64).unwrap();
         let build = t.elapsed().as_secs_f64();
         let bpk = idx.memory_usage() as f64 / keys.len() as f64;
+        for (rank, &key) in keys.iter().enumerate() {
+            assert_eq!(idx.index(key).ok(), Some(rank));
+        }
         let qs: Vec<u128> =
             (0..q as u64).map(|i| keys[(splitmix(i) % keys.len() as u64) as usize]).collect();
-        let (lookup, s) =
-            ns_per(q, || qs.iter().fold(0usize, |a, &k| a.wrapping_add(idx.index(k).unwrap_or(0))));
+        let (lookup, s) = ns_per(q, || {
+            qs.iter().fold(0usize, |a, &k| a.wrapping_add(idx.index(k).expect("known u128 hit")))
+        });
         sink = sink.wrapping_add(s);
         row(&format!("PgmIndexU128 ε=64 ({m} keys)"), build, bpk, lookup, None, None);
     }
@@ -171,11 +197,16 @@ fn main() {
         idx.compact().unwrap();
         let build = t.elapsed().as_secs_f64();
         let bpk = idx.memory_usage() as f64 / m as f64;
+        for (position, key) in keys_bytes[..m].iter().enumerate() {
+            assert_eq!(idx.lookup(key), Some(position as u32));
+        }
         let hb: Vec<[u8; 8]> = (0..q.min(m))
             .map(|i| keys_u64[(splitmix(i as u64 ^ 0x77) % m as u64) as usize].to_le_bytes())
             .collect();
         let (lookup, s) = ns_per(hb.len(), || {
-            hb.iter().fold(0usize, |a, k| a.wrapping_add(idx.lookup(k).unwrap_or(0) as usize))
+            hb.iter().fold(0usize, |a, k| {
+                a.wrapping_add(idx.lookup(k).expect("known dynamic hit") as usize)
+            })
         });
         sink = sink.wrapping_add(s);
         row(

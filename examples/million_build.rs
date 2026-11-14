@@ -14,6 +14,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
+#[path = "support/validation.rs"]
+mod validation;
+
 /// Default key count; override with `KIRA_BENCH_N=<n>`.
 const N_KEYS_DEFAULT: usize = 40_000_000;
 fn n_keys() -> usize {
@@ -166,6 +169,35 @@ fn run_index_bench(settings: &BenchSettings) -> Result<(), Box<dyn std::error::E
             let (c, w) = measure_lookup_pair(&mut q, &mut run_rng, &index);
             zipf_cold.push(c);
             zipf_warm.push(w);
+
+            // Outside every timer: reject false negatives, wrong known-key slots
+            // and non-bijective MPH output instead of accepting an XOR alone.
+            let oracle = validation::verify_index(&index, &mixed_keys)?;
+            for (name, queries) in [
+                ("positive", &positive_queries),
+                ("negative", &negative_queries),
+                ("zipf", &zipf_queries),
+            ] {
+                let mut foreign_candidates = 0;
+                let mut foreign_queries = 0;
+                for chunk in queries.chunks(65_536) {
+                    let refs: Vec<_> = chunk.iter().map(|q| q.key.as_slice()).collect();
+                    let results = index.lookup_batch_pipelined(&refs);
+                    let stats = validation::verify_results(
+                        &oracle,
+                        &mixed_keys,
+                        chunk.iter().map(|q| (q.key.as_slice(), q.is_hit)),
+                        &results,
+                    )?;
+                    foreign_candidates += stats.foreign_candidates;
+                    foreign_queries += stats.foreign_queries;
+                }
+                eprintln!(
+                    "correctness=pass backend={backend_name} workload={name} keys={} queries={} foreign_candidates={foreign_candidates}/{foreign_queries}",
+                    mixed_keys.len(),
+                    queries.len()
+                );
+            }
         }
 
         let build_stats = summarize(&mut build_samples);
