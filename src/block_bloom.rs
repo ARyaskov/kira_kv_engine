@@ -4,8 +4,9 @@
 //! word for a total of 8 bits per element. Roughly equivalent FPR to a classic Bloom with 8
 //! hash functions, but one cache miss instead of eight independent random loads.
 //!
-//! On AVX2-capable x86_64 the lookup compiles to ~12 instructions: one `vmovdqu` for the
-//! block, one `vpcmpeqq` against the broadcast bitmask, and a final mask test.
+//! On AVX2-capable x86_64 lookup generates the eight lane masks in vector
+//! registers and checks both block halves with `vptest`. The scalar fallback
+//! uses the same lane-bit formula.
 //!
 //! ## Bit-index width (format v2)
 //!
@@ -26,6 +27,18 @@ const BIT_SHIFT_V2: u32 = 26;
 const BIT_SHIFT_LEGACY: u32 = 27;
 /// Set on the serialized word-count to mark a v2 (6-bit) filter.
 const LEN_FLAG_V2: u64 = 1 << 63;
+/// Lane multipliers from Impala's split-block Bloom filter. The scalar builder,
+/// scalar lookup and AVX2 lookup must use these exact wire-compatible constants.
+const MASK_SALTS: [u32; BLOCK_WORDS] = [
+    0x47b6_137b,
+    0x4476_8924,
+    0x1820_5237,
+    0x2384_8965,
+    0x8e6e_2354,
+    0x0f7c_c9b6,
+    0xe43d_5fa5,
+    0xa4d5_2dc1,
+];
 
 // Serde/rkyv derive omitted: words is HugeVec which doesn't trivially serialize.
 // Manual serialization via write_to / read_from below.
@@ -89,11 +102,16 @@ impl BlockBloom {
         let n = hashes.len().max(1);
         let total_bits = ((n as f64) * BITS_PER_KEY).ceil() as usize;
         // The block index is a multiply-high reduction of the top 32 hash bits, which is
-        // unbiased for *any* block count — no power-of-two rounding (that used to cost up
-        // to 2× filter memory: 100M keys → 268 MB instead of 137 MB). Blocks are rounded
-        // up to a multiple of `BLOOM_RANGES` so the parallel builder can split the filter
-        // into equal windows whose index is simply the top 8 bits of the hash.
-        let blocks = (total_bits / (BLOCK_WORDS * 64)).max(1).next_multiple_of(BLOOM_RANGES);
+        // unbiased for *any* block count. Small filters need only enough complete
+        // cache lines for the target bit budget. Large filters retain the existing
+        // 256-block rounding so the parallel builder's equal windows and existing
+        // large-build geometry stay unchanged.
+        let minimum_blocks = total_bits.div_ceil(BLOCK_WORDS * 64).max(1);
+        let blocks = if minimum_blocks < BLOOM_RANGES {
+            minimum_blocks
+        } else {
+            (total_bits / (BLOCK_WORDS * 64)).max(1).next_multiple_of(BLOOM_RANGES)
+        };
         let mut words = crate::hugepage::HugeVec::<u64>::zeroed(blocks * BLOCK_WORDS);
         let bit_shift = BIT_SHIFT_V2;
 
@@ -182,7 +200,7 @@ impl BlockBloom {
     pub fn contains_hash(&self, hash: u64) -> bool {
         let words = self.words.as_slice();
         let blocks = words.len() / BLOCK_WORDS;
-        let (block, mask) = block_and_mask(hash, blocks, self.bit_shift);
+        let block = block_of(hash, blocks);
         let base = block * BLOCK_WORDS;
         // 64 bytes — one cache line — touched per query.
         #[cfg(target_arch = "x86_64")]
@@ -190,9 +208,12 @@ impl BlockBloom {
             if cfg!(target_feature = "avx2") || std::arch::is_x86_feature_detected!("avx2") {
                 // SAFETY: AVX2 verified at compile time or by the cached runtime probe;
                 // `base + 8 ≤ words.len()` by construction of `block_of`.
-                return unsafe { contains_hash_avx2(words.as_ptr().add(base), &mask) };
+                return unsafe {
+                    contains_hash_avx2(words.as_ptr().add(base), hash as u32, self.bit_shift)
+                };
             }
         }
+        let mask = mask_for(hash, self.bit_shift);
         for w in 0..BLOCK_WORDS {
             let word = unsafe { *words.get_unchecked(base + w) };
             if word & mask[w] != mask[w] {
@@ -219,8 +240,9 @@ impl BlockBloom {
     }
 
     /// Export the raw 64-bit word array for upload to an external
-    /// accelerator. Length is always a multiple of `BLOCK_WORDS` (8) and
-    /// `len() / 8` is always a multiple of 256. The on-device kernel uses
+    /// accelerator. Length is always a multiple of `BLOCK_WORDS` (8). Small
+    /// filters may use any positive block count; large builds retain a multiple
+    /// of 256 blocks. The on-device kernel uses
     /// the same `block_and_mask` formula as the CPU path:
     ///
     /// ```text
@@ -231,7 +253,7 @@ impl BlockBloom {
     /// ```
     ///
     /// `bit_shift` is [`BlockBloom::bit_shift`] (26 for current filters, 27 for legacy).
-    /// SALT constants live in `block_bloom.rs::mask_for` and must be replicated
+    /// SALT constants live in `block_bloom.rs::MASK_SALTS` and must be replicated
     /// bit-exact in the kernel.
     pub fn export_words(&self) -> Vec<u64> {
         self.words.as_slice().to_vec()
@@ -255,7 +277,8 @@ impl BlockBloom {
     }
 
     pub fn read_from(buf: &[u8], pos: &mut usize) -> Option<Self> {
-        if *pos + 16 > buf.len() {
+        let header_end = pos.checked_add(16)?;
+        if header_end > buf.len() {
             return None;
         }
         let mut a = [0u8; 8];
@@ -264,8 +287,8 @@ impl BlockBloom {
         a.copy_from_slice(&buf[*pos + 8..*pos + 16]);
         let raw_len = u64::from_le_bytes(a);
         let bit_shift = if raw_len & LEN_FLAG_V2 != 0 { BIT_SHIFT_V2 } else { BIT_SHIFT_LEGACY };
-        let len = (raw_len & !LEN_FLAG_V2) as usize;
-        *pos += 16;
+        let len = usize::try_from(raw_len & !LEN_FLAG_V2).ok()?;
+        *pos = header_end;
         // At least one block (the lookup indexes block 0 unconditionally), whole
         // blocks only, and the payload must fit — with overflow-safe arithmetic so a
         // huge length word cannot slip past the check and trigger a giant allocation.
@@ -304,8 +327,8 @@ impl BlockBloom {
 /// Below this many keys the parallel build isn't worth the extra passes.
 #[cfg(feature = "parallel")]
 const PARALLEL_MIN_KEYS: usize = 1 << 18;
-/// Windows of the parallel builder; `blocks` is always a multiple of this so the window
-/// of a hash is its top 8 bits.
+/// Windows of the parallel builder; at parallel-build sizes `blocks` is a multiple
+/// of this count, so the window of a hash is its top 8 bits.
 const BLOOM_RANGES: usize = 256;
 
 /// Raw pointer shared across rayon workers; every worker writes disjoint positions.
@@ -424,18 +447,8 @@ fn block_and_mask(hash: u64, blocks: usize, bit_shift: u32) -> (usize, [u64; BLO
 #[inline(always)]
 fn mask_for(hash: u64, bit_shift: u32) -> [u64; BLOCK_WORDS] {
     let seed = hash as u32;
-    const SALT: [u32; 8] = [
-        0x47b6_137b,
-        0x4476_8924,
-        0x1820_5237,
-        0x2384_8965,
-        0x8e6e_2354,
-        0x0f7c_c9b6,
-        0xe43d_5fa5,
-        0xa4d5_2dc1,
-    ];
     let mut mask = [0u64; BLOCK_WORDS];
-    for (m, &s) in mask.iter_mut().zip(SALT.iter()) {
+    for (m, &s) in mask.iter_mut().zip(MASK_SALTS.iter()) {
         let bit = (seed.wrapping_mul(s) >> bit_shift) & 0x3F;
         *m = 1u64 << bit;
     }
@@ -443,24 +456,97 @@ fn mask_for(hash: u64, bit_shift: u32) -> [u64; BLOCK_WORDS] {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[allow(unsafe_op_in_unsafe_fn)]
 #[inline]
 #[target_feature(enable = "avx2")]
-unsafe fn contains_hash_avx2(words_ptr: *const u64, mask: &[u64; BLOCK_WORDS]) -> bool {
+unsafe fn contains_hash_avx2(words_ptr: *const u64, seed: u32, bit_shift: u32) -> bool {
     use core::arch::x86_64::{
-        _mm256_and_si256, _mm256_cmpeq_epi64, _mm256_loadu_si256, _mm256_movemask_epi8,
+        _mm_cvtsi32_si128, _mm256_castsi256_si128, _mm256_cvtepu32_epi64, _mm256_extracti128_si256,
+        _mm256_loadu_si256, _mm256_mullo_epi32, _mm256_set1_epi32, _mm256_set1_epi64x,
+        _mm256_sllv_epi64, _mm256_srl_epi32, _mm256_testc_si256,
     };
-    // Load two 32-byte halves.
-    let block_lo = _mm256_loadu_si256(words_ptr as *const _);
-    let block_hi = _mm256_loadu_si256(words_ptr.add(4) as *const _);
-    let mask_lo = _mm256_loadu_si256(mask.as_ptr() as *const _);
-    let mask_hi = _mm256_loadu_si256(mask.as_ptr().add(4) as *const _);
-    let and_lo = _mm256_and_si256(block_lo, mask_lo);
-    let and_hi = _mm256_and_si256(block_hi, mask_hi);
-    let eq_lo = _mm256_cmpeq_epi64(and_lo, mask_lo);
-    let eq_hi = _mm256_cmpeq_epi64(and_hi, mask_hi);
-    // 8 lanes; we need ALL lanes equal. movemask_epi8 == 0xFFFF_FFFF iff every byte set.
-    let mm_lo = _mm256_movemask_epi8(eq_lo) as u32;
-    let mm_hi = _mm256_movemask_epi8(eq_hi) as u32;
-    mm_lo == 0xFFFF_FFFF && mm_hi == 0xFFFF_FFFF
+    // Compute all eight wrapped u32 products and lane indices without building
+    // a stack mask. Logical shifts preserve both current (26) and legacy (27)
+    // formulas; widening precedes the variable 64-bit one-bit shifts.
+    // SAFETY: the static table contains exactly eight initialized u32 values.
+    let salts = unsafe { _mm256_loadu_si256(MASK_SALTS.as_ptr().cast()) };
+    let products = _mm256_mullo_epi32(_mm256_set1_epi32(seed as i32), salts);
+    let bits = _mm256_srl_epi32(products, _mm_cvtsi32_si128(bit_shift as i32));
+    let ones = _mm256_set1_epi64x(1);
+    let mask_lo = _mm256_sllv_epi64(ones, _mm256_cvtepu32_epi64(_mm256_castsi256_si128(bits)));
+    let mask_hi =
+        _mm256_sllv_epi64(ones, _mm256_cvtepu32_epi64(_mm256_extracti128_si256::<1>(bits)));
+    // SAFETY: the caller supplies eight readable words. Both loads are unaligned
+    // so mapped/owned tables need not start at a 32-byte boundary.
+    let block_lo = unsafe { _mm256_loadu_si256(words_ptr.cast()) };
+    let block_hi = unsafe { _mm256_loadu_si256(words_ptr.add(4).cast()) };
+    // VPTEST checks (~block & mask) == 0 directly. Bitwise AND checks both halves
+    // without a data-dependent branch between the two four-lane tests.
+    (_mm256_testc_si256(block_lo, mask_lo) & _mm256_testc_si256(block_hi, mask_hi)) != 0
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod avx2_tests {
+    use super::{BLOCK_WORDS, BlockBloom, block_of, contains_hash_avx2, mask_for};
+
+    fn mix(mut value: u64) -> u64 {
+        value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        value ^ (value >> 31)
+    }
+
+    fn scalar(words: &[u64], hash: u64, shift: u32) -> bool {
+        let base = block_of(hash, words.len() / BLOCK_WORDS) * BLOCK_WORDS;
+        let mask = mask_for(hash, shift);
+        (0..BLOCK_WORDS).all(|lane| words[base + lane] & mask[lane] == mask[lane])
+    }
+
+    #[test]
+    fn direct_avx2_matches_scalar_masks_for_legacy_current_and_unaligned_blocks() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let edges = [0, 1, u64::MAX, u32::MAX as u64, (u32::MAX as u64) << 32, 1 << 31, 1 << 63];
+        for blocks in [1, 2, 6, 255, 256, 512] {
+            for shift in [26, 27] {
+                for fill in [0u64, u64::MAX, 0x1234_5678] {
+                    let mut backing = vec![fill; blocks * BLOCK_WORDS + 1];
+                    let offset = usize::from((backing.as_ptr() as usize).is_multiple_of(32));
+                    let words = &mut backing[offset..offset + blocks * BLOCK_WORDS];
+                    assert!(!(words.as_ptr() as usize).is_multiple_of(32));
+                    if fill == 0x1234_5678 {
+                        for (index, word) in words.iter_mut().enumerate() {
+                            *word = mix(index as u64);
+                        }
+                        // Guarantee positive matches as well as random negatives.
+                        for hash in edges.into_iter().chain((0..128).map(mix)) {
+                            let base = block_of(hash, blocks) * BLOCK_WORDS;
+                            for (word, mask) in words[base..base + BLOCK_WORDS]
+                                .iter_mut()
+                                .zip(mask_for(hash, shift))
+                            {
+                                *word |= mask;
+                            }
+                        }
+                    }
+                    let filter = BlockBloom {
+                        seed: 0,
+                        words: crate::hugepage::HugeVec::from_slice(words),
+                        bit_shift: shift,
+                    };
+                    for hash in edges.into_iter().chain((0..4096).map(mix)) {
+                        let expected = scalar(words, hash, shift);
+                        let base = block_of(hash, blocks) * BLOCK_WORDS;
+                        // SAFETY: AVX2 is checked above; the selected block has
+                        // eight initialized readable words, deliberately unaligned.
+                        let actual = unsafe {
+                            contains_hash_avx2(words.as_ptr().add(base), hash as u32, shift)
+                        };
+                        assert_eq!(actual, expected, "blocks={blocks} shift={shift} hash={hash}");
+                        assert_eq!(filter.contains_hash(hash), expected);
+                    }
+                }
+            }
+        }
+    }
 }

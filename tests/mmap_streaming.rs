@@ -149,7 +149,7 @@ fn frozen_legacy_hash_models_keep_positions_after_streamed_mmap_resave() {
 }
 
 #[test]
-fn streaming_keeps_frozen_preoptimization_mmap_bytes_identical() {
+fn streaming_keeps_frozen_mmap_bytes_and_compact_build_positions() {
     let directory = tempfile::tempdir().unwrap();
     let original_path = directory.path().join("baseline.mmap");
     let rewritten_path = directory.path().join("streamed.mmap");
@@ -161,7 +161,13 @@ fn streaming_keeps_frozen_preoptimization_mmap_bytes_identical() {
         .build_index_ref(&keys)
         .unwrap();
     index.save_mmap(&rewritten_path).unwrap();
-    assert_eq!(std::fs::read(&rewritten_path).unwrap(), fixture);
+    let compact_bytes = std::fs::read(&rewritten_path).unwrap();
+    assert!(compact_bytes.len() < fixture.len(), "small builds use fewer Bloom blocks");
+    let compact = Index::open_mmap(&rewritten_path).unwrap();
+    for key in &keys {
+        assert_eq!(compact.lookup(key).unwrap(), index.lookup(key).unwrap());
+    }
+    drop(compact);
     std::fs::write(&original_path, fixture).unwrap();
     let old = Index::open_mmap(&original_path).unwrap();
     old.save_mmap(&rewritten_path).unwrap();
