@@ -9,8 +9,10 @@
 //!   indexes written by 0.6 keep their 1.1× padded range. Size parallel side
 //!   arrays to `slot_capacity()`.
 //! - Empty input is accepted by every engine and yields an always-miss instance.
-//! - Every engine serializes into a checksummed, validated, platform-independent
-//!   byte form; hashing is bit-identical on x86_64, aarch64 and other targets.
+//! - Index engines serialize into a checksummed, validated, platform-independent
+//!   byte form; the low-level [`MphIndex`] exposes the existing raw MPH payload
+//!   without an outer checksum. Hashing is bit-identical on x86_64, aarch64 and
+//!   other targets.
 //!
 //! See `README.md` for choosing an engine and `API.md` for the full surface.
 
@@ -61,6 +63,7 @@ pub use pgm::{PgmBuilder, PgmError, PgmIndex, PgmStats};
 pub use pgm_u128::{PgmIndexU128, PgmU128Error};
 /// Geometry and hashing options for the MPH builder used by [`IndexConfig`].
 pub use ptrhash25::BuildConfig as MphConfig;
+pub use ptrhash25::{MphExternalBuildError, MphExternalBuilder, MphIndex};
 
 /// Test-only re-exports of crate-internal items. Hidden from rustdoc; not part
 /// of the stable API. Used exclusively by `tests/` for internal-state tests.
