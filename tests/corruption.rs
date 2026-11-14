@@ -91,14 +91,11 @@ fn index_v3_rejects_every_mutation_and_truncation() {
 /// lookups stay in bounds and never panic.
 #[test]
 fn index_legacy_tag2_never_panics_on_corruption() {
-    let keys = byte_keys(10_000);
-    let foreign = byte_keys(10_000)
-        .into_iter()
-        .map(|mut k| {
-            k.push(b'!');
-            k
-        })
-        .collect::<Vec<_>>();
+    // Eight-byte canonical hashing is unchanged across hash versions, so this
+    // stripped container is also a valid legacy payload. Frozen byte-key
+    // fixtures separately cover the historical variable-length hash.
+    let keys: Vec<Vec<u8>> = (0..10_000u64).map(|k| k.to_le_bytes().to_vec()).collect();
+    let foreign: Vec<Vec<u8>> = (10_000..20_000u64).map(|k| k.to_le_bytes().to_vec()).collect();
     let idx = IndexBuilder::new().build_index_ref(&keys).unwrap();
     let v3 = idx.to_bytes().unwrap();
     // v3: [tag][magic 4][version 2][hash 1][reserved 1][key_count 8][payload...][checksum 8]

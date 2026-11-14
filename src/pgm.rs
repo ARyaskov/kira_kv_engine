@@ -11,9 +11,9 @@
 //!   - **Optional Block-Bloom** fast-path for negative lookups (10–100× faster miss).
 //!   - **Auto-tune epsilon** via micro-benchmark on the actual key distribution.
 //!
-//! On-disk wire format is bumped to version=2; v1 indexes are no longer readable.
-//! That's an explicit trade-off — we accept format-break in exchange for a much
-//! cleaner SoA layout that's friendlier to mmap zero-copy (handled by `mmap_index`).
+//! Standalone serialization uses a checksummed container around the v4 payload.
+//! Legacy raw v2/v3/v4 payloads remain readable; embedded payloads keep their raw
+//! layout for compatibility with HybridIndex.
 
 use thiserror::Error;
 
@@ -410,7 +410,16 @@ impl PgmIndex {
         if segment_idx >= self.segments.max_keys.len() {
             return n;
         }
+        let segment_start = self.segments.starts[segment_idx] as usize;
+        let segment_end = self.segments.ends[segment_idx] as usize;
+        // No line is fitted over gaps between segments. The next segment's first
+        // position is the exact lower bound before (or at) its minimum key.
+        if target <= self.segments.min_keys[segment_idx] {
+            return segment_start;
+        }
         let (search_start, search_end) = self.scan_window(segment_idx, target, n);
+        let search_start = search_start.clamp(segment_start, segment_end);
+        let search_end = search_end.clamp(search_start, segment_end);
 
         if self.keys_ef.is_none() {
             let window = &self.keys[search_start..search_end];
@@ -434,12 +443,15 @@ impl PgmIndex {
         if let Some(local) = find_first_ge_simd(&buf, 0, buf.len(), target) {
             return search_start + local;
         }
-        n
+        search_end
     }
 
     /// Find first position where key > target.
     pub fn upper_bound(&self, target: u64) -> usize {
-        self.lower_bound(target.saturating_add(1))
+        match target.checked_add(1) {
+            Some(next) => self.lower_bound(next),
+            None => self.keys_count(),
+        }
     }
 
     /// Get statistics about the index.
@@ -478,18 +490,28 @@ impl PgmIndex {
         }
     }
 
-    /// Serialize to a self-contained byte vector (uses the same v2 wire format
-    /// as `write_to`).
+    /// Serialize into a self-contained, checksummed container with a v4 payload.
     pub fn to_bytes(&self) -> Result<Vec<u8>, PgmError> {
         let mut out = Vec::with_capacity(self.stats().memory_usage);
         self.write_to(&mut out);
-        Ok(out)
+        Ok(crate::wire::seal_tagged(crate::wire::PGM_CONTAINER_TAG, crate::wire::KIND_PGM, &out))
     }
 
-    /// Deserialize from a byte slice produced by [`PgmIndex::to_bytes`] / `write_to`.
+    /// Read a standalone checksummed container or a legacy raw v2/v3/v4 payload.
+    /// Trailing bytes are rejected; embedded payloads use the separate raw reader.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, PgmError> {
+        let body = if bytes.first() == Some(&crate::wire::PGM_CONTAINER_TAG) {
+            crate::wire::unseal_tagged(bytes, crate::wire::PGM_CONTAINER_TAG, crate::wire::KIND_PGM)
+                .ok_or(PgmError::CorruptData)?
+        } else {
+            bytes
+        };
         let mut pos = 0usize;
-        Self::read_from(bytes, &mut pos)
+        let index = Self::read_from(body, &mut pos)?;
+        if pos != body.len() {
+            return Err(PgmError::CorruptData);
+        }
+        Ok(index)
     }
 
     /// Wire format v4:
@@ -553,10 +575,12 @@ impl PgmIndex {
         }
         let epsilon = cur.read_u32().ok_or(PgmError::CorruptData)?;
         // Every count is capped by the bytes actually present before allocating.
-        let remaining = |cur: &Cursor<'_>| cur.buf.len() - cur.pos;
-        let key_count = cur.read_u64().ok_or(PgmError::CorruptData)? as usize;
+        let remaining = |cur: &Cursor<'_>| cur.buf.len().saturating_sub(cur.pos);
+        let key_count = usize::try_from(cur.read_u64().ok_or(PgmError::CorruptData)?)
+            .map_err(|_| PgmError::CorruptData)?;
         let stored = if ver >= PGM_FORMAT_V3 {
-            cur.read_u64().ok_or(PgmError::CorruptData)? as usize
+            usize::try_from(cur.read_u64().ok_or(PgmError::CorruptData)?)
+                .map_err(|_| PgmError::CorruptData)?
         } else {
             key_count
         };
@@ -564,18 +588,21 @@ impl PgmIndex {
             return Err(PgmError::CorruptData);
         }
         let keys: Vec<u64> = cur.read_le(stored)?;
-        let seg_len = cur.read_u64().ok_or(PgmError::CorruptData)? as usize;
-        if seg_len > remaining(&cur) / 41 {
+        let seg_len = usize::try_from(cur.read_u64().ok_or(PgmError::CorruptData)?)
+            .map_err(|_| PgmError::CorruptData)?;
+        // v4 removed one u64 filter per segment; retain the older payload bound
+        // for v2/v3 without rejecting compact multi-segment v4 indexes.
+        let segment_bytes = if ver < PGM_FORMAT_V4 { 41 } else { 33 };
+        if seg_len > remaining(&cur) / segment_bytes {
             return Err(PgmError::CorruptData);
         }
         let slopes: Vec<f32> = cur.read_le(seg_len)?;
         let intercepts: Vec<f32> = cur.read_le(seg_len)?;
         let min_keys: Vec<u64> = cur.read_le(seg_len)?;
         let max_keys: Vec<u64> = cur.read_le(seg_len)?;
-        let max_errors_u8 =
-            cur.buf.get(cur.pos..cur.pos + seg_len).ok_or(PgmError::CorruptData)?.to_vec();
-        cur.pos += seg_len;
-        let over_n = cur.read_u64().ok_or(PgmError::CorruptData)? as usize;
+        let max_errors_u8 = cur.read_bytes(seg_len).ok_or(PgmError::CorruptData)?.to_vec();
+        let over_n = usize::try_from(cur.read_u64().ok_or(PgmError::CorruptData)?)
+            .map_err(|_| PgmError::CorruptData)?;
         if over_n > remaining(&cur) / 8 {
             return Err(PgmError::CorruptData);
         }
@@ -592,6 +619,9 @@ impl PgmIndex {
         let starts: Vec<u32> = cur.read_le(seg_len)?;
         let ends: Vec<u32> = cur.read_le(seg_len)?;
         let has_bloom = cur.read_u8().ok_or(PgmError::CorruptData)?;
+        if has_bloom > 1 {
+            return Err(PgmError::CorruptData);
+        }
         *pos = cur.pos;
         let bloom = if has_bloom == 1 {
             let mut bp = *pos;
@@ -624,9 +654,9 @@ impl PgmIndex {
         Ok(idx)
     }
 
-    /// Structural invariants of a deserialized index: parallel segment arrays of one
-    /// length, keys sorted and unique, segment ranges inside the key array, key
-    /// bounds consistent with the ranges. Lookups index by these without checks.
+    /// Validate segment geometry and error metadata in linear time. When stored
+    /// keys are present, verify their bounds and the fitted line's error as well.
+    /// Locator-only payloads still carry complete, ordered segment geometry.
     pub(crate) fn validate(&self) -> bool {
         let s = &self.segments;
         let m = s.max_keys.len();
@@ -641,9 +671,9 @@ impl PgmIndex {
         }
         let n = self.keys_count();
         if n == 0 {
-            return m == 0;
+            return m == 0 && self.keys.is_empty() && s.overflow_errors.is_empty();
         }
-        if m == 0 {
+        if m == 0 || n > u32::MAX as usize {
             return false;
         }
         if !self.keys.is_empty() && self.keys.len() != n {
@@ -652,6 +682,12 @@ impl PgmIndex {
         if self.keys.windows(2).any(|w| w[0] >= w[1]) {
             return false;
         }
+        if s.overflow_errors.windows(2).any(|w| w[0].0 >= w[1].0)
+            || s.overflow_errors.iter().any(|&(si, _)| si as usize >= m)
+        {
+            return false;
+        }
+        let mut overflow = s.overflow_errors.iter().peekable();
         let mut prev_end = 0u32;
         for i in 0..m {
             let (st, en) = (s.starts[i], s.ends[i]);
@@ -661,20 +697,43 @@ impl PgmIndex {
             if s.min_keys[i] > s.max_keys[i] || (i > 0 && s.min_keys[i] <= s.max_keys[i - 1]) {
                 return false;
             }
-            if !s.slopes[i].is_finite() || !s.intercepts[i].is_finite() {
+            if !s.slopes[i].is_finite() || s.slopes[i] < 0.0 || !s.intercepts[i].is_finite() {
                 return false;
+            }
+            let max_error = if s.max_errors_u8[i] == 0xFF {
+                match overflow.next() {
+                    Some(&(segment, error)) if segment as usize == i && error >= 255 => error,
+                    _ => return false,
+                }
+            } else {
+                if overflow.peek().is_some_and(|&&(segment, _)| segment as usize == i) {
+                    return false;
+                }
+                s.max_errors_u8[i] as u32
+            };
+            if !self.keys.is_empty() {
+                let start = st as usize;
+                let end = en as usize;
+                if s.min_keys[i] != self.keys[start] || s.max_keys[i] != self.keys[end - 1] {
+                    return false;
+                }
+                let slope = s.slopes[i] as f64;
+                let intercept = s.intercepts[i] as f64;
+                for (local, &key) in self.keys[start..end].iter().enumerate() {
+                    let predicted = slope.mul_add(key as f64, intercept);
+                    if (predicted - (start + local) as f64).abs().ceil() > max_error as f64
+                        || self.bloom.as_ref().is_some_and(|bloom| !bloom.contains_u64(key))
+                    {
+                        return false;
+                    }
+                }
             }
             prev_end = en;
         }
         if prev_end as usize != n {
             return false;
         }
-        if s.overflow_errors.windows(2).any(|w| w[0].0 >= w[1].0)
-            || s.overflow_errors.iter().any(|&(si, _)| si as usize >= m)
-        {
-            return false;
-        }
-        true
+        overflow.next().is_none()
     }
 
     /// Convert `Vec<SegmentBuild>` (f64 working storage) into the SoA layout with
@@ -1212,31 +1271,20 @@ struct Cursor<'a> {
 }
 
 impl<'a> Cursor<'a> {
+    fn read_bytes(&mut self, len: usize) -> Option<&'a [u8]> {
+        let end = self.pos.checked_add(len)?;
+        let bytes = self.buf.get(self.pos..end)?;
+        self.pos = end;
+        Some(bytes)
+    }
     fn read_u8(&mut self) -> Option<u8> {
-        if self.pos + 1 > self.buf.len() {
-            return None;
-        }
-        let v = self.buf[self.pos];
-        self.pos += 1;
-        Some(v)
+        Some(self.read_bytes(1)?[0])
     }
     fn read_u32(&mut self) -> Option<u32> {
-        if self.pos + 4 > self.buf.len() {
-            return None;
-        }
-        let mut array = [0u8; 4];
-        array.copy_from_slice(&self.buf[self.pos..self.pos + 4]);
-        self.pos += 4;
-        Some(u32::from_le_bytes(array))
+        Some(u32::from_le_bytes(self.read_bytes(4)?.try_into().ok()?))
     }
     fn read_u64(&mut self) -> Option<u64> {
-        if self.pos + 8 > self.buf.len() {
-            return None;
-        }
-        let mut array = [0u8; 8];
-        array.copy_from_slice(&self.buf[self.pos..self.pos + 8]);
-        self.pos += 8;
-        Some(u64::from_le_bytes(array))
+        Some(u64::from_le_bytes(self.read_bytes(8)?.try_into().ok()?))
     }
     fn read_le<T: crate::wire::LeNum + Default>(
         &mut self,

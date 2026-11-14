@@ -256,6 +256,11 @@ Every engine has a self-contained byte form with a magic, a format version and a
 a corrupt or hostile file is rejected instead of being read out of bounds.
 Files are portable between x86_64, aarch64 and other targets.
 
+New builds use length-delimited hashing for short byte keys. Previously written
+Index, mmap and Hybrid files keep their original hash and lookup positions when
+loaded or saved again. Standalone PGM now uses a checksummed envelope; legacy raw
+PGM versions 2, 3 and 4 remain readable.
+
 ```rust
 // Index: streaming save/load, or in-memory bytes
 index.save("keys.idx")?;                       // streams, ~0.5 B/key transient

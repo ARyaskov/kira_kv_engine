@@ -143,11 +143,16 @@ impl DynamicIndex {
         Self::with_config(DynamicConfig::default())
     }
 
-    pub fn with_config(mut cfg: DynamicConfig) -> Self {
+    pub fn with_config(cfg: DynamicConfig) -> Self {
+        let capacity = cfg.flush_threshold.max(1);
+        Self::with_buffer_capacity(cfg, capacity)
+    }
+
+    fn with_buffer_capacity(mut cfg: DynamicConfig, capacity: usize) -> Self {
         cfg.flush_threshold = cfg.flush_threshold.max(1);
         cfg.max_tiers = cfg.max_tiers.max(1);
         Self {
-            buffer: HashMap::with_capacity(cfg.flush_threshold),
+            buffer: HashMap::with_capacity(capacity),
             tombstones: HashSet::new(),
             tiers: Vec::new(),
             pending: None,
@@ -529,8 +534,9 @@ impl DynamicIndex {
         let bad = || IndexError::CorruptData;
         let mut pos = 0usize;
         let rd = |pos: &mut usize, n: usize| -> Result<&[u8], IndexError> {
-            let v = body.get(*pos..*pos + n).ok_or(IndexError::CorruptData)?;
-            *pos += n;
+            let end = pos.checked_add(n).ok_or(IndexError::CorruptData)?;
+            let v = body.get(*pos..end).ok_or(IndexError::CorruptData)?;
+            *pos = end;
             Ok(v)
         };
         let u64_at = |v: &[u8]| u64::from_le_bytes(v.try_into().unwrap());
@@ -545,11 +551,12 @@ impl DynamicIndex {
         }
         let mut entries: Vec<(&[u8], StableId)> = Vec::with_capacity(live);
         let mut seen: HashSet<&[u8]> = HashSet::with_capacity(live);
+        let mut seen_ids: HashSet<StableId> = HashSet::with_capacity(live);
         for _ in 0..live {
             let len = u32::from_le_bytes(rd(&mut pos, 4)?.try_into().unwrap()) as usize;
             let key = rd(&mut pos, len)?;
             let id = u32::from_le_bytes(rd(&mut pos, 4)?.try_into().unwrap());
-            if id >= next_id || !seen.insert(key) {
+            if id >= next_id || !seen.insert(key) || !seen_ids.insert(id) {
                 return Err(bad());
             }
             entries.push((key, id));
@@ -557,12 +564,13 @@ impl DynamicIndex {
         if pos != body.len() {
             return Err(bad());
         }
-        let mut idx = Self::with_config(DynamicConfig {
-            flush_threshold,
-            max_tiers,
-            lean_tiers,
-            parallel_build,
-        });
+        // The serialized threshold controls future flushes, not the amount of
+        // memory needed to restore a compacted index. Grow the empty buffer on
+        // actual inserts instead of reserving an attacker-controlled capacity.
+        let mut idx = Self::with_buffer_capacity(
+            DynamicConfig { flush_threshold, max_tiers, lean_tiers, parallel_build },
+            0,
+        );
         idx.next_id = next_id;
         idx.live = live;
         if !entries.is_empty() {

@@ -61,6 +61,7 @@
 use thiserror::Error;
 
 use crate::block_bloom::BlockBloom;
+use crate::canonical_hash::CanonicalHashVersion;
 use crate::pgm::{PgmBuilder, PgmIndex};
 use crate::prefetch::prefetch_read;
 use crate::ptrhash25::{
@@ -86,6 +87,7 @@ pub struct HybridIndex {
     seg_offsets: Vec<u32>,
     /// Seed used for `canonical_hash` — must match build-time on lookup.
     seed: u64,
+    hash_version: CanonicalHashVersion,
     /// Global negative-lookup short-circuit. `None` in lean mode.
     bloom: Option<BlockBloom>,
     /// Number of input keys.
@@ -468,7 +470,15 @@ impl HybridBuilder {
             Some(BlockBloom::build_from_u64(&sorted_hashes, self.seed ^ 0xBB00_BB00_BB00_BB00))
         };
 
-        Ok(HybridIndex { pgm, segments, seg_offsets, seed: self.seed, bloom, n })
+        Ok(HybridIndex {
+            pgm,
+            segments,
+            seg_offsets,
+            seed: self.seed,
+            hash_version: CanonicalHashVersion::Current,
+            bloom,
+            n,
+        })
     }
 }
 
@@ -500,6 +510,7 @@ impl HybridIndex {
             segments: Vec::new(),
             seg_offsets: vec![0],
             seed,
+            hash_version: CanonicalHashVersion::Current,
             bloom: None,
             n: 0,
         }
@@ -545,14 +556,23 @@ impl HybridIndex {
                 }
             }
         }
-        crate::wire::seal(crate::wire::KIND_HYBRID, &body)
+        let kind = match self.hash_version {
+            CanonicalHashVersion::Legacy => crate::wire::KIND_HYBRID,
+            CanonicalHashVersion::Current => crate::wire::KIND_HYBRID_V2,
+        };
+        crate::wire::seal(kind, &body)
     }
 
     /// Deserialize [`HybridIndex::to_bytes`] output. Checksum and every structural
     /// invariant are verified; corrupt input is rejected, never read out of bounds.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, HybridError> {
-        let body =
-            crate::wire::unseal(bytes, crate::wire::KIND_HYBRID).ok_or(HybridError::CorruptData)?;
+        let kind = *bytes.get(7).ok_or(HybridError::CorruptData)?;
+        let hash_version = match kind {
+            crate::wire::KIND_HYBRID => CanonicalHashVersion::Legacy,
+            crate::wire::KIND_HYBRID_V2 => CanonicalHashVersion::Current,
+            _ => return Err(HybridError::CorruptData),
+        };
+        let body = crate::wire::unseal(bytes, kind).ok_or(HybridError::CorruptData)?;
         let bad = || HybridError::CorruptData;
         let mut pos = 0usize;
         let rd_u64 = |pos: &mut usize| -> Result<u64, HybridError> {
@@ -652,13 +672,13 @@ impl HybridIndex {
         if pos != body.len() {
             return Err(bad());
         }
-        Ok(HybridIndex { pgm, segments, seg_offsets, seed, bloom, n })
+        Ok(HybridIndex { pgm, segments, seg_offsets, seed, hash_version, bloom, n })
     }
 
     /// Look up `key`. Returns `Some(original_position)` on hit, `None` on miss.
     #[inline]
     pub fn lookup(&self, key: &[u8]) -> Option<u32> {
-        let hash = crate::canonical_hash::canonical_hash_bytes(key, self.seed);
+        let hash = self.hash_version.hash(key, self.seed);
         self.lookup_hash(hash)
     }
 

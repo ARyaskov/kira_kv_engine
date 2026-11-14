@@ -42,21 +42,32 @@ le_num!(f64, 8);
 le_num!(u128, 16);
 
 /// Shared self-describing container for every engine's `to_bytes` form:
-/// `[TAG=4][magic "KIRA"][format u16][kind u8][reserved u8][body][checksum u64]`.
+/// `[tag][magic "KIRA"][format u16][kind u8][reserved u8][body][checksum u64]`.
+/// Tag 4 is shared by hash indexes; standalone PGM uses tag 5 to distinguish
+/// its envelope from legacy raw PGM version 4.
 /// `kind` identifies the engine (and, for `Index`, its canonical hash).
 pub const CONTAINER_TAG: u8 = 4;
+/// Separate from every legacy raw PGM version, including version 4.
+pub const PGM_CONTAINER_TAG: u8 = 5;
 pub const CONTAINER_MAGIC: &[u8; 4] = b"KIRA";
 pub const CONTAINER_FORMAT: u16 = 1;
 pub const KIND_INDEX: u8 = 1;
 pub const KIND_HYBRID: u8 = 2;
 pub const KIND_PGM_U128: u8 = 3;
 pub const KIND_DYNAMIC: u8 = 4;
+pub const KIND_PGM: u8 = 5;
+pub const KIND_INDEX_V2: u8 = 6;
+pub const KIND_HYBRID_V2: u8 = 7;
 pub const HEADER_LEN: usize = 9;
 
 /// Wrap `body` into the sealed container of the given `kind`.
 pub fn seal(kind: u8, body: &[u8]) -> Vec<u8> {
+    seal_tagged(CONTAINER_TAG, kind, body)
+}
+
+pub fn seal_tagged(tag: u8, kind: u8, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(HEADER_LEN + body.len() + 8);
-    out.push(CONTAINER_TAG);
+    out.push(tag);
     out.extend_from_slice(CONTAINER_MAGIC);
     out.extend_from_slice(&CONTAINER_FORMAT.to_le_bytes());
     out.push(kind);
@@ -69,6 +80,10 @@ pub fn seal(kind: u8, body: &[u8]) -> Vec<u8> {
 
 /// Verify header, kind and checksum; return the body.
 pub fn unseal(bytes: &[u8], kind: u8) -> Option<&[u8]> {
+    unseal_tagged(bytes, CONTAINER_TAG, kind)
+}
+
+pub fn unseal_tagged(bytes: &[u8], tag: u8, kind: u8) -> Option<&[u8]> {
     if bytes.len() < HEADER_LEN + 8 {
         return None;
     }
@@ -77,7 +92,7 @@ pub fn unseal(bytes: &[u8], kind: u8) -> Option<&[u8]> {
     if crate::checksum::checksum(data) != stored {
         return None;
     }
-    if data[0] != CONTAINER_TAG || &data[1..5] != CONTAINER_MAGIC {
+    if data[0] != tag || &data[1..5] != CONTAINER_MAGIC {
         return None;
     }
     if u16::from_le_bytes([data[5], data[6]]) != CONTAINER_FORMAT || data[7] != kind {
@@ -103,12 +118,17 @@ pub fn extend_le<T: LeNum>(out: &mut Vec<u8>, v: &[T]) {
     }
     #[cfg(not(target_endian = "little"))]
     {
-        out.reserve(v.len() * T::SIZE);
-        let mut buf = [0u8; 8];
-        for &x in v {
-            x.write_le(&mut buf);
-            out.extend_from_slice(&buf[..T::SIZE]);
-        }
+        extend_converted_le(out, v);
+    }
+}
+
+#[cfg(any(test, not(target_endian = "little")))]
+fn extend_converted_le<T: LeNum>(out: &mut Vec<u8>, v: &[T]) {
+    out.reserve(v.len() * T::SIZE);
+    let mut buf = [0u8; 16];
+    for &x in v {
+        x.write_le(&mut buf);
+        out.extend_from_slice(&buf[..T::SIZE]);
     }
 }
 
@@ -192,5 +212,17 @@ impl<W: Write> Write for ChecksumWriter<W> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn converted_u128_encoding_uses_all_sixteen_bytes() {
+        let values = [u128::from_le_bytes(core::array::from_fn(|i| i as u8)), u128::MAX];
+        let mut bytes = Vec::new();
+        super::extend_converted_le(&mut bytes, &values);
+        assert_eq!(&bytes[..16], &(0u8..16).collect::<Vec<_>>());
+        assert_eq!(&bytes[16..], &[255; 16]);
     }
 }

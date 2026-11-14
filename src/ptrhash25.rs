@@ -1370,39 +1370,34 @@ pub fn write_ptrhash25(mph: &PtrHash25Mphf, out: &mut Vec<u8>) {
 }
 
 pub fn read_ptrhash25(buf: &[u8], pos: &mut usize) -> Option<PtrHash25Mphf> {
+    fn rd_bytes<'a>(buf: &'a [u8], pos: &mut usize, len: usize) -> Option<&'a [u8]> {
+        let end = pos.checked_add(len)?;
+        let bytes = buf.get(*pos..end)?;
+        *pos = end;
+        Some(bytes)
+    }
     fn rd_u32(buf: &[u8], pos: &mut usize) -> Option<u32> {
-        if *pos + 4 > buf.len() {
-            return None;
-        }
-        let mut a = [0u8; 4];
-        a.copy_from_slice(&buf[*pos..*pos + 4]);
-        *pos += 4;
-        Some(u32::from_le_bytes(a))
+        Some(u32::from_le_bytes(rd_bytes(buf, pos, 4)?.try_into().ok()?))
     }
     fn rd_u64(buf: &[u8], pos: &mut usize) -> Option<u64> {
-        if *pos + 8 > buf.len() {
-            return None;
-        }
-        let mut a = [0u8; 8];
-        a.copy_from_slice(&buf[*pos..*pos + 8]);
-        *pos += 8;
-        Some(u64::from_le_bytes(a))
+        Some(u64::from_le_bytes(rd_bytes(buf, pos, 8)?.try_into().ok()?))
     }
     let n = rd_u64(buf, pos)?;
+    if n == 0 || n > u32::MAX as u64 {
+        return None;
+    }
     let num_buckets = rd_u32(buf, pos)?;
     let salt = rd_u64(buf, pos)?;
-    let plen = rd_u64(buf, pos)? as usize;
-    if *pos + plen > buf.len() {
+    let plen = usize::try_from(rd_u64(buf, pos)?).ok()?;
+    if plen != num_buckets as usize {
         return None;
     }
-    let pilots = crate::hugepage::HugeVec::from_slice(&buf[*pos..*pos + plen]);
-    *pos += plen;
-    let flen = rd_u64(buf, pos)? as usize;
-    if *pos + flen > buf.len() {
+    let pilots = crate::hugepage::HugeVec::from_slice(rd_bytes(buf, pos, plen)?);
+    let flen = usize::try_from(rd_u64(buf, pos)?).ok()?;
+    if flen != 0 && flen as u64 != n {
         return None;
     }
-    let fingerprints = buf[*pos..*pos + flen].to_vec();
-    *pos += flen;
+    let fingerprints = rd_bytes(buf, pos, flen)?.to_vec();
     // Trailing flags (v0.4+/v0.5). Older indexes lack them → default to 0.
     let use_aes_hash = if *pos < buf.len() {
         let v = buf[*pos] != 0;
@@ -1422,10 +1417,10 @@ pub fn read_ptrhash25(buf: &[u8], pos: &mut usize) -> Option<PtrHash25Mphf> {
     let (part_salt, parts, remap) = if rot_byte & FLAG_V3_GEOMETRY != 0 {
         let part_salt = rd_u64(buf, pos)?;
         let count = rd_u32(buf, pos)? as usize;
-        if count == 0 {
+        if count == 0 || count > buf.len().checked_sub(*pos)? / 36 {
             return None;
         }
-        let mut parts = Vec::with_capacity(count.min(buf.len() / 40));
+        let mut parts = Vec::with_capacity(count);
         for _ in 0..count {
             let slot_off = rd_u64(buf, pos)?;
             let psalt = rd_u64(buf, pos)?;
@@ -1441,16 +1436,16 @@ pub fn read_ptrhash25(buf: &[u8], pos: &mut usize) -> Option<PtrHash25Mphf> {
                 slot_off, psalt, bucket_off, num_keys, num_slots, nb, remap_off,
             ));
         }
-        let remap_len = rd_u64(buf, pos)? as usize;
+        let remap_len = usize::try_from(rd_u64(buf, pos)?).ok()?;
         let remap: Vec<u32> = crate::wire::read_le_at(buf, pos, remap_len)?;
         (part_salt, parts, remap)
     } else if rot_byte & FLAG_LEGACY_MULTI != 0 {
         let part_salt = rd_u64(buf, pos)?;
         let count = rd_u32(buf, pos)? as usize;
-        if count == 0 {
+        if count == 0 || count > buf.len().checked_sub(*pos)? / 28 {
             return None;
         }
-        let mut parts = Vec::with_capacity(count.min(buf.len() / 28));
+        let mut parts = Vec::with_capacity(count);
         for _ in 0..count {
             let slot_off = rd_u64(buf, pos)?;
             let psalt = rd_u64(buf, pos)?;
@@ -1500,6 +1495,9 @@ impl PtrHash25Mphf {
             return false;
         }
         let remap_len = self.remap.len() as u64;
+        let mut slot_end = 0u64;
+        let mut bucket_end = 0u64;
+        let mut remap_end = 0u64;
         for p in self.parts.iter() {
             if p.num_slots < p.num_keys || p.num_slots == 0 || p.num_buckets == 0 {
                 return false;
@@ -1507,18 +1505,38 @@ impl PtrHash25Mphf {
             if p.large_buckets >= p.num_buckets {
                 return false;
             }
-            if p.bucket_off as u64 + p.num_buckets as u64 > pilots {
+            // Writers concatenate each part's tables. Enforcing that geometry
+            // rejects overlap before scanning remap entries, keeping validation
+            // linear in the number of parts plus the table sizes.
+            if p.bucket_off as u64 != bucket_end {
+                return false;
+            }
+            bucket_end += p.num_buckets as u64;
+            if bucket_end > pilots {
                 return false;
             }
             // Every reachable output position must be < n: the keys' own range and,
             // through the remap, the tail.
-            if p.slot_off >= n
-                || p.slot_off.checked_add(p.num_keys as u64).is_none_or(|end| end > n)
-            {
-                return false;
+            if p.num_keys == 0 {
+                // Empty parts redirect foreign queries to the valid slot zero.
+                if p.slot_off != 0 {
+                    return false;
+                }
+            } else {
+                if p.slot_off != slot_end {
+                    return false;
+                }
+                slot_end += p.num_keys as u64;
+                if slot_end > n {
+                    return false;
+                }
             }
             let tail = (p.num_slots - p.num_keys) as u64;
-            if p.remap_off as u64 + tail > remap_len {
+            if p.remap_off as u64 != remap_end {
+                return false;
+            }
+            remap_end += tail;
+            if remap_end > remap_len {
                 return false;
             }
             let lo = p.remap_off as usize;
@@ -1528,6 +1546,6 @@ impl PtrHash25Mphf {
                 return false;
             }
         }
-        true
+        slot_end == n && bucket_end == pilots && remap_end == remap_len
     }
 }

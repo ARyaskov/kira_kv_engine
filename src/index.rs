@@ -1,4 +1,5 @@
 use crate::block_bloom::BlockBloom;
+use crate::canonical_hash::CanonicalHashVersion;
 use crate::fingerprints::{FingerprintBits, Fingerprints};
 #[allow(deprecated)]
 use crate::mph_backend::{
@@ -14,6 +15,7 @@ use crate::prefetch::prefetch_read;
 struct MphEngine {
     backend: BackendDispatch,
     prehash_seed: u64,
+    hash_version: CanonicalHashVersion,
     /// Membership filter on the lookup hot path. Block-Bloom touches exactly one
     /// 64-byte cache line per query, vs three random byte loads for Xor8.
     ///
@@ -464,7 +466,7 @@ impl Index {
         use crate::mph_backend::BackendDispatch;
         let BackendDispatch::PtrHash25(_) = &engine.backend;
         // Hash key with same canonical path the index was built against.
-        let canonical = canonical_hash_key(&key.to_le_bytes(), engine.prehash_seed);
+        let canonical = engine.hash_version.hash(&key.to_le_bytes(), engine.prehash_seed);
         if let Some(bf) = &engine.filter
             && !bf.contains_hash(canonical)
         {
@@ -526,7 +528,7 @@ impl Index {
         let Some(engine) = self.engine.as_ref() else {
             return false;
         };
-        let canonical = canonical_hash_key(key, engine.prehash_seed);
+        let canonical = engine.hash_version.hash(key, engine.prehash_seed);
         match &engine.filter {
             Some(bf) => bf.contains_hash(canonical),
             // Without Bloom, use the fingerprints. Lean lookups cannot fail.
@@ -552,7 +554,7 @@ impl Index {
         };
         keys.iter()
             .map(|&key| {
-                let canonical = canonical_hash_key(key, engine.prehash_seed);
+                let canonical = engine.hash_version.hash(key, engine.prehash_seed);
                 match &engine.filter {
                     Some(bf) => bf.contains_hash(canonical),
                     None => self.lookup_mph(engine, key).is_ok(),
@@ -612,7 +614,7 @@ impl Index {
         let mut hashes = [0u64; 64];
         for (input, result) in keys.chunks(64).zip(out.chunks_mut(64)) {
             for (h, key) in hashes.iter_mut().zip(input) {
-                *h = canonical_hash_key(key, engine.prehash_seed);
+                *h = engine.hash_version.hash(key, engine.prehash_seed);
             }
             Self::lookup_canonical_batch(engine, &hashes[..input.len()], result);
         }
@@ -775,6 +777,7 @@ impl Index {
                     m.part_salt,
                     bseed,
                     bshift,
+                    e.hash_version as u64,
                 ];
                 let mut meta = Vec::new();
                 crate::wire::extend_le(&mut meta, &fields);
@@ -864,11 +867,17 @@ impl Index {
             if header.version != 2 {
                 return Err(bad());
             }
-            if meta.len() != 80 {
+            if meta.len() != 80 && meta.len() != 88 {
                 return Err(bad());
             }
             let f: Vec<u64> =
                 meta.as_chunks::<8>().0.iter().map(|b| u64::from_le_bytes(*b)).collect();
+            let hash_version = if f.len() == 10 {
+                CanonicalHashVersion::Legacy
+            } else {
+                CanonicalHashVersion::from_id(u8::try_from(f[10]).map_err(|_| bad())?)
+                    .ok_or_else(bad)?
+            };
             if FingerprintBits::from_bits(f[0]).is_none() || f[5] > 1 || f[6] >= 64 {
                 return Err(bad());
             }
@@ -946,6 +955,7 @@ impl Index {
                         storage: crate::mph_backend::PtrHash25Storage::Mph(m),
                     }),
                     prehash_seed: f[1],
+                    hash_version,
                     filter,
                     fingerprints,
                 }),
@@ -984,7 +994,9 @@ impl Index {
         write_u8(&mut head, TAG_V3);
         head.extend_from_slice(FORMAT_MAGIC);
         write_u16(&mut head, FORMAT_VERSION);
-        write_u8(&mut head, HASH_ID_CANONICAL);
+        let hash_version =
+            self.engine.as_ref().map_or(CanonicalHashVersion::Current, |e| e.hash_version);
+        write_u8(&mut head, hash_version as u8);
         write_u8(&mut head, 0);
         write_u64(&mut head, self.key_count as u64);
         w.write_all(&head)?;
@@ -1039,7 +1051,8 @@ impl Index {
         if tag == TAG_V3 {
             return Self::from_bytes_v3(bytes);
         }
-        let key_count = cursor.read_u64().ok_or(IndexError::CorruptData)? as usize;
+        let key_count = usize::try_from(cursor.read_u64().ok_or(IndexError::CorruptData)?)
+            .map_err(|_| IndexError::CorruptData)?;
         match tag {
             0 => {
                 // Legacy MPH v1: always-present filter + fingerprints.
@@ -1057,6 +1070,7 @@ impl Index {
                     engine: Some(MphEngine {
                         backend,
                         prehash_seed,
+                        hash_version: CanonicalHashVersion::Legacy,
                         filter: Some(filter),
                         fingerprints: Some(fingerprints),
                     }),
@@ -1084,7 +1098,13 @@ impl Index {
                 let fingerprints =
                     if has_fp == 1 { Some(read_fingerprints(&mut cursor, 1)?) } else { None };
                 Ok(Index {
-                    engine: Some(MphEngine { backend, prehash_seed, filter, fingerprints }),
+                    engine: Some(MphEngine {
+                        backend,
+                        prehash_seed,
+                        hash_version: CanonicalHashVersion::Legacy,
+                        filter,
+                        fingerprints,
+                    }),
                     key_count,
                 })
             }
@@ -1122,11 +1142,10 @@ impl Index {
             return Err(IndexError::CorruptData);
         }
         let hash_id = cursor.read_u8().ok_or(IndexError::CorruptData)?;
-        if hash_id != HASH_ID_CANONICAL {
-            return Err(IndexError::CorruptData);
-        }
+        let hash_version = CanonicalHashVersion::from_id(hash_id).ok_or(IndexError::CorruptData)?;
         let _reserved = cursor.read_u8().ok_or(IndexError::CorruptData)?;
-        let key_count = cursor.read_u64().ok_or(IndexError::CorruptData)? as usize;
+        let key_count = usize::try_from(cursor.read_u64().ok_or(IndexError::CorruptData)?)
+            .map_err(|_| IndexError::CorruptData)?;
         if cursor.pos == body.len() {
             return if key_count == 0 { Ok(Index::empty()) } else { Err(IndexError::CorruptData) };
         }
@@ -1155,7 +1174,7 @@ impl Index {
             return Err(IndexError::CorruptData);
         }
         let idx = Index {
-            engine: Some(MphEngine { backend, prehash_seed, filter, fingerprints }),
+            engine: Some(MphEngine { backend, prehash_seed, hash_version, filter, fingerprints }),
             key_count,
         };
         if idx.validate() { Ok(idx) } else { Err(IndexError::CorruptData) }
@@ -1188,7 +1207,7 @@ impl Index {
 
     #[inline(always)]
     fn lookup_mph(&self, engine: &MphEngine, key: &[u8]) -> Result<usize, IndexError> {
-        let canonical = canonical_hash_key(key, engine.prehash_seed);
+        let canonical = engine.hash_version.hash(key, engine.prehash_seed);
         // Optional Bloom prefilter (skipped in lean_mph mode).
         if let Some(bf) = &engine.filter
             && !bf.contains_hash(canonical)
@@ -1229,16 +1248,8 @@ fn make_backend_cfg(config: &IndexConfig) -> BackendConfig {
 const TAG_V3: u8 = 4;
 const FORMAT_MAGIC: &[u8; 4] = b"KIRA";
 const FORMAT_VERSION: u16 = 1;
-/// Identifier of the canonical key hash: mix64 for 8-byte keys, AES-round hash for
-/// everything else (see `canonical_hash`). A different id means the file was built
-/// with a hash this version cannot reproduce.
-const HASH_ID_CANONICAL: u8 = crate::wire::KIND_INDEX;
-
-/// Number of canonical-hash seeds tried before concluding that two input keys are
-/// byte-identical. Equal canonical hashes are detected exactly by the MPH build (equal
-/// keys can never be separated by any pilot). A pair of *distinct* keys colliding on the
-/// 64-bit canonical hash under two independent seeds has probability ~(n²/2⁶⁵)², which is
-/// negligible at any practical `n`, so "collides under a second seed" ⇒ duplicate.
+/// Number of canonical-hash seeds tried for distinct keys with colliding hashes.
+/// Only an exact byte comparison may report a duplicate key.
 const MAX_PREHASH_ROUNDS: u32 = 4;
 
 /// Run `f` on the persistent build pool (P-core pinned on hybrid CPUs) so every rayon
@@ -1302,9 +1313,15 @@ where
         ) {
             Ok(v) => v,
             Err(MphError::DuplicateKey) => {
+                if round == 0 {
+                    let mut unique = std::collections::HashSet::with_capacity(n);
+                    if keys.iter().any(|key| !unique.insert(key.as_ref())) {
+                        return Err(IndexError::DuplicateKey);
+                    }
+                }
                 round += 1;
                 if round >= MAX_PREHASH_ROUNDS {
-                    return Err(IndexError::DuplicateKey);
+                    return Err(IndexError::Unresolvable);
                 }
                 continue;
             }
@@ -1345,6 +1362,7 @@ where
         return Ok(MphEngine {
             backend: BackendDispatch::PtrHash25(backend),
             prehash_seed,
+            hash_version: CanonicalHashVersion::Current,
             filter,
             fingerprints,
         });

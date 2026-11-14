@@ -189,7 +189,7 @@ impl PgmIndexU128 {
         let pred = predict_pos_u128(&self.segments, seg, key);
         let err = self.segments.get_max_error(seg) as usize;
         let s = pred.saturating_sub(err).min(self.keys.len());
-        let e = (pred + err + 1).min(self.keys.len()).max(s);
+        let e = pred.saturating_add(err).saturating_add(1).min(self.keys.len()).max(s);
         // Sorted window: bisect it (branchless). 16-byte keys make a linear scan
         // of 2ε+1 entries several cache lines of work; 7 dependent loads are not.
         let w = &self.keys[s..e];
@@ -223,16 +223,21 @@ impl PgmIndexU128 {
         if seg >= self.segments.max_keys.len() {
             return self.keys.len();
         }
+        if target <= self.segments.min_keys[seg] {
+            return self.segments.starts[seg] as usize;
+        }
         let pred = predict_pos_u128(&self.segments, seg, target);
         let err = self.segments.get_max_error(seg) as usize;
-        let s = pred.saturating_sub(err).min(self.keys.len());
-        let e = (pred + err + 1).min(self.keys.len()).max(s);
+        let s =
+            pred.saturating_sub(err).max(self.segments.starts[seg] as usize).min(self.keys.len());
+        let e =
+            pred.saturating_add(err).saturating_add(1).min(self.segments.ends[seg] as usize).max(s);
         let p = self.keys[s..e].partition_point(|&k| k < target);
         if p < e - s { s + p } else { e }
     }
 
     pub fn upper_bound(&self, target: u128) -> usize {
-        self.lower_bound(target.saturating_add(1))
+        if target == u128::MAX { self.keys.len() } else { self.lower_bound(target + 1) }
     }
 
     pub fn len(&self) -> usize {
@@ -293,8 +298,9 @@ impl PgmIndexU128 {
         let bad = || PgmU128Error::CorruptData;
         let mut pos = 0usize;
         let rd_u64 = |pos: &mut usize| -> Result<usize, PgmU128Error> {
-            let v = body.get(*pos..*pos + 8).ok_or(PgmU128Error::CorruptData)?;
-            *pos += 8;
+            let end = pos.checked_add(8).ok_or(PgmU128Error::CorruptData)?;
+            let v = body.get(*pos..end).ok_or(PgmU128Error::CorruptData)?;
+            *pos = end;
             usize::try_from(u64::from_le_bytes(v.try_into().unwrap()))
                 .map_err(|_| PgmU128Error::CorruptData)
         };
@@ -351,12 +357,13 @@ impl PgmIndexU128 {
         let n = self.keys.len();
         let m = s.len();
         if n == 0 {
-            return m == 0;
+            return m == 0 && s.overflow_errors.is_empty();
         }
         if m == 0 || n > u32::MAX as usize || self.keys.windows(2).any(|w| w[0] >= w[1]) {
             return false;
         }
         let mut prev_end = 0u32;
+        let mut overflow = s.overflow_errors.iter().peekable();
         for i in 0..m {
             if s.starts[i] != prev_end || s.ends[i] <= s.starts[i] || s.ends[i] as usize > n {
                 return false;
@@ -365,14 +372,30 @@ impl PgmIndexU128 {
                 || s.min_keys[i] != self.keys[s.starts[i] as usize]
                 || s.max_keys[i] != self.keys[s.ends[i] as usize - 1]
                 || !s.slopes[i].is_finite()
+                || s.slopes[i] < 0.0
             {
                 return false;
             }
+            let error = if s.max_errors_u8[i] == 0xFF {
+                match overflow.next() {
+                    Some(&(segment, error)) if segment as usize == i && error >= 255 => error,
+                    _ => return false,
+                }
+            } else {
+                if overflow.peek().is_some_and(|&&(segment, _)| segment as usize <= i) {
+                    return false;
+                }
+                s.max_errors_u8[i] as u32
+            };
+            for pos in s.starts[i] as usize..s.ends[i] as usize {
+                let prediction = predict_pos_u128(s, i, self.keys[pos]);
+                if prediction.abs_diff(pos) > error as usize {
+                    return false;
+                }
+            }
             prev_end = s.ends[i];
         }
-        prev_end as usize == n
-            && s.overflow_errors.windows(2).all(|w| w[0].0 < w[1].0)
-            && s.overflow_errors.iter().all(|&(si, _)| (si as usize) < m)
+        prev_end as usize == n && overflow.next().is_none()
     }
 }
 

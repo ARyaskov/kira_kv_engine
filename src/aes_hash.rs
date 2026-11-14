@@ -145,6 +145,21 @@ pub fn hash_bytes(key: &[u8], seed: u64) -> u64 {
     unsafe { hash_bytes_impl::<SoftAes>(key, seed) }
 }
 
+/// Length-delimited short-key hash used by newly built indexes. The marker is
+/// above every payload bit, so distinct lengths cannot erase payload differences.
+/// The legacy function remains available for indexes written before hash v2.
+#[inline]
+pub fn hash_bytes_v2(key: &[u8], seed: u64) -> u64 {
+    if (1..8).contains(&key.len()) {
+        let mut payload = [0u8; 8];
+        payload[..key.len()].copy_from_slice(key);
+        let encoded = u64::from_le_bytes(payload) | (1u64 << (8 * key.len()));
+        hash_u64(encoded, seed)
+    } else {
+        hash_bytes(key, seed)
+    }
+}
+
 /// Hash a single u64 with two AES rounds. Same value on every platform.
 #[inline]
 pub fn hash_u64(key: u64, seed: u64) -> u64 {

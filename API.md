@@ -262,7 +262,7 @@ impl PgmIndex {
     pub fn compact_keys(&mut self) -> isize;
 
     pub fn stats(&self) -> PgmStats;
-    pub fn to_bytes(&self) -> Result<Vec<u8>, PgmError>;      // format v3; v2 files load
+    pub fn to_bytes(&self) -> Result<Vec<u8>, PgmError>;      // checksummed; raw v2/v3/v4 files load
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, PgmError>;
 }
 
@@ -497,12 +497,21 @@ pub struct BloomExport {
 
 ## Serialized formats
 
-Every `to_bytes` form is `[4]["KIRA"][format u16][kind u8][0][body][checksum u64]`
-with `kind` 1 = `Index`, 2 = `HybridIndex`, 3 = `PgmIndexU128`, 4 =
-`DynamicIndex`; `PgmIndex` keeps its own versioned layout. Loading verifies the
-checksum, then every structural invariant (array lengths, offsets, remap targets,
-sortedness) before any unchecked lookup can run. Legacy `Index` tags 0/2/3 and
-PGM format v2 still load, without a checksum.
+The checksummed container is `[tag]["KIRA"][format u16][kind u8][0][body][checksum u64]`.
+New `Index` and `HybridIndex` builds use tag 4 and kinds 6 and 7 respectively;
+legacy kinds 1 and 2 retain their original byte-key hash when loaded or saved
+again. Kinds 3 and 4 identify `PgmIndexU128` and `DynamicIndex`.
+Standalone `PgmIndex` uses tag 5 and kind 5 around its raw v4 payload, avoiding
+ambiguity with legacy raw PGM versions 2/3/4, which remain readable. Its embedded
+layout inside Hybrid is unchanged. Legacy `Index` tags 0/2/3 also remain readable.
+Legacy raw formats have no checksum; new containers verify the checksum before
+validating lengths, contiguous part geometry, remap targets and sortedness.
+Stored PGM keys additionally verify segment bounds, model errors and Bloom
+containment. Dynamic loads reject repeated stable IDs and allocate their write
+buffer on demand rather than reserving the persisted flush threshold.
+
+New aligned mmap metadata includes the canonical hash version (88 bytes);
+the previous 80-byte metadata remains readable with the legacy hash.
 
 ---
 
