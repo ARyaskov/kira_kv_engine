@@ -109,3 +109,15 @@ fn empty_and_tiny_hybrid_queries_roundtrip_without_routing_state() {
         }
     }
 }
+
+#[test]
+fn bloom_first_batch_preserves_hits_and_misses_across_windows() {
+    let keys: Vec<_> = (0..4096u64).collect();
+    let index = HybridBuilder::new().with_parallel(false).build_from_u64(&keys).unwrap();
+    let queries: Vec<_> = (0..69).map(|i| if i % 19 == 0 { i } else { i + 4096 }).collect();
+    let expected: Vec<_> = queries.iter().map(|&key| (key < 4096).then_some(key as u32)).collect();
+    let mut hashes = vec![0; queries.len()];
+    hash_u64_scalar(&queries, index.seed(), &mut hashes);
+    assert_eq!(index.lookup_batch_hashes(&hashes), expected);
+    assert_eq!(index.lookup_batch_u64_simd(&queries), expected);
+}

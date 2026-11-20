@@ -857,38 +857,71 @@ impl HybridIndex {
     pub fn lookup_batch_u64_simd_into(&self, keys: &[u64], out: &mut [Option<u32>]) {
         assert!(out.len() >= keys.len(), "out slice too small");
         let mut hashes = [0; 32];
+        let mut bloom_first = false;
         for (keys, out) in keys.chunks(32).zip(out[..keys.len()].chunks_mut(32)) {
             let hashes = &mut hashes[..keys.len()];
             crate::simd_hash::hash_u64(keys, self.seed, hashes);
-            self.lookup_hash_chunk(hashes, out);
+            self.lookup_hash_chunk(hashes, out, &mut bloom_first);
         }
     }
 
     /// Batch lookup taking pre-computed canonical hashes in query order.
     pub fn lookup_batch_hashes(&self, hashes: &[u64]) -> Vec<Option<u32>> {
         let mut out = vec![None; hashes.len()];
+        let mut bloom_first = false;
         for (hashes, out) in hashes.chunks(32).zip(out.chunks_mut(32)) {
-            self.lookup_hash_chunk(hashes, out);
+            self.lookup_hash_chunk(hashes, out, &mut bloom_first);
         }
         out
     }
 
-    fn lookup_hash_chunk(&self, hashes: &[u64], out: &mut [Option<u32>]) {
-        let mut bloom_hashes = [0; 32];
-        for (i, &hash) in hashes.iter().enumerate() {
-            if let Some(filter) = &self.bloom {
-                bloom_hashes[i] = filter.hash_u64(hash);
-                prefetch_read(filter.block_ptr(bloom_hashes[i]));
+    fn lookup_hash_chunk(&self, hashes: &[u64], out: &mut [Option<u32>], bloom_first: &mut bool) {
+        let Some(filter) = &self.bloom else {
+            for &hash in hashes {
+                self.router.prefetch(&self.pgm, hash);
             }
-            self.router.prefetch(&self.pgm, hash);
+            for (&hash, result) in hashes.iter().zip(out) {
+                *result = self.lookup_segment(hash);
+            }
+            return;
+        };
+        let mut bloom_hashes = [0; 32];
+        let mut accepted = 0;
+        if *bloom_first {
+            for (cached, &hash) in bloom_hashes.iter_mut().zip(hashes) {
+                *cached = filter.hash_u64(hash);
+                prefetch_read(filter.block_ptr(*cached));
+            }
+            let mut survivors = [0u8; 32];
+            out.fill(None);
+            for (i, &hash) in hashes.iter().enumerate() {
+                if filter.contains_hash(bloom_hashes[i]) {
+                    survivors[accepted] = i as u8;
+                    accepted += 1;
+                    self.router.prefetch(&self.pgm, hash);
+                }
+            }
+            for &i in &survivors[..accepted] {
+                let i = i as usize;
+                out[i] = self.lookup_segment(hashes[i]);
+            }
+        } else {
+            for (cached, &hash) in bloom_hashes.iter_mut().zip(hashes) {
+                *cached = filter.hash_u64(hash);
+                prefetch_read(filter.block_ptr(*cached));
+                self.router.prefetch(&self.pgm, hash);
+            }
+            for (i, &hash) in hashes.iter().enumerate() {
+                out[i] = if filter.contains_hash(bloom_hashes[i]) {
+                    accepted += 1;
+                    self.lookup_segment(hash)
+                } else {
+                    None
+                };
+            }
         }
-        for (i, &hash) in hashes.iter().enumerate() {
-            out[i] = if self.bloom.as_ref().is_some_and(|f| !f.contains_hash(bloom_hashes[i])) {
-                None
-            } else {
-                self.lookup_segment(hash)
-            };
-        }
+        // Delay router prefetch on the next window after at least 75% rejections.
+        *bloom_first = accepted <= hashes.len() / 4;
     }
 
     pub fn len(&self) -> usize {
