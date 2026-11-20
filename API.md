@@ -722,6 +722,8 @@ For a static set of numeric keys, `IndexBuilder::build_exact_u64(&keys)`
 returns an `ExactU64Index` with an owned u64 per slot. Both `contains_u64`
 and `lookup_u64` compare the query with the full key. Empty input is valid.
 Lean mode saves the Bloom and fingerprint tables while retaining exact answers.
+Use `contains_batch_u64_into(keys, out)` for exact membership in query order with
+caller-provided output and bounded stack scratch.
 
 ```rust
 let index = kira_kv_engine::IndexBuilder::new()

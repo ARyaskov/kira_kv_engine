@@ -30,6 +30,30 @@ impl ExactU64Index {
         (self.keys_by_slot[slot] == key).then_some(slot)
     }
 
+    /// Check exact membership in input order with bounded stack scratch.
+    ///
+    /// The prefix for the queried keys is overwritten, and any suffix is preserved.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `out` is shorter than `keys`.
+    pub fn contains_batch_u64_into(&self, keys: &[u64], out: &mut [bool]) {
+        const WINDOW: usize = 64;
+        assert!(out.len() >= keys.len(), "out slice too small");
+        let mut hashes = [0; WINDOW];
+        let mut candidates = [None; WINDOW];
+        for (keys, out) in keys.chunks(WINDOW).zip(out[..keys.len()].chunks_mut(WINDOW)) {
+            let slots = &mut candidates[..keys.len()];
+            self.index.lookup_batch_u64_simd_into(keys, &mut hashes, slots);
+            for &slot in slots.iter().flatten() {
+                crate::prefetch::prefetch_read(&self.keys_by_slot[slot]);
+            }
+            for ((&key, &slot), result) in keys.iter().zip(slots.iter()).zip(out) {
+                *result = slot.is_some_and(|slot| self.keys_by_slot[slot] == key);
+            }
+        }
+    }
+
     /// Exact membership with no per-query allocation.
     pub fn contains_u64(&self, key: u64) -> bool {
         self.lookup_u64(key).is_some()
@@ -56,6 +80,26 @@ mod tests {
             }
             assert!(!exact.contains_u64(u64::MAX));
         }
+    }
+
+    #[test]
+    fn exact_batches_overwrite_only_the_requested_prefix() {
+        let queries: Vec<_> = (0..163).chain([u64::MAX, 0]).collect();
+        let keys: std::collections::HashSet<_> = queries.iter().step_by(3).copied().collect();
+        let input: Vec<_> = keys.iter().copied().collect();
+        for lean in [false, true] {
+            let exact = IndexBuilder::new().with_lean_mph(lean).build_exact_u64(&input).unwrap();
+            let mut result = vec![true; queries.len() + 1];
+            exact.contains_batch_u64_into(&queries, &mut result);
+            for (key, answer) in queries.iter().zip(&result) {
+                assert_eq!(*answer, keys.contains(key));
+            }
+            assert!(result[queries.len()]);
+        }
+        let empty = IndexBuilder::new().build_exact_u64(&[]).unwrap();
+        let mut result = [true; 2];
+        empty.contains_batch_u64_into(&[0], &mut result);
+        assert_eq!(result, [false, true]);
     }
 
     #[test]
