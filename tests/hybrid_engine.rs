@@ -1,6 +1,43 @@
 use kira_kv_engine::HybridBuilder;
 
 #[test]
+fn verified_lookup_checks_original_keys_even_in_closed_world_mode() {
+    use kira_kv_engine::{HybridIndex, MembershipMode};
+
+    let keys: Vec<_> = (0u64..128).map(u64::to_le_bytes).collect();
+    for lean in [false, true] {
+        let index = HybridBuilder::new()
+            .with_parallel(false)
+            .with_linear_threshold(0)
+            .with_chd_threshold(0)
+            .with_lean(lean)
+            .build(&keys)
+            .unwrap();
+        let restored = HybridIndex::from_bytes(&index.to_bytes()).unwrap();
+        for idx in [&index, &restored] {
+            assert_eq!(
+                idx.membership_mode(),
+                if lean { MembershipMode::ClosedWorld } else { MembershipMode::Probabilistic }
+            );
+            let verify = |position: u32, key: &[u8]| keys[position as usize] == key;
+            for (position, key) in keys.iter().enumerate() {
+                assert_eq!(idx.lookup_verified(key, verify), Some(position as u32));
+            }
+            if lean {
+                let foreign = (128u64..1024)
+                    .map(u64::to_le_bytes)
+                    .find(|key| idx.lookup(key).is_some())
+                    .unwrap();
+                assert_eq!(idx.lookup_verified(&foreign, verify), None);
+            }
+        }
+    }
+    let empty = HybridIndex::empty(0);
+    assert_eq!(empty.membership_mode(), MembershipMode::Exact);
+    assert_eq!(empty.lookup_verified(b"x", |_, _| panic!("unexpected candidate")), None);
+}
+
+#[test]
 fn build_and_lookup_byte_keys() {
     let keys: Vec<Vec<u8>> = (0..1000).map(|i| format!("key-{i}").into_bytes()).collect();
     let idx =

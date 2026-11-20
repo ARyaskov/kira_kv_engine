@@ -801,11 +801,34 @@ impl HybridIndex {
         Ok(HybridIndex { pgm, router, segments, seg_offsets, seed, hash_version, bloom, n })
     }
 
-    /// Look up `key`. Returns `Some(original_position)` on hit, `None` on miss.
+    /// Return a candidate original position. Full indexes use probabilistic
+    /// membership checks. Lean indexes are intended for known keys only.
     #[inline]
     pub fn lookup(&self, key: &[u8]) -> Option<u32> {
         let hash = self.hash_version.hash(key, self.seed);
         self.lookup_hash(hash)
+    }
+
+    /// Conservative membership guarantee across all segment kinds.
+    pub fn membership_mode(&self) -> crate::MembershipMode {
+        if self.is_empty() {
+            crate::MembershipMode::Exact
+        } else if self.bloom.is_some() {
+            crate::MembershipMode::Probabilistic
+        } else {
+            crate::MembershipMode::ClosedWorld
+        }
+    }
+
+    /// Return a candidate only if the caller verifies its full original key.
+    /// The callback runs once on a candidate and never on a miss.
+    pub fn lookup_verified(
+        &self,
+        key: &[u8],
+        verify: impl FnOnce(u32, &[u8]) -> bool,
+    ) -> Option<u32> {
+        let position = self.lookup(key)?;
+        verify(position, key).then_some(position)
     }
 
     /// Look up a u64 key directly. The hash is computed as

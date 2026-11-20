@@ -463,6 +463,10 @@ pub struct HybridIndex { /* opaque */ }
 
 impl HybridIndex {
     pub fn empty(seed: u64) -> Self;
+    /// Conservative guarantee: Exact when empty, Probabilistic with Bloom, ClosedWorld in lean mode.
+    pub fn membership_mode(&self) -> MembershipMode;
+    /// Verify a candidate by comparing the full key at its original input position.
+    pub fn lookup_verified(&self, key: &[u8], verify: impl FnOnce(u32, &[u8]) -> bool) -> Option<u32>;
     pub fn lookup(&self, key: &[u8]) -> Option<u32>;
     pub fn lookup_u64(&self, key: u64) -> Option<u32>;
     pub fn lookup_hash(&self, hash: u64) -> Option<u32>;
