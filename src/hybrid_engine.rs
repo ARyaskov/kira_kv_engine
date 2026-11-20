@@ -391,6 +391,7 @@ impl HybridBuilder {
     where
         K: AsRef<[u8]>,
     {
+        crate::pgm::check_key_count(keys.len())?;
         if keys.is_empty() {
             return Ok(HybridIndex::empty(self.seed));
         }
@@ -417,6 +418,7 @@ impl HybridBuilder {
     /// the variable-length canonical_hash machinery. The rest of the pipeline
     /// (sort, PGM, mini-MPHs) is shared with `build()`.
     pub fn build_from_u64(self, keys: &[u64]) -> Result<HybridIndex, HybridError> {
+        crate::pgm::check_key_count(keys.len())?;
         if keys.is_empty() {
             return Ok(HybridIndex::empty(self.seed));
         }

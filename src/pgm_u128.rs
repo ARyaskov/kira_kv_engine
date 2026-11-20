@@ -64,6 +64,8 @@ pub enum PgmU128Error {
     /// never the problem).
     #[error("duplicate key in input")]
     DuplicateKeys,
+    #[error("PGM supports at most u32::MAX keys")]
+    TooManyKeys,
     #[deprecated(
         since = "0.7.0",
         note = "the builder sorts its input; duplicates raise DuplicateKeys"
@@ -84,6 +86,7 @@ impl PgmIndexU128 {
     /// Build a PGM-U128 from unique u128 keys (sorted here if needed). An empty
     /// key set yields an index on which every lookup misses.
     pub fn build(mut keys: Vec<u128>, epsilon: u32) -> Result<Self, PgmU128Error> {
+        crate::pgm::check_key_count(keys.len()).map_err(|_| PgmU128Error::TooManyKeys)?;
         keys.sort_unstable();
         if keys.windows(2).any(|w| w[0] >= w[1]) {
             return Err(PgmU128Error::DuplicateKeys);
@@ -96,6 +99,7 @@ impl PgmIndexU128 {
     /// is interpreted as big-endian to preserve lexicographic ordering — i.e.
     /// the byte-wise sort order matches the u128 numeric order.
     pub fn build_from_bytes16(keys: &[[u8; 16]], epsilon: u32) -> Result<Self, PgmU128Error> {
+        crate::pgm::check_key_count(keys.len()).map_err(|_| PgmU128Error::TooManyKeys)?;
         let u128_keys: Vec<u128> = keys.iter().map(|b| u128::from_be_bytes(*b)).collect();
         Self::build(u128_keys, epsilon)
     }
@@ -311,6 +315,7 @@ impl PgmIndexU128 {
         let epsilon = u32::from_le_bytes(body.get(0..4).ok_or_else(bad)?.try_into().unwrap());
         pos += 4;
         let n = rd_u64(&mut pos)?;
+        crate::pgm::check_key_count(n).map_err(|_| bad())?;
         let keys: Vec<u128> = crate::wire::read_le_at(body, &mut pos, n).ok_or_else(bad)?;
         let m = rd_u64(&mut pos)?;
         if m > (body.len() - pos) / 49 {

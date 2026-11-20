@@ -142,7 +142,7 @@ pub enum PgmError {
     CorruptData,
 }
 
-fn check_key_count(count: usize) -> Result<(), PgmError> {
+pub(crate) fn check_key_count(count: usize) -> Result<(), PgmError> {
     if count > u32::MAX as usize { Err(PgmError::TooManyKeys) } else { Ok(()) }
 }
 

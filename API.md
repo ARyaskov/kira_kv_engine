@@ -314,6 +314,7 @@ pub enum CompactionPolicy { Full, SizeTiered, Geometric }
 
 #[non_exhaustive]
 pub enum DynamicInsertError {
+    KeyTooLong,
     IdExhausted,
     Backpressure(String),
     Maintenance { committed_id: StableId, source: IndexError },
@@ -324,14 +325,14 @@ impl DynamicInsertError {
 }
 ```
 
-`try_insert` checks ID exhaustion and maintenance backpressure before changing
+`try_insert` checks the maximum key length (`u32::MAX` bytes), ID exhaustion and maintenance backpressure before changing
 bindings, including revival of a deleted key. A `Maintenance` error means the key
 was inserted and its ID remains readable; retry `flush` or `compact`, not the key.
 After a maintenance failure new writes are blocked until a successful explicit
 retry. Existing-key inserts still return their ID and do not rewrite a tier.
 The original `insert` signature is unchanged: it returns a committed ID after a
 maintenance failure and exposes its diagnostic through `last_maintenance_error`;
-an uncommitted blocked write or exhausted ID space panics before mutation.
+an oversized key, an uncommitted blocked write or exhausted ID space panics before mutation.
 
 ---
 
