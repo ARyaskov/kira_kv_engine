@@ -625,7 +625,18 @@ impl Index {
 
     /// Batched [`Index::may_contain`], preserving input order.
     pub fn may_contain_batch(&self, keys: &[&[u8]]) -> Vec<bool> {
-        keys.iter().map(|key| self.may_contain(key)).collect()
+        let Some(engine) = self.engine.as_ref() else {
+            return vec![false; keys.len()];
+        };
+        let mut out = Vec::with_capacity(keys.len());
+        let mut slots = [None; 64];
+        let mut bloom_first = false;
+        for input in keys.chunks(slots.len()) {
+            let slots = &mut slots[..input.len()];
+            Self::lookup_byte_chunk(engine, input, slots, &mut bloom_first);
+            out.extend(slots.iter().map(Option::is_some));
+        }
+        out
     }
 
     /// Verify a candidate against the caller's authoritative key storage.

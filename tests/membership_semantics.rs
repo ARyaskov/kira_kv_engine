@@ -12,9 +12,10 @@ fn static_membership_capabilities_and_explicit_candidate_checks() {
             index.membership_mode(),
             if lean { MembershipMode::ClosedWorld } else { MembershipMode::Probabilistic }
         );
-        let queries: &[&[u8]] = &[b"alpha", b"absent", b"beta", b"also absent"];
+        let pattern: &[&[u8]] = &[b"alpha", b"absent", b"beta", b"also absent"];
+        let queries: Vec<_> = pattern.iter().copied().cycle().take(145).collect();
         let expected: Vec<bool> = queries.iter().map(|key| index.lookup(key).is_ok()).collect();
-        assert_eq!(index.may_contain_batch(queries), expected);
+        assert_eq!(index.may_contain_batch(&queries), expected);
         for (&key, answer) in queries.iter().zip(expected) {
             assert_eq!(index.may_contain(key), answer);
         }
