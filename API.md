@@ -237,7 +237,8 @@ The iterator must yield exactly `expected_len` keys; zero keys return
 `EmptyInput`. The budget bounds auxiliary key/sort/scratch arrays, I/O buffers
 and temporary bookkeeping. It excludes final resident index tables and storage
 already owned by the caller or iterator, so it is not a total-process RAM cap.
-Construction spools temporary files beneath `scratch_dir`, partitions with
+Construction writes the input directly to the first partition level beneath
+`scratch_dir`, partitions with
 fanout at most 64, and builds parts sequentially. For `N` keys and `P` parts,
 partition I/O is `O(N * (1 + ceil(log_64 P)))` records; resident output is `O(N)`.
 A skewed part that exceeds the budget returns

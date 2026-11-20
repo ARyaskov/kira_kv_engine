@@ -83,7 +83,14 @@ fn one_pass_stream_has_a_budgeted_peak_and_every_slot_is_bijective() {
     let budget = 1024 * 1024;
     let builder = MphExternalBuilder::new().with_memory_budget_bytes(budget);
     ALLOCATIONS.with(|state| state.set(Some(Probe { live: 0, peak: 0 })));
-    let result = builder.build((0..count as u64).map(mix), count, directory.path());
+    let input = (0..count as u64).map(|key| {
+        if key == 0 {
+            let scratch = std::fs::read_dir(directory.path()).unwrap().next().unwrap().unwrap();
+            assert!(!scratch.path().join("root.keys").exists());
+        }
+        mix(key)
+    });
+    let result = builder.build(input, count, directory.path());
     let peak = ALLOCATIONS.with(|state| state.replace(None).unwrap().peak);
     let index = result.unwrap();
     assert!(

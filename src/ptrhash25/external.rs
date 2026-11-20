@@ -2,7 +2,7 @@
 
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use super::{
     BuildConfig, BuildValidationError, CandidateMarks, PART_SALT_MIX, PART_TARGET_KEYS, PartInfo,
@@ -138,7 +138,8 @@ impl MphExternalBuilder {
     /// Consume exactly `expected_len` unique keys, with temporary files beneath
     /// `scratch_dir`. Success requires removal of the owned temporary directory;
     /// failure/unwind uses best-effort RAII cleanup. Existing files are untouched.
-    /// Disk partitioning uses O(N (1 + ceil(log_64 P))) records for P parts, avoiding an
+    /// The input goes straight to the first partition level. Disk partitioning uses
+    /// O(N (1 + ceil(log_64 P))) records for P parts, avoiding an
     /// O(N) in-memory copy. Resident output still requires O(N) index memory.
     pub fn build<I: IntoIterator<Item = u64>, P: AsRef<Path>>(
         self,
@@ -183,8 +184,8 @@ impl MphExternalBuilder {
         }
         validate_output_capacities(part_count, 0, 0)?;
         let part_salt = mix64(self.config.seed ^ PART_SALT_MIX);
-        let root = temporary.path().join("root.keys");
-        let mut file = BufWriter::with_capacity(FILE_BUFFER, File::create(&root)?);
+        let directory = temporary.path();
+        let (paths, mut outputs, child_leaves) = create_partitions(directory, 0, part_count)?;
         let mut observed = 0usize;
         for key in keys {
             observed = observed
@@ -196,7 +197,8 @@ impl MphExternalBuilder {
                     observed,
                 });
             }
-            file.write_all(&key.to_le_bytes())?;
+            let child = part_of(key, part_salt, part_count) / child_leaves;
+            outputs[child].write_all(&key.to_le_bytes())?;
         }
         if observed != expected_len {
             return Err(MphExternalBuildError::KeyCountMismatch {
@@ -204,9 +206,8 @@ impl MphExternalBuilder {
                 observed,
             });
         }
-        file.flush()?;
-        drop(file);
-        split_file(temporary.path(), &root, 0, part_count, part_count, part_salt)?;
+        flush_partitions(outputs)?;
+        split_children(directory, paths, 0, child_leaves, part_count, part_salt)?;
 
         // Geometry is final index metadata. Check every leaf's working set before
         // allocating its key/scratch arrays or any final output tables.
@@ -424,20 +425,7 @@ fn split_file(
     all_parts: usize,
     salt: u64,
 ) -> io::Result<()> {
-    if leaves == 1 {
-        std::fs::rename(source, leaf_path(directory, first))?;
-        return Ok(());
-    }
-    let fanout = FANOUT.min(leaves);
-    let child_leaves = leaves / fanout;
-    let mut paths = Vec::with_capacity(fanout);
-    let mut outputs = Vec::with_capacity(fanout);
-    for child in 0..fanout {
-        let start = first + child * child_leaves;
-        let path = directory.join(format!("split-{start:08x}-{child_leaves:08x}.keys"));
-        outputs.push(BufWriter::with_capacity(FILE_BUFFER, File::create(&path)?));
-        paths.push(path);
-    }
+    let (paths, mut outputs, child_leaves) = create_partitions(directory, first, leaves)?;
     let mut input = BufReader::with_capacity(FILE_BUFFER, File::open(source)?);
     loop {
         let mut bytes = [0u8; 8];
@@ -450,13 +438,60 @@ fn split_file(
         let child = (part_of(key, salt, all_parts) - first) / child_leaves;
         outputs[child].write_all(&bytes)?;
     }
+    flush_partitions(outputs)?;
+    drop(input);
+    std::fs::remove_file(source)?;
+    split_children(directory, paths, first, child_leaves, all_parts, salt)
+}
+
+fn create_partitions(
+    directory: &Path,
+    first: usize,
+    leaves: usize,
+) -> io::Result<(Vec<PathBuf>, Vec<BufWriter<File>>, usize)> {
+    let fanout = FANOUT.min(leaves);
+    let child_leaves = leaves / fanout;
+    let mut paths = Vec::with_capacity(fanout);
+    let mut outputs = Vec::with_capacity(fanout);
+    for child in 0..fanout {
+        let start = first + child * child_leaves;
+        let path = if child_leaves == 1 {
+            leaf_path(directory, start)
+        } else {
+            directory.join(format!("split-{start:08x}-{child_leaves:08x}.keys"))
+        };
+        outputs.push(BufWriter::with_capacity(FILE_BUFFER, File::create(&path)?));
+        paths.push(path);
+    }
+    Ok((paths, outputs, child_leaves))
+}
+
+fn flush_partitions(outputs: Vec<BufWriter<File>>) -> io::Result<()> {
     for mut output in outputs {
         output.flush()?;
     }
-    drop(input);
-    std::fs::remove_file(source)?;
-    for (child, path) in paths.into_iter().enumerate() {
-        split_file(directory, &path, first + child * child_leaves, child_leaves, all_parts, salt)?;
+    Ok(())
+}
+
+fn split_children(
+    directory: &Path,
+    paths: Vec<PathBuf>,
+    first: usize,
+    child_leaves: usize,
+    all_parts: usize,
+    salt: u64,
+) -> io::Result<()> {
+    if child_leaves > 1 {
+        for (child, path) in paths.into_iter().enumerate() {
+            split_file(
+                directory,
+                &path,
+                first + child * child_leaves,
+                child_leaves,
+                all_parts,
+                salt,
+            )?;
+        }
     }
     Ok(())
 }
