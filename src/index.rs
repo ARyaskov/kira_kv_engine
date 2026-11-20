@@ -865,9 +865,12 @@ impl Index {
     /// fallback is stored as a legacy payload and remains readable. Tables are
     /// streamed from borrowed storage with bounded buffers and no file reread.
     pub fn save_mmap<P: AsRef<std::path::Path>>(&self, path: P) -> Result<(), IndexError> {
+        save_atomically(path.as_ref(), |file| self.write_mmap(file))
+    }
+
+    fn write_mmap(&self, file: &mut std::fs::File) -> Result<(), IndexError> {
         use crate::mmap_index::{SectionKind, write_sections};
         use crate::mph_backend::PtrHash25Storage;
-        let file = std::fs::File::create(path)?;
         if let Some(e) = &self.engine {
             let BackendDispatch::PtrHash25(b) = &e.backend;
             if let PtrHash25Storage::Mph(m) = &b.storage {
@@ -1231,8 +1234,7 @@ impl Index {
 
     /// Write the index to a file (streaming, see [`Index::write_to`]).
     pub fn save<P: AsRef<std::path::Path>>(&self, path: P) -> std::io::Result<()> {
-        let file = std::fs::File::create(path)?;
-        self.write_to(file)
+        save_atomically(path.as_ref(), |file| self.write_to(file))
     }
 
     /// Read an index written by [`Index::save`] / [`Index::write_to`].
@@ -1854,4 +1856,36 @@ fn read_fingerprints(cursor: &mut Cursor<'_>, flag: u8) -> Result<Fingerprints, 
     cursor.pos = end;
     data.push(0);
     Ok(Fingerprints::packed(data.into(), width, len))
+}
+
+/// Publish only a complete snapshot. A failed write leaves the prior file intact.
+fn save_atomically<E: From<std::io::Error>>(
+    path: &std::path::Path,
+    write: impl FnOnce(&mut std::fs::File) -> Result<(), E>,
+) -> Result<(), E> {
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(".".as_ref());
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    if let Ok(metadata) = std::fs::metadata(path) {
+        temporary.as_file().set_permissions(metadata.permissions())?;
+    }
+    write(temporary.as_file_mut())?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod atomic_save_tests {
+    #[test]
+    fn failed_replacement_preserves_the_previous_snapshot() {
+        use std::io::{self, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index");
+        std::fs::write(&path, b"previous").unwrap();
+        let result = super::save_atomically(&path, |file| {
+            file.write_all(b"incomplete")?;
+            Err::<(), _>(io::Error::other("write failed"))
+        });
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(path).unwrap(), b"previous");
+    }
 }
