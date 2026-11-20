@@ -1,7 +1,7 @@
 //! Bounded-working-memory construction over a one-pass stream of u64 keys.
 
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use super::{
@@ -434,16 +434,32 @@ fn split_file(
 ) -> io::Result<()> {
     let (paths, mut outputs, child_leaves) = create_partitions(directory, first, leaves)?;
     let mut input = BufReader::with_capacity(FILE_BUFFER, File::open(source)?);
+    let mut distribute = |bytes: &[u8; 8]| {
+        let key = u64::from_le_bytes(*bytes);
+        let child = (part_of(key, salt, all_parts) - first) / child_leaves;
+        outputs[child].write_all(bytes)
+    };
     loop {
-        let mut bytes = [0u8; 8];
-        let count = input.read(&mut bytes[..1])?;
-        if count == 0 {
+        let buffer = input.fill_buf()?;
+        if buffer.is_empty() {
             break;
         }
-        input.read_exact(&mut bytes[1..])?;
-        let key = u64::from_le_bytes(bytes);
-        let child = (part_of(key, salt, all_parts) - first) / child_leaves;
-        outputs[child].write_all(&bytes)?;
+        let (records, remainder) = buffer.as_chunks::<8>();
+        for record in records {
+            distribute(record)?;
+        }
+        if records.is_empty() {
+            // A short read can split a record across buffer fills.
+            let mut record = [0; 8];
+            let prefix = remainder.len();
+            record[..prefix].copy_from_slice(remainder);
+            input.consume(prefix);
+            input.read_exact(&mut record[prefix..])?;
+            distribute(&record)?;
+        } else {
+            let consumed = records.len() * 8;
+            input.consume(consumed);
+        }
     }
     flush_partitions(outputs)?;
     drop(input);
