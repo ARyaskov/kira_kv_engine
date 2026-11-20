@@ -307,6 +307,7 @@ impl MmapIndexWriter {
     }
 }
 
+/// Publish only a complete snapshot. A failed write leaves the prior file intact.
 pub(crate) fn save_atomically<E: From<std::io::Error>>(
     path: &std::path::Path,
     write: impl FnOnce(&mut std::fs::File) -> Result<(), E>,

@@ -1906,8 +1906,6 @@ fn read_fingerprints(cursor: &mut Cursor<'_>, flag: u8) -> Result<Fingerprints, 
     Ok(Fingerprints::packed(data.into(), width, len))
 }
 
-/// Publish only a complete snapshot. A failed write leaves the prior file intact.
-
 #[cfg(test)]
 mod atomic_save_tests {
     #[cfg(unix)]
