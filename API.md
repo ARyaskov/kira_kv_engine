@@ -718,6 +718,29 @@ Bloom exists; `may_contain` uses all the checks used by `lookup`. Neither makes
 a nonempty static Index exact. `lookup_verified` adds a full-key comparison
 against authoritative caller-owned storage, including for lean indexes.
 
+For a static set of numeric keys, `IndexBuilder::build_exact_u64(&keys)`
+returns an `ExactU64Index` with an owned u64 per slot. Both `contains_u64`
+and `lookup_u64` compare the query with the full key. Empty input is valid.
+Lean mode saves the Bloom and fingerprint tables while retaining exact answers.
+
+```rust
+let index = kira_kv_engine::IndexBuilder::new()
+    .with_lean_mph(true)
+    .build_exact_u64(&[0, 42, u64::MAX])?;
+assert!(index.contains_u64(42));
+assert_eq!(index.lookup_u64(7), None);
+Ok::<(), kira_kv_engine::IndexError>(())
+```
+
+`contains_batch` pipelines Bloom probes and has the same membership guarantee as
+`contains`. For pipelined byte and u64 position lookups, a block with at least
+75% Bloom rejections causes the next block to check Bloom before fetching MPH
+pilots. Scheduling is local to the batch and preserves query order.
+
+`Index::save` and `Index::save_mmap` write a temporary file in the destination
+directory and replace the path after the complete write. A write or replacement
+error preserves the prior snapshot. These methods do not request power-loss durability.
+
 The aligned mmap container has a checksum covering its header and sections.
 Windows `open_mmap` retains a read handle that denies write/delete sharing.
 Safe opens on other platforms retain an owned byte buffer; immutable-file
