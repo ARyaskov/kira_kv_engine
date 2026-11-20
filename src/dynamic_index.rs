@@ -73,6 +73,8 @@ pub enum CompactionPolicy {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum DynamicInsertError {
+    #[error("DynamicIndex: key length exceeds the u32 storage limit")]
+    KeyTooLong,
     #[error("DynamicIndex: id space exhausted")]
     IdExhausted,
     #[error("DynamicIndex: maintenance is blocked: {0}")]
@@ -99,6 +101,10 @@ impl DynamicInsertError {
 /// A stable external id assigned by [`DynamicIndex`] on insert. Never
 /// invalidated by flushes or compactions.
 pub type StableId = u32;
+
+fn stored_key_len(len: usize) -> Result<u32, DynamicInsertError> {
+    u32::try_from(len).map_err(|_| DynamicInsertError::KeyTooLong)
+}
 
 /// Configuration for [`DynamicIndex`].
 #[derive(Debug, Clone)]
@@ -235,8 +241,8 @@ impl DynamicIndex {
     /// Automatic maintenance failures leave the inserted binding readable and
     /// are exposed by `last_maintenance_error`. New writes then stop until an
     /// explicit successful `flush` or `compact`. Use `try_insert` to handle these
-    /// cases without panicking. ID exhaustion and blocked writes panic before
-    /// changing any key/id binding.
+    /// cases without panicking. Keys longer than `u32::MAX` bytes, ID exhaustion,
+    /// and blocked writes panic before changing any key/id binding.
     pub fn insert(&mut self, key: Vec<u8>) -> StableId {
         match self.try_insert(key) {
             Ok(id) | Err(DynamicInsertError::Maintenance { committed_id: id, .. }) => id,
@@ -245,6 +251,7 @@ impl DynamicIndex {
     }
 
     pub fn try_insert(&mut self, key: Vec<u8>) -> Result<StableId, DynamicInsertError> {
+        stored_key_len(key.len())?;
         if let Some(id) = self.lookup(&key) {
             return Ok(id);
         }
@@ -701,7 +708,9 @@ impl DynamicIndex {
         body.extend_from_slice(&self.next_id.to_le_bytes());
         body.extend_from_slice(&(self.live as u64).to_le_bytes());
         let mut write = |k: &[u8], id: StableId| {
-            body.extend_from_slice(&(k.len() as u32).to_le_bytes());
+            let len =
+                stored_key_len(k.len()).expect("stored key length validated on insert or load");
+            body.extend_from_slice(&len.to_le_bytes());
             body.extend_from_slice(k);
             body.extend_from_slice(&id.to_le_bytes());
         };
@@ -800,7 +809,7 @@ fn build_tier(cfg: &DynamicConfig, input: Vec<(&[u8], StableId)>) -> Result<Tier
     let mut arena = Vec::with_capacity(bytes);
     let mut entries = vec![Entry::default(); index.slot_capacity()];
     for (key, id) in input {
-        let len = u32::try_from(key.len()).map_err(|_| IndexError::InvalidKey)?;
+        let len = stored_key_len(key.len()).map_err(|_| IndexError::InvalidKey)?;
         let slot = index.lookup(key)?;
         entries[slot] = Entry { offset: arena.len(), len, id };
         arena.extend_from_slice(key);
@@ -840,6 +849,17 @@ impl Drop for DynamicIndex {
 mod tests {
     use super::{CompactionPolicy, DynamicConfig, DynamicIndex, DynamicInsertError};
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn insertion_key_length_matches_tier_and_snapshot_width() {
+        assert_eq!(super::stored_key_len(0).unwrap(), 0);
+        assert_eq!(super::stored_key_len(u32::MAX as usize).unwrap(), u32::MAX);
+        if let Some(too_long) = (u32::MAX as usize).checked_add(1) {
+            let error = super::stored_key_len(too_long).unwrap_err();
+            assert!(matches!(error, DynamicInsertError::KeyTooLong));
+            assert!(error.committed_id().is_none());
+        }
+    }
 
     #[test]
     fn failed_automatic_flush_latches_backpressure_until_explicit_retry() {
