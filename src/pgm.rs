@@ -1533,9 +1533,14 @@ impl PgmBuilder {
         if sorted.windows(2).any(|w| w[0] >= w[1]) {
             return Err(PgmError::DuplicateKeys);
         }
+        Ok(self.build_sorted_unique(sorted))
+    }
 
+    /// Fit models in the caller's build scope. Both builders have already
+    /// checked the u32 position bound and established strict key ordering.
+    pub(crate) fn build_sorted_unique(self, sorted: Vec<u64>) -> PgmIndex {
         if sorted.is_empty() {
-            return Ok(PgmIndex {
+            return PgmIndex {
                 key_count: 0,
                 keys: Vec::new(),
                 keys_ef: None,
@@ -1545,7 +1550,7 @@ impl PgmBuilder {
                 },
                 epsilon: self.epsilon,
                 bloom: None,
-            });
+            };
         }
 
         let epsilon = match self.target_lookup_ns {
@@ -1586,7 +1591,7 @@ impl PgmBuilder {
         if self.enable_elias_fano {
             let _ = idx.compact_keys();
         }
-        Ok(idx)
+        idx
     }
 
     /// Sweep ε ∈ {16, 32, 64, 128, 256} on a 16K-key sample, measure resulting

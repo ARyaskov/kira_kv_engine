@@ -395,12 +395,10 @@ impl HybridBuilder {
         if keys.is_empty() {
             return Ok(HybridIndex::empty(self.seed));
         }
-        let n = keys.len();
-
         // Phase 1: hash all keys via canonical_hash. For byte keys this is
         // scalar (per-key variable-length hashing); for u64 keys callers
         // should use `build_from_u64` to get the SIMD path.
-        let mut hashed: Vec<(u64, u32)> = keys
+        let hashed: Vec<(u64, u32)> = keys
             .iter()
             .enumerate()
             .map(|(i, k)| {
@@ -409,7 +407,7 @@ impl HybridBuilder {
             })
             .collect();
 
-        self.finalize_build(&mut hashed, n)
+        self.finalize_build(hashed)
     }
 
     /// SIMD-optimized build for u64 keys (3–5× faster Phase 1 vs `build()`).
@@ -427,43 +425,36 @@ impl HybridBuilder {
         crate::simd_hash::hash_u64(keys, self.seed, &mut hashes);
 
         // Pair with original index (i as u32).
-        let mut hashed: Vec<(u64, u32)> =
+        let hashed: Vec<(u64, u32)> =
             hashes.into_iter().enumerate().map(|(i, h)| (h, i as u32)).collect();
-        self.finalize_build(&mut hashed, n)
+        self.finalize_build(hashed)
     }
 
     /// Shared finalize phase: sort hashes → build PGM → build per-segment
     /// storage → build Bloom. Extracted from `build()` so the SIMD-hashed
     /// `build_from_u64()` can reuse it.
-    fn finalize_build(
-        self,
-        hashed: &mut Vec<(u64, u32)>,
-        n: usize,
-    ) -> Result<HybridIndex, HybridError> {
-        crate::build_pool::run(self.enable_parallel, || self.finalize_build_inner(hashed, n))
+    fn finalize_build(self, hashed: Vec<(u64, u32)>) -> Result<HybridIndex, HybridError> {
+        crate::build_pool::run(self.enable_parallel, || self.finalize_build_inner(hashed))
     }
 
-    fn finalize_build_inner(
-        self,
-        hashed: &mut Vec<(u64, u32)>,
-        n: usize,
-    ) -> Result<HybridIndex, HybridError> {
+    fn finalize_build_inner(self, mut hashed: Vec<(u64, u32)>) -> Result<HybridIndex, HybridError> {
         // Phase 2: sort by hash. Duplicate hashes (collisions) would break
         // segment lookup — reject early. canonical_hash on distinct keys has
         // ~2^-64 collision rate, so this rarely triggers.
         //
         // For N > 1024 use radix sort (2–3× faster than comparison sort on
         // u64 keys). For small N std sort wins (no scratch alloc).
-        crate::build_pool::radix_sort_u64_pairs(hashed);
+        let n = hashed.len();
+        crate::build_pool::radix_sort_u64_pairs(&mut hashed);
         for w in hashed.windows(2) {
             if w[0].0 == w[1].0 {
                 return Err(HybridError::HashCollision);
             }
         }
 
-        // Split into SoA for cache-friendly downstream access.
-        let sorted_hashes: Vec<u64> = hashed.iter().map(|&(h, _)| h).collect();
-        let sorted_positions: Vec<u32> = hashed.iter().map(|&(_, p)| p).collect();
+        // Consume the sorted pairs so their allocation is released before fitting
+        // the PGM or constructing the per-segment MPH tables.
+        let (sorted_hashes, sorted_positions): (Vec<u64>, Vec<u32>) = hashed.into_iter().unzip();
 
         // Phase 3: build PGM on sorted hashes. The PGM is only used as a segment
         // locator here (`segment_for_key`), so the key array is taken back out of it
@@ -472,25 +463,23 @@ impl HybridBuilder {
         let mut pgm = PgmBuilder::new()
             .with_epsilon(self.pgm_epsilon)
             .with_parallel(self.enable_parallel)
-            .build(sorted_hashes)?;
+            .build_sorted_unique(sorted_hashes);
         let sorted_hashes = pgm.take_keys();
 
         // Phase 4: enumerate segments and build per-segment storage.
-        let num_segments = enumerate_segments(&pgm);
+        let num_segments = pgm.num_segments();
         let mut seg_offsets = Vec::with_capacity(num_segments + 1);
-        let mut seg_ranges = Vec::with_capacity(num_segments);
         for seg_id in 0..num_segments {
-            if let Some((start, end)) = pgm.segment_bounds(seg_id) {
-                seg_offsets.push(start);
-                seg_ranges.push((start as usize, end as usize));
-            }
+            let (start, _) = pgm.segment_bounds(seg_id).expect("in-range segment");
+            seg_offsets.push(start);
         }
         seg_offsets.push(n as u32);
 
         let linear_threshold = self.linear_threshold;
         let chd_threshold = self.chd_threshold;
         let lean = self.lean;
-        let build_one = |&(start, end): &(usize, usize)| -> SegmentStorage {
+        let build_one = |bounds: &[u32]| -> SegmentStorage {
+            let (start, end) = (bounds[0] as usize, bounds[1] as usize);
             let seg_hashes = &sorted_hashes[start..end];
             let seg_positions = &sorted_positions[start..end];
             let seg_len = seg_hashes.len();
@@ -553,14 +542,14 @@ impl HybridBuilder {
             {
                 if self.enable_parallel && crate::build_pool::parallel_enabled() {
                     use rayon::prelude::*;
-                    crate::build_pool::run(true, || seg_ranges.par_iter().map(build_one).collect())
+                    seg_offsets.par_windows(2).map(build_one).collect()
                 } else {
-                    seg_ranges.iter().map(build_one).collect()
+                    seg_offsets.windows(2).map(build_one).collect()
                 }
             }
             #[cfg(not(feature = "parallel"))]
             {
-                seg_ranges.iter().map(build_one).collect()
+                seg_offsets.windows(2).map(build_one).collect()
             }
         };
 
@@ -589,15 +578,6 @@ impl Default for HybridBuilder {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn enumerate_segments(pgm: &PgmIndex) -> usize {
-    // PGM doesn't expose num_segments directly; walk until segment_bounds returns None.
-    let mut i = 0;
-    while pgm.segment_bounds(i).is_some() {
-        i += 1;
-    }
-    i
 }
 
 /// Segment payload tags in the serialized form.
