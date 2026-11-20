@@ -467,46 +467,45 @@ impl Index {
         for (hashes, out) in hashes.chunks(LANES).zip(out.chunks_mut(LANES)) {
             let mut prepared = [crate::ptrhash25::PreparedLookup::default(); LANES];
             let mut slots = [usize::MAX; LANES];
-            let filter = engine.filter.as_ref();
-            let defer_pilots = *bloom_first && filter.is_some();
-            for (i, &hash) in hashes.iter().enumerate() {
-                if !defer_pilots {
-                    prepared[i] = mph.prepare_lookup(hash);
-                }
-                if let Some(bf) = filter {
-                    prefetch_read(bf.block_ptr(hash));
-                }
-            }
-            let mut survivors = [0u8; LANES];
-            let mut count = 0;
-            for (i, &hash) in hashes.iter().enumerate() {
-                if filter.is_some_and(|bf| !bf.contains_hash(hash)) {
-                    continue;
-                }
-                survivors[count] = i as u8;
-                count += 1;
-                if defer_pilots {
-                    prepared[i] = mph.prepare_lookup(hash);
-                }
-                if !defer_pilots {
-                    let slot = mph.finish_lookup(prepared[i]);
-                    slots[i] = slot;
-                    if let Some(fp) = &engine.fingerprints {
-                        fp.prefetch(slot);
-                    }
-                }
-            }
-            // A negative-heavy block predicts that fetching every pilot in the
-            // next block would mostly waste cache lines. Reevaluate each block.
-            *bloom_first = count <= hashes.len() / 4;
-            for &lane in &survivors[..if defer_pilots { count } else { 0 }] {
-                let i = lane as usize;
-                let slot = mph.finish_lookup(prepared[i]);
+            let mut prefetch_slot = |i: usize, query| {
+                let slot = mph.finish_lookup(query);
                 slots[i] = slot;
                 if let Some(fp) = &engine.fingerprints {
                     fp.prefetch(slot);
                 }
+            };
+            let mut count = 0;
+            if let Some(filter) = engine.filter.as_ref().filter(|_| *bloom_first) {
+                for &hash in hashes {
+                    prefetch_read(filter.block_ptr(hash));
+                }
+                let mut survivors = [0u8; LANES];
+                for (i, &hash) in hashes.iter().enumerate() {
+                    if filter.contains_hash(hash) {
+                        survivors[count] = i as u8;
+                        prepared[count] = mph.prepare_lookup(hash);
+                        count += 1;
+                    }
+                }
+                for (&i, &query) in survivors[..count].iter().zip(&prepared) {
+                    prefetch_slot(i as usize, query);
+                }
+            } else {
+                for (i, &hash) in hashes.iter().enumerate() {
+                    prepared[i] = mph.prepare_lookup(hash);
+                    if let Some(filter) = &engine.filter {
+                        prefetch_read(filter.block_ptr(hash));
+                    }
+                }
+                for (i, &hash) in hashes.iter().enumerate() {
+                    if engine.filter.as_ref().is_none_or(|f| f.contains_hash(hash)) {
+                        prefetch_slot(i, prepared[i]);
+                        count += 1;
+                    }
+                }
             }
+            // Use the observed Bloom rejection rate to schedule the next block.
+            *bloom_first = count <= hashes.len() / 4;
             for (i, &hash) in hashes.iter().enumerate() {
                 let slot = slots[i];
                 out[i] = if slot != usize::MAX
