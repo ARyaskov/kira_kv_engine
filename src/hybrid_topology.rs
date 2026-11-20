@@ -89,6 +89,57 @@ mod windows {
 
     const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 
+    fn parse_cores(mut bytes: &[u8]) -> Option<Vec<(u8, Vec<usize>)>> {
+        const PROCESSOR: usize = mem::offset_of!(LogicalProcInfoEx, processor);
+        const CLASS: usize = PROCESSOR + mem::offset_of!(ProcessorRelationship, efficiency_class);
+        const COUNT: usize = PROCESSOR + mem::offset_of!(ProcessorRelationship, group_count);
+        const GROUPS: usize = PROCESSOR + mem::offset_of!(ProcessorRelationship, groups);
+        let mut cores = Vec::new();
+        while !bytes.is_empty() {
+            let relationship = u32::from_ne_bytes(bytes.get(..4)?.try_into().ok()?);
+            let size = u32::from_ne_bytes(bytes.get(4..8)?.try_into().ok()?) as usize;
+            if size < 8 {
+                return None;
+            }
+            let (record, rest) = bytes.split_at_checked(size)?;
+            bytes = rest;
+            if relationship != RELATION_PROCESSOR_CORE {
+                continue;
+            }
+            let efficiency = *record.get(CLASS)?;
+            let count = u16::from_ne_bytes(record.get(COUNT..COUNT + 2)?.try_into().ok()?);
+            let groups = record.get(GROUPS..)?.as_chunks::<{ mem::size_of::<GroupAffinity>() }>().0;
+            let mut logical_ids = Vec::new();
+            for group in groups.get(..count as usize)? {
+                let (mask, number) = group.split_at(mem::size_of::<usize>());
+                let mut mask = usize::from_ne_bytes(mask.try_into().ok()?);
+                let base = u16::from_ne_bytes(number[..2].try_into().ok()?) as usize * 64;
+                while mask != 0 {
+                    logical_ids.push(base + mask.trailing_zeros() as usize);
+                    mask &= mask - 1;
+                }
+            }
+            cores.push((efficiency, logical_ids));
+        }
+        Some(cores)
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn parses_unaligned_processor_records_and_rejects_truncation() {
+        let record_len = mem::size_of::<LogicalProcInfoEx>();
+        let mut storage = vec![0; record_len + 1];
+        let record = &mut storage[1..];
+        record[4..8].copy_from_slice(&(record_len as u32).to_ne_bytes());
+        let processor = mem::offset_of!(LogicalProcInfoEx, processor);
+        let count = processor + mem::offset_of!(ProcessorRelationship, group_count);
+        record[count..count + 2].copy_from_slice(&1u16.to_ne_bytes());
+        let mask = processor + mem::offset_of!(ProcessorRelationship, groups);
+        record[mask..mask + mem::size_of::<usize>()].copy_from_slice(&4usize.to_ne_bytes());
+        assert_eq!(parse_cores(record), Some(vec![(0, vec![2])]));
+        assert!(parse_cores(&record[..record_len - 1]).is_none());
+    }
+
     pub fn detect() -> Option<Topology> {
         let mut needed: u32 = 0;
         unsafe {
@@ -114,33 +165,7 @@ mod windows {
                 return None;
             }
 
-            // Walk variable-length records.
-            let mut cores: Vec<(u8, Vec<usize>)> = Vec::new();
-            let mut offset = 0usize;
-            while offset + mem::size_of::<u32>() * 2 <= needed as usize {
-                let header = &*(buf.as_ptr().add(offset) as *const LogicalProcInfoEx);
-                if header.relationship != RELATION_PROCESSOR_CORE {
-                    offset += header.size as usize;
-                    continue;
-                }
-                let efficiency = header.processor.efficiency_class;
-                let group_count = header.processor.group_count as usize;
-                let groups_ptr = &header.processor.groups as *const GroupAffinity;
-                let mut logical_ids = Vec::new();
-                for g in 0..group_count {
-                    let ga = &*groups_ptr.add(g);
-                    let base = (ga.group as usize) * 64;
-                    let mut mask = ga.mask;
-                    while mask != 0 {
-                        let bit = mask.trailing_zeros() as usize;
-                        logical_ids.push(base + bit);
-                        mask &= mask - 1;
-                    }
-                }
-                cores.push((efficiency, logical_ids));
-                offset += header.size as usize;
-            }
-
+            let cores = parse_cores(buf.get(..needed as usize)?)?;
             if cores.is_empty() {
                 return None;
             }
