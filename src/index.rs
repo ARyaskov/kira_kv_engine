@@ -917,7 +917,7 @@ impl Index {
     /// fallback is stored as a legacy payload and remains readable. Tables are
     /// streamed from borrowed storage with bounded buffers and no file reread.
     pub fn save_mmap<P: AsRef<std::path::Path>>(&self, path: P) -> Result<(), IndexError> {
-        save_atomically(path.as_ref(), |file| self.write_mmap(file))
+        crate::mmap_index::save_atomically(path.as_ref(), |file| self.write_mmap(file))
     }
 
     fn write_mmap(&self, file: &mut std::fs::File) -> Result<(), IndexError> {
@@ -1286,7 +1286,7 @@ impl Index {
 
     /// Write the index to a file (streaming, see [`Index::write_to`]).
     pub fn save<P: AsRef<std::path::Path>>(&self, path: P) -> std::io::Result<()> {
-        save_atomically(path.as_ref(), |file| self.write_to(file))
+        crate::mmap_index::save_atomically(path.as_ref(), |file| self.write_to(file))
     }
 
     /// Read an index written by [`Index::save`] / [`Index::write_to`].
@@ -1886,54 +1886,6 @@ fn read_fingerprints(cursor: &mut Cursor<'_>, flag: u8) -> Result<Fingerprints, 
 }
 
 /// Publish only a complete snapshot. A failed write leaves the prior file intact.
-fn save_atomically<E: From<std::io::Error>>(
-    path: &std::path::Path,
-    write: impl FnOnce(&mut std::fs::File) -> Result<(), E>,
-) -> Result<(), E> {
-    use std::io::{Error, ErrorKind};
-    // Follow final-component links, including a relative link to a new file.
-    let mut target = path.to_owned();
-    let mut links = 0;
-    let permissions = loop {
-        match std::fs::symlink_metadata(&target) {
-            Ok(meta) if meta.is_symlink() => {
-                if links == 40 {
-                    return Err(Error::other("too many snapshot symlinks").into());
-                }
-                links += 1;
-                let destination = std::fs::read_link(&target)?;
-                target.pop();
-                target.push(destination);
-            }
-            Ok(meta) if meta.is_file() => {
-                // Enforce the same write-access requirement as a normal save.
-                let existing = std::fs::OpenOptions::new().write(true).open(&target)?;
-                break Some(existing.metadata()?.permissions());
-            }
-            Ok(_) => return Err(Error::other("snapshot destination must be a regular file").into()),
-            Err(error) if error.kind() == ErrorKind::NotFound => break None,
-            Err(error) => return Err(error.into()),
-        }
-    };
-    let parent = target.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(".".as_ref());
-    let builder = tempfile::Builder::new();
-    #[cfg(unix)]
-    let builder = {
-        use std::os::unix::fs::PermissionsExt;
-        let mut builder = builder;
-        builder.permissions(
-            permissions.clone().unwrap_or_else(|| std::fs::Permissions::from_mode(0o666)),
-        );
-        builder
-    };
-    let mut temporary = builder.tempfile_in(parent)?;
-    if let Some(permissions) = permissions {
-        temporary.as_file().set_permissions(permissions)?;
-    }
-    write(temporary.as_file_mut())?;
-    temporary.persist(target).map_err(|error| error.error)?;
-    Ok(())
-}
 
 #[cfg(test)]
 mod atomic_save_tests {
@@ -1960,7 +1912,7 @@ mod atomic_save_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index");
         std::fs::write(&path, b"previous").unwrap();
-        let result = super::save_atomically(&path, |file| {
+        let result = crate::mmap_index::save_atomically(&path, |file| {
             file.write_all(b"incomplete")?;
             Err::<(), _>(io::Error::other("write failed"))
         });

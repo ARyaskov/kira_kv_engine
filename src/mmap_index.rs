@@ -8,9 +8,11 @@
 //! On other platforms the safe opener retains the owned-byte fallback; callers
 //! guaranteeing file immutability can use `open_unchecked` for zero-copy access.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(windows)]
+use std::fs::OpenOptions;
 use std::io::{self, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Magic prefix to detect kira_kv_engine on-disk indexes.
@@ -277,15 +279,15 @@ pub struct Header {
 
 /// Writer that builds an index file with multiple sections.
 pub struct MmapIndexWriter {
-    file: File,
+    path: PathBuf,
     pending_sections: Vec<(SectionKind, Vec<u8>)>,
     key_count: u64,
 }
 
 impl MmapIndexWriter {
+    /// Stage a snapshot. The destination is opened for publication by `finalize`.
     pub fn create<P: AsRef<Path>>(path: P, key_count: u64) -> std::io::Result<Self> {
-        let file = OpenOptions::new().create(true).truncate(true).write(true).open(path)?;
-        Ok(Self { file, pending_sections: Vec::new(), key_count })
+        Ok(Self { path: std::path::absolute(path)?, pending_sections: Vec::new(), key_count })
     }
 
     pub fn add_section(&mut self, kind: SectionKind, bytes: Vec<u8>) {
@@ -296,11 +298,62 @@ impl MmapIndexWriter {
     pub fn finalize(self) -> std::io::Result<()> {
         let sections: Vec<_> =
             self.pending_sections.iter().map(|(kind, bytes)| (*kind, bytes.len() as u64)).collect();
-        write_sections(self.file, self.key_count, &sections, |index, out| {
-            out.write_all(&self.pending_sections[index].1)
+        save_atomically(&self.path, |file| {
+            write_sections(file, self.key_count, &sections, |index, out| {
+                out.write_all(&self.pending_sections[index].1)
+            })
+            .map(|_| ())
         })
-        .map(|_| ())
     }
+}
+
+pub(crate) fn save_atomically<E: From<std::io::Error>>(
+    path: &std::path::Path,
+    write: impl FnOnce(&mut std::fs::File) -> Result<(), E>,
+) -> Result<(), E> {
+    use std::io::{Error, ErrorKind};
+    // Follow final-component links, including a relative link to a new file.
+    let mut target = path.to_owned();
+    let mut links = 0;
+    let permissions = loop {
+        match std::fs::symlink_metadata(&target) {
+            Ok(meta) if meta.is_symlink() => {
+                if links == 40 {
+                    return Err(Error::other("too many snapshot symlinks").into());
+                }
+                links += 1;
+                let destination = std::fs::read_link(&target)?;
+                target.pop();
+                target.push(destination);
+            }
+            Ok(meta) if meta.is_file() => {
+                // Enforce the same write-access requirement as a normal save.
+                let existing = std::fs::OpenOptions::new().write(true).open(&target)?;
+                break Some(existing.metadata()?.permissions());
+            }
+            Ok(_) => return Err(Error::other("snapshot destination must be a regular file").into()),
+            Err(error) if error.kind() == ErrorKind::NotFound => break None,
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let parent = target.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(".".as_ref());
+    let builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    let builder = {
+        use std::os::unix::fs::PermissionsExt;
+        let mut builder = builder;
+        builder.permissions(
+            permissions.clone().unwrap_or_else(|| std::fs::Permissions::from_mode(0o666)),
+        );
+        builder
+    };
+    let mut temporary = builder.tempfile_in(parent)?;
+    if let Some(permissions) = permissions {
+        temporary.as_file().set_permissions(permissions)?;
+    }
+    write(temporary.as_file_mut())?;
+    temporary.persist(target).map_err(|error| error.error)?;
+    Ok(())
 }
 
 /// Stream a pre-sized section container without reading or seeking its output.
@@ -321,7 +374,11 @@ pub(crate) fn write_sections<W: Write>(
         .ok_or_else(|| invalid("section table size overflow"))?;
     let mut cursor = checked_align(table_size as u64)?;
     let mut entries = Vec::with_capacity(sections.len());
+    let mut kinds = std::collections::HashSet::new();
     for &(kind, length) in sections {
+        if !kinds.insert(kind as u32) {
+            return Err(invalid("duplicate section kind"));
+        }
         entries.push(SectionEntry { kind: kind as u32, _pad: 0, offset: cursor, length });
         cursor = checked_align(
             cursor.checked_add(length).ok_or_else(|| invalid("section size overflow"))?,
@@ -478,5 +535,30 @@ mod streaming_tests {
         let blocked = WriteOnly { bytes: Vec::new(), limit: 0 };
         let output = write_sections(blocked, 0, &[], |_, _| unreachable!());
         assert!(matches!(output, Err(error) if error.kind() == io::ErrorKind::WriteZero));
+    }
+}
+
+#[cfg(test)]
+mod writer_tests {
+    use super::*;
+
+    #[test]
+    fn abandoned_or_invalid_writer_preserves_published_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("snapshot");
+        let mut writer = MmapIndexWriter::create(&path, 1).unwrap();
+        writer.add_section(SectionKind::LegacyPayload, vec![42]);
+        writer.finalize().unwrap();
+        drop(MmapIndexWriter::create(&path, 2).unwrap());
+
+        let mut invalid = MmapIndexWriter::create(&path, 3).unwrap();
+        invalid.add_section(SectionKind::LegacyPayload, vec![1]);
+        invalid.add_section(SectionKind::LegacyPayload, vec![2]);
+        assert_eq!(invalid.finalize().unwrap_err().kind(), io::ErrorKind::InvalidData);
+
+        let reader = MmapIndex::open(&path).unwrap();
+        let header = reader.parse_header().unwrap();
+        assert_eq!(header.key_count, 1);
+        assert_eq!(reader.section(&header, SectionKind::LegacyPayload), Some(&[42][..]));
     }
 }
