@@ -930,8 +930,7 @@ struct Scratch {
     cursor: Vec<u32>,
     items_h2: Vec<u64>,
     order: Vec<u32>,
-    /// Owning bucket per slot, `FREE` when empty.
-    slot_bucket: Vec<u32>,
+    slots: SlotOwners,
     /// Buckets still to be placed (largest first on top initially).
     stack: Vec<u32>,
     trial: Vec<u32>,
@@ -939,6 +938,40 @@ struct Scratch {
     start: Vec<u32>,
     duplicate_keys: Vec<u64>,
     candidate_marks: CandidateMarks,
+}
+
+/// Pilot trials probe one bit per slot. Only eviction needs the bucket identity.
+#[derive(Default)]
+struct SlotOwners {
+    occupied: Vec<u64>,
+    owners: Vec<u32>,
+}
+
+impl SlotOwners {
+    fn prepare(&mut self, slots: usize) {
+        grow(&mut self.occupied, slots.div_ceil(64));
+        grow(&mut self.owners, slots);
+    }
+
+    fn reset(&mut self, slots: usize) {
+        self.occupied[..slots.div_ceil(64)].fill(0);
+    }
+
+    #[inline(always)]
+    fn is_occupied(&self, slot: usize) -> bool {
+        self.occupied[slot / 64] & (1u64 << (slot % 64)) != 0
+    }
+
+    #[inline(always)]
+    fn claim(&mut self, slot: usize, bucket: u32) {
+        self.owners[slot] = bucket;
+        self.occupied[slot / 64] |= 1u64 << (slot % 64);
+    }
+
+    #[inline(always)]
+    fn release(&mut self, slot: usize) {
+        self.occupied[slot / 64] &= !(1u64 << (slot % 64));
+    }
 }
 
 /// Temporary slot membership for one candidate. Only slots recorded in `trial`
@@ -1062,16 +1095,16 @@ fn place_free(
     bucket: &[u64],
     pilot: u8,
     num_slots: usize,
-    slot_bucket: &[u32],
+    slots: &SlotOwners,
     trial: &mut [u32],
     marks: &mut CandidateMarks,
 ) -> bool {
     if bucket.len() > SMALL_BUCKET_LIMIT {
-        return place_free_large(bucket, pilot, num_slots, slot_bucket, trial, marks);
+        return place_free_large(bucket, pilot, num_slots, slots, trial, marks);
     }
     for (i, &h2) in bucket.iter().enumerate() {
         let slot = slot_for(h2, pilot, num_slots);
-        if slot_bucket[slot] != FREE {
+        if slots.is_occupied(slot) {
             return false;
         }
         for &t in &trial[..i] {
@@ -1090,7 +1123,7 @@ fn place_free_large(
     bucket: &[u64],
     pilot: u8,
     num_slots: usize,
-    slot_bucket: &[u32],
+    slots: &SlotOwners,
     trial: &mut [u32],
     marks: &mut CandidateMarks,
 ) -> bool {
@@ -1098,7 +1131,7 @@ fn place_free_large(
     let placed = (|| {
         for (i, &h2) in bucket.iter().enumerate() {
             let slot = slot_for(h2, pilot, num_slots);
-            if slot_bucket[slot] != FREE || !marks.insert(slot) {
+            if slots.is_occupied(slot) || !marks.insert(slot) {
                 return false;
             }
             trial[i] = slot as u32;
@@ -1119,7 +1152,7 @@ fn eviction_cost(
     bucket: &[u64],
     pilot: u8,
     num_slots: usize,
-    slot_bucket: &[u32],
+    slots: &SlotOwners,
     offsets: &[u32],
     recent: &[u32; RECENT],
     limit: usize,
@@ -1128,15 +1161,7 @@ fn eviction_cost(
 ) -> Option<usize> {
     if bucket.len() > SMALL_BUCKET_LIMIT {
         return eviction_cost_large(
-            bucket,
-            pilot,
-            num_slots,
-            slot_bucket,
-            offsets,
-            recent,
-            limit,
-            trial,
-            marks,
+            bucket, pilot, num_slots, slots, offsets, recent, limit, trial, marks,
         );
     }
     let mut cost = 0usize;
@@ -1148,8 +1173,8 @@ fn eviction_cost(
             }
         }
         trial[i] = slot as u32;
-        let owner = slot_bucket[slot];
-        if owner != FREE {
+        if slots.is_occupied(slot) {
+            let owner = slots.owners[slot];
             if recent.contains(&owner) {
                 return None;
             }
@@ -1170,7 +1195,7 @@ fn eviction_cost_large(
     bucket: &[u64],
     pilot: u8,
     num_slots: usize,
-    slot_bucket: &[u32],
+    slots: &SlotOwners,
     offsets: &[u32],
     recent: &[u32; RECENT],
     limit: usize,
@@ -1187,8 +1212,8 @@ fn eviction_cost_large(
             }
             trial[i] = slot as u32;
             recorded = i + 1;
-            let owner = slot_bucket[slot];
-            if owner != FREE {
+            if slots.is_occupied(slot) {
+                let owner = slots.owners[slot];
                 if recent.contains(&owner) {
                     return None;
                 }
@@ -1231,7 +1256,7 @@ fn build_part(
     grow(&mut sc.offsets, num_buckets + 1);
     grow(&mut sc.cursor, num_buckets + 1);
     grow(&mut sc.order, num_buckets);
-    grow(&mut sc.slot_bucket, num_slots);
+    sc.slots.prepare(num_slots);
     let Scratch {
         h1,
         bidx,
@@ -1239,7 +1264,7 @@ fn build_part(
         cursor,
         items_h2,
         order,
-        slot_bucket,
+        slots,
         stack,
         trial,
         freq,
@@ -1253,7 +1278,6 @@ fn build_part(
     let offsets = &mut offsets[..num_buckets + 1];
     let cursor = &mut cursor[..num_buckets + 1];
     let order = &mut order[..num_buckets];
-    let slot_bucket = &mut slot_bucket[..num_slots];
     let eviction_budget = m * EVICTION_BUDGET_PER_KEY + 1024;
 
     for round in 0..=cfg.max_rehash {
@@ -1330,7 +1354,7 @@ fn build_part(
         }
 
         // Step 4: pilot search, largest buckets first, with eviction.
-        slot_bucket.fill(FREE);
+        slots.reset(num_slots);
         grow(trial, max_size.max(1));
         let trial = &mut trial[..max_size.max(1)];
         if max_size > SMALL_BUCKET_LIMIT {
@@ -1354,9 +1378,9 @@ fn build_part(
             // 4a. Collision-free pilot, lowest first.
             let mut placed = false;
             for pilot in 0..=255u8 {
-                if place_free(bucket, pilot, num_slots, slot_bucket, trial, candidate_marks) {
+                if place_free(bucket, pilot, num_slots, slots, trial, candidate_marks) {
                     for &t in &trial[..len] {
-                        slot_bucket[t as usize] = b as u32;
+                        slots.claim(t as usize, b as u32);
                     }
                     job.pilots[b] = pilot;
                     placed = true;
@@ -1381,7 +1405,7 @@ fn build_part(
                         bucket,
                         pilot,
                         num_slots,
-                        slot_bucket,
+                        slots,
                         offsets,
                         &protect,
                         limit,
@@ -1408,19 +1432,19 @@ fn build_part(
             for (i, &h2) in bucket.iter().enumerate() {
                 let slot = slot_for(h2, pilot, num_slots);
                 trial[i] = slot as u32;
-                let owner = slot_bucket[slot];
-                if owner != FREE {
+                if slots.is_occupied(slot) {
+                    let owner = slots.owners[slot];
                     let ob = owner as usize;
                     let opilot = job.pilots[ob];
                     for &oh2 in &items_h2[offsets[ob] as usize..offsets[ob + 1] as usize] {
-                        slot_bucket[slot_for(oh2, opilot, num_slots)] = FREE;
+                        slots.release(slot_for(oh2, opilot, num_slots));
                     }
                     stack.push(owner);
                     evictions += 1;
                 }
             }
             for &t in &trial[..len] {
-                slot_bucket[t as usize] = b as u32;
+                slots.claim(t as usize, b as u32);
             }
             job.pilots[b] = pilot;
             recent[recent_pos] = b as u32;
@@ -1438,8 +1462,8 @@ fn build_part(
         // the final positions are a bijection onto [0, m).
         let mut next_free = 0usize;
         for tail in m..num_slots {
-            if slot_bucket[tail] != FREE {
-                while slot_bucket[next_free] != FREE {
+            if slots.is_occupied(tail) {
+                while slots.is_occupied(next_free) {
                     next_free += 1;
                 }
                 job.remap[tail - m] = next_free as u32;
@@ -1942,13 +1966,20 @@ mod large_bucket_tests {
                             },
                         )
                         .collect();
+                    let mut table = super::SlotOwners::default();
+                    table.prepare(slots);
+                    for (slot, &owner) in owners.iter().enumerate() {
+                        if owner != FREE {
+                            table.claim(slot, owner);
+                        }
+                    }
                     for pilot in 0..=255 {
                         let mut expected = vec![u32::MAX; keys.len()];
                         let mut actual = expected.clone();
                         let free = reference_free(&keys, pilot, slots, &owners, &mut expected);
                         marks.visits = 0;
                         assert_eq!(
-                            place_free(&keys, pilot, slots, &owners, &mut actual, &mut marks),
+                            place_free(&keys, pilot, slots, &table, &mut actual, &mut marks),
                             free
                         );
                         assert_eq!(actual, expected);
@@ -1977,7 +2008,7 @@ mod large_bucket_tests {
                                     &keys,
                                     pilot,
                                     slots,
-                                    &owners,
+                                    &table,
                                     &offsets,
                                     &recent,
                                     limit,
@@ -2017,9 +2048,10 @@ mod large_bucket_tests {
     fn small_candidates_do_not_allocate_a_slot_directory() {
         let mut marks = CandidateMarks::default();
         let keys: Vec<_> = (0..32).map(super::mix64).collect();
-        let owners = vec![FREE; 4096];
+        let mut table = super::SlotOwners::default();
+        table.prepare(4096);
         let mut trial = vec![0; keys.len()];
-        let _ = place_free(&keys, 0, owners.len(), &owners, &mut trial, &mut marks);
+        let _ = place_free(&keys, 0, 4096, &table, &mut trial, &mut marks);
         assert!(marks.words.is_empty());
         assert_eq!(marks.words.capacity(), 0);
     }

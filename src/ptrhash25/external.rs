@@ -359,7 +359,7 @@ fn working_bytes(keys: usize, config: &BuildConfig) -> Result<usize, MphExternal
     keys.checked_mul(48)
         .and_then(|bytes| bytes.checked_add(buckets.checked_mul(16)?))
         .and_then(|bytes| bytes.checked_add(slots.checked_mul(4)?))
-        .and_then(|bytes| bytes.checked_add(slots.div_ceil(64).checked_mul(8)?))
+        .and_then(|bytes| bytes.checked_add(slots.div_ceil(64).checked_mul(16)?))
         .and_then(|bytes| bytes.checked_add(FIXED_WORKING_BYTES + 16))
         .ok_or(MphExternalBuildError::CapacityExceeded("working set size overflow"))
 }
@@ -376,7 +376,7 @@ fn bounded_scratch(keys: usize, buckets: usize, slots: usize) -> Scratch {
         offsets: vec![0; buckets + 1],
         cursor: vec![0; buckets + 1],
         order: vec![0; buckets],
-        slot_bucket: vec![0; slots],
+        slots: super::SlotOwners { occupied: vec![0; slots.div_ceil(64)], owners: vec![0; slots] },
         stack: Vec::with_capacity(buckets),
         trial: vec![0; keys.max(1)],
         freq: vec![0; keys + 1],
