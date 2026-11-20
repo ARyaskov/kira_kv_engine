@@ -42,9 +42,10 @@ impl ExactU64Index {
         assert!(out.len() >= keys.len(), "out slice too small");
         let mut hashes = [0; WINDOW];
         let mut candidates = [None; WINDOW];
+        let mut bloom_first = false;
         for (keys, out) in keys.chunks(WINDOW).zip(out[..keys.len()].chunks_mut(WINDOW)) {
             let slots = &mut candidates[..keys.len()];
-            self.index.lookup_batch_u64_simd_into(keys, &mut hashes, slots);
+            self.index.lookup_batch_u64_with_order(keys, &mut hashes, slots, &mut bloom_first);
             for &slot in slots.iter().flatten() {
                 crate::prefetch::prefetch_read(&self.keys_by_slot[slot]);
             }

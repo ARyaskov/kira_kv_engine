@@ -412,6 +412,16 @@ impl Index {
         canon: &mut [u64],
         out: &mut [Option<usize>],
     ) {
+        self.lookup_batch_u64_with_order(keys, canon, out, &mut false);
+    }
+
+    pub(crate) fn lookup_batch_u64_with_order(
+        &self,
+        keys: &[u64],
+        canon: &mut [u64],
+        out: &mut [Option<usize>],
+        bloom_first: &mut bool,
+    ) {
         assert!(canon.len() >= keys.len(), "canon scratch too small");
         assert!(out.len() >= keys.len(), "out slice too small");
         let n = keys.len();
@@ -423,7 +433,7 @@ impl Index {
             return;
         };
         crate::simd_hash::hash_u64(keys, engine.prehash_seed, &mut canon[..n]);
-        Self::lookup_canonical_batch(engine, &canon[..n], &mut out[..n], &mut false);
+        Self::lookup_canonical_batch(engine, &canon[..n], &mut out[..n], bloom_first);
     }
 
     /// Three stages across 64 independent queries: pilot/Bloom prefetch,
