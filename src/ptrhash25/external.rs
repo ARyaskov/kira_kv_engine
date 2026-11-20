@@ -272,11 +272,18 @@ impl MphExternalBuilder {
         let mut fingerprints =
             if self.config.with_fingerprints { vec![0u8; expected_len] } else { Vec::new() };
         let global_salt = (part_count > 1).then(|| part_round_salt(self.config.seed, 0, 0));
+        // All three dimensions are monotone in the leaf key count. Allocate once
+        // for the largest leaf, whose budget was checked before any build.
+        let largest_leaf = infos.iter().max_by_key(|info| info.num_keys).unwrap();
+        let mut keys = Vec::with_capacity(largest_leaf.num_keys as usize);
+        let mut scratch = bounded_scratch(
+            largest_leaf.num_keys as usize,
+            largest_leaf.num_buckets as usize,
+            largest_leaf.num_slots as usize,
+        );
         for (part, info) in infos.iter_mut().enumerate() {
             let count = info.num_keys as usize;
-            let keys = read_leaf(temporary.path(), part, count)?;
-            let mut scratch =
-                bounded_scratch(count, info.num_buckets as usize, info.num_slots as usize);
+            read_leaf(temporary.path(), part, count, &mut keys)?;
             let pilot_start = info.bucket_off as usize;
             let remap_start = info.remap_off as usize;
             let fingerprint_start = info.slot_off as usize;
@@ -406,15 +413,15 @@ fn leaf_count(directory: &Path, part: usize) -> Result<usize, MphExternalBuildEr
         .map_err(|_| MphExternalBuildError::CapacityExceeded("partition too large"))
 }
 
-fn read_leaf(directory: &Path, part: usize, count: usize) -> io::Result<Vec<u64>> {
+fn read_leaf(directory: &Path, part: usize, count: usize, keys: &mut Vec<u64>) -> io::Result<()> {
     let mut file = BufReader::with_capacity(FILE_BUFFER, File::open(leaf_path(directory, part))?);
-    let mut keys = Vec::with_capacity(count);
+    keys.clear();
     for _ in 0..count {
         let mut bytes = [0; 8];
         file.read_exact(&mut bytes)?;
         keys.push(u64::from_le_bytes(bytes));
     }
-    Ok(keys)
+    Ok(())
 }
 
 fn split_file(
@@ -556,7 +563,8 @@ mod tests {
         let mut observed = Vec::new();
         for part in 0..parts {
             let count = leaf_count(directory.path(), part).unwrap();
-            let leaf = read_leaf(directory.path(), part, count).unwrap();
+            let mut leaf = Vec::new();
+            read_leaf(directory.path(), part, count, &mut leaf).unwrap();
             assert!(leaf.iter().all(|&key| part_of(key, salt, parts) == part));
             observed.extend(leaf);
         }
