@@ -709,7 +709,7 @@ impl Builder {
 
 /// Keys grouped by part, ready for [`build_partitioned`].
 ///
-/// `keys` holds the **prerotated** keys (see [`Partitioned::prerotate`]) ordered by
+/// `keys` holds the **prerotated** keys ordered by
 /// part; part `p` occupies `keys[part_offsets[p]..part_offsets[p+1]]`. The original
 /// key of entry `i` is `keys[i].rotate_right(prerotate)`.
 #[derive(Debug, Clone)]
