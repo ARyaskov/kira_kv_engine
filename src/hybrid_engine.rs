@@ -842,41 +842,53 @@ impl HybridIndex {
         keys.iter().map(|k| self.lookup(k.as_ref())).collect()
     }
 
-    /// SIMD-accelerated batch lookup for `u64` keys. Pipeline:
-    ///   1. SIMD canonical_hash (4-wide AVX2) of all keys at once.
-    ///   2. Prefetch Bloom blocks using their filter-specific hashes.
-    ///   3. Scalar segment-find + segment-lookup with cache-line prefetch
-    ///      of the segment directory.
+    /// SIMD-accelerated batch lookup for u64 keys using bounded stack scratch.
     pub fn lookup_batch_u64_simd(&self, keys: &[u64]) -> Vec<Option<u32>> {
-        let mut hashes = vec![0u64; keys.len()];
-        crate::simd_hash::hash_u64(keys, self.seed, &mut hashes);
-        self.lookup_batch_hashes(&hashes)
+        let mut out = vec![None; keys.len()];
+        self.lookup_batch_u64_simd_into(keys, &mut out);
+        out
+    }
+
+    /// Write results in query order without allocating. Any extra output is preserved.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `out` is shorter than `keys`.
+    pub fn lookup_batch_u64_simd_into(&self, keys: &[u64], out: &mut [Option<u32>]) {
+        assert!(out.len() >= keys.len(), "out slice too small");
+        let mut hashes = [0; 32];
+        for (keys, out) in keys.chunks(32).zip(out[..keys.len()].chunks_mut(32)) {
+            let hashes = &mut hashes[..keys.len()];
+            crate::simd_hash::hash_u64(keys, self.seed, hashes);
+            self.lookup_hash_chunk(hashes, out);
+        }
     }
 
     /// Batch lookup taking pre-computed canonical hashes in query order.
     pub fn lookup_batch_hashes(&self, hashes: &[u64]) -> Vec<Option<u32>> {
-        const WINDOW: usize = 32;
-        let mut out = Vec::with_capacity(hashes.len());
-        let mut bloom_hashes = [0; WINDOW];
-        for chunk in hashes.chunks(WINDOW) {
-            for (i, &hash) in chunk.iter().enumerate() {
-                if let Some(filter) = &self.bloom {
-                    bloom_hashes[i] = filter.hash_u64(hash);
-                    prefetch_read(filter.block_ptr(bloom_hashes[i]));
-                }
-                self.router.prefetch(&self.pgm, hash);
-            }
-            for (i, &hash) in chunk.iter().enumerate() {
-                let result =
-                    if self.bloom.as_ref().is_some_and(|f| !f.contains_hash(bloom_hashes[i])) {
-                        None
-                    } else {
-                        self.lookup_segment(hash)
-                    };
-                out.push(result);
-            }
+        let mut out = vec![None; hashes.len()];
+        for (hashes, out) in hashes.chunks(32).zip(out.chunks_mut(32)) {
+            self.lookup_hash_chunk(hashes, out);
         }
         out
+    }
+
+    fn lookup_hash_chunk(&self, hashes: &[u64], out: &mut [Option<u32>]) {
+        let mut bloom_hashes = [0; 32];
+        for (i, &hash) in hashes.iter().enumerate() {
+            if let Some(filter) = &self.bloom {
+                bloom_hashes[i] = filter.hash_u64(hash);
+                prefetch_read(filter.block_ptr(bloom_hashes[i]));
+            }
+            self.router.prefetch(&self.pgm, hash);
+        }
+        for (i, &hash) in hashes.iter().enumerate() {
+            out[i] = if self.bloom.as_ref().is_some_and(|f| !f.contains_hash(bloom_hashes[i])) {
+                None
+            } else {
+                self.lookup_segment(hash)
+            };
+        }
     }
 
     pub fn len(&self) -> usize {

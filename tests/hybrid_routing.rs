@@ -14,6 +14,10 @@ fn check_numeric_queries(index: &HybridIndex, keys: &[u64]) {
     assert_eq!(index.lookup_batch(&bytes), expected);
     assert_eq!(index.lookup_batch_hashes(&hashes), expected);
     assert_eq!(index.lookup_batch_u64_simd(keys), expected);
+    let mut out = vec![Some(u32::MAX); keys.len() + 1];
+    index.lookup_batch_u64_simd_into(keys, &mut out);
+    assert_eq!(&out[..keys.len()], expected);
+    assert_eq!(out[keys.len()], Some(u32::MAX));
 }
 
 #[test]

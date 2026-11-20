@@ -473,6 +473,7 @@ impl HybridIndex {
     pub fn lookup_hash(&self, hash: u64) -> Option<u32>;
     pub fn lookup_batch<K: AsRef<[u8]>>(&self, keys: &[K]) -> Vec<Option<u32>>;
     pub fn lookup_batch_u64_simd(&self, keys: &[u64]) -> Vec<Option<u32>>;
+    pub fn lookup_batch_u64_simd_into(&self, keys: &[u64], out: &mut [Option<u32>]);
     pub fn lookup_batch_hashes(&self, hashes: &[u64]) -> Vec<Option<u32>>;
 
     pub fn len(&self) -> usize;
