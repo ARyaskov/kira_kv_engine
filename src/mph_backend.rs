@@ -11,6 +11,7 @@
 //! dispatch layer is deprecated and goes away with it. PtrHash25 itself is now the
 //! paper-style algorithm (λ = 3 buckets, cuckoo-style eviction, tail remap).
 
+use crate::fingerprints::{FingerprintBits, Fingerprints};
 use crate::ptrhash25::{self, Partitioned, PtrHash25Error};
 use hashbrown::HashMap;
 
@@ -117,7 +118,7 @@ impl MphBackend for PtrHash25Backend {
                 return Self { storage: PtrHash25Storage::Map(build_fallback_map_original(keys)) };
             }
             let part = ptrhash25::partition_keys(keys, &cfg);
-            match Self::build_from_partitioned(&part, &cfg, false) {
+            match Self::build_from_partitioned(&part, &cfg, None) {
                 Ok((backend, _)) => backend,
                 // Keep the historical map behavior for duplicate keys in this API.
                 Err(_) => {
@@ -147,37 +148,58 @@ impl MphBackend for PtrHash25Backend {
 }
 
 impl PtrHash25Backend {
-    /// Build from already-partitioned keys. With `outer_fp16 = true` the u16
-    /// fingerprint table (`original_key & 0xFFFF` per slot) is filled inside the
-    /// per-part build — no slot array, no second pass.
+    /// Build the backend and write outer fingerprints into their final slots during placement.
     ///
     /// `Err(DuplicateKey)` is reported to the caller; `Unresolvable` (astronomically
     /// rare) falls back to a hash map keyed by the original u64 keys.
     pub(crate) fn build_from_partitioned(
         part: &Partitioned,
         cfg: &ptrhash25::BuildConfig,
-        outer_fp16: bool,
-    ) -> Result<(Self, Option<Vec<u16>>), PtrHash25Error> {
+        width: Option<FingerprintBits>,
+    ) -> Result<(Self, Option<Fingerprints>), PtrHash25Error> {
+        let n = part.len();
+        let outer_fp16 = width == Some(FingerprintBits::Bits16);
         let outputs = ptrhash25::BuildOutputs { slots: false, fp16: outer_fp16 };
-        match ptrhash25::build_partitioned_with(part, cfg, outputs) {
-            Ok((mph, _, fp16)) => Ok((Self { storage: PtrHash25Storage::Mph(mph) }, fp16)),
-            Err(PtrHash25Error::DuplicateKey) => Err(PtrHash25Error::DuplicateKey),
-            Err(PtrHash25Error::Unresolvable) => {
-                let n = part.len();
-                let mut map = HashMap::with_capacity(n * 2);
-                let mut fp16 = if outer_fp16 { Some(vec![0u16; n]) } else { None };
-                for i in 0..n {
-                    let key = part.original_key(i);
-                    if map.insert(key, i as u32).is_some() {
-                        return Err(PtrHash25Error::DuplicateKey);
-                    }
-                    if let Some(fp) = fp16.as_mut() {
-                        fp[i] = (key & 0xFFFF) as u16;
-                    }
-                }
-                Ok((Self { storage: PtrHash25Storage::Map(map) }, fp16))
+        let stride = width.map_or(0, |bits| bits.bits() as usize / 8);
+        let mut bytes = if stride > 2 { vec![0u8; n * stride + 1] } else { Vec::new() };
+        let packed = match width {
+            Some(FingerprintBits::Bits24) => {
+                Some(ptrhash25::PackedPart::U24(bytes[..n * 3].as_chunks_mut::<3>().0))
             }
-        }
+            Some(FingerprintBits::Bits32) => {
+                Some(ptrhash25::PackedPart::U32(bytes[..n * 4].as_chunks_mut::<4>().0))
+            }
+            _ => None,
+        };
+        let (storage, fp16) =
+            match ptrhash25::build_partitioned_with_packed(part, cfg, outputs, packed) {
+                Ok((mph, _, fp16)) => (PtrHash25Storage::Mph(mph), fp16),
+                Err(PtrHash25Error::DuplicateKey) => return Err(PtrHash25Error::DuplicateKey),
+                Err(PtrHash25Error::Unresolvable) => {
+                    let mut map = HashMap::with_capacity(n * 2);
+                    let mut fp16 = if outer_fp16 { Some(vec![0u16; n]) } else { None };
+                    for i in 0..n {
+                        let key = part.original_key(i);
+                        if map.insert(key, i as u32).is_some() {
+                            return Err(PtrHash25Error::DuplicateKey);
+                        }
+                        if let Some(fp) = fp16.as_mut() {
+                            fp[i] = (key & 0xFFFF) as u16;
+                        } else if stride > 2 {
+                            bytes[i * stride..(i + 1) * stride]
+                                .copy_from_slice(&key.to_le_bytes()[..stride]);
+                        }
+                    }
+                    (PtrHash25Storage::Map(map), fp16)
+                }
+            };
+        let fingerprints = match width {
+            Some(bits @ (FingerprintBits::Bits24 | FingerprintBits::Bits32)) => {
+                Some(Fingerprints::packed(bytes.into(), bits, n))
+            }
+            _ => fp16.map(Fingerprints::low16),
+        };
+        Ok((Self { storage }, fingerprints))
     }
 
     /// Upper bound on `lookup`'s return value.

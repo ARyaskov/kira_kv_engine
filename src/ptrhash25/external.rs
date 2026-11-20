@@ -294,6 +294,7 @@ impl MphExternalBuilder {
                     .with_fingerprints
                     .then(|| &mut fingerprints[fingerprint_start..fingerprint_start + count]),
                 fp16: None,
+                packed: None,
             };
             info.salt = build_part(&mut job, &mut scratch, &self.config)?;
         }

@@ -1493,7 +1493,7 @@ fn run_in_build_pool<T: Send>(parallel: bool, f: impl FnOnce() -> T + Send) -> T
 /// 2. partition the hashes into ~32K-key parts (`ptrhash25::partition_keys`);
 /// 3. build every part in parallel — bucket scatter, pilot search and per-key slots all
 ///    stay inside L2 (`ptrhash25::build_partitioned`);
-/// 4. Block-Bloom (parallel by block range) and u16 fingerprints (parallel by part,
+/// 4. Block-Bloom (parallel by block range) and fingerprints (parallel by part,
 ///    written from the slots the build already computed) — skipped in lean mode.
 ///
 /// There is no byte arena and no key copy: the only per-key allocations are the
@@ -1535,10 +1535,10 @@ where
         };
         let t2 = std::time::Instant::now();
         crate::ptrhash25::validate_partitioned(&part, &mph_cfg)?;
-        let (backend, fp16) = match PtrHash25Backend::build_from_partitioned(
+        let (backend, fingerprints) = match PtrHash25Backend::build_from_partitioned(
             &part,
             &mph_cfg,
-            !config.lean_mph && config.fingerprint_bits == FingerprintBits::Bits16,
+            (!config.lean_mph).then_some(config.fingerprint_bits),
         ) {
             Ok(v) => v,
             Err(MphError::DuplicateKey) => {
@@ -1557,26 +1557,6 @@ where
             Err(e) => return Err(e.into()),
         };
         let t3 = std::time::Instant::now();
-        // Default fp16 is filled inside the MPH build. Wider packed tables
-        // are filled from the original canonical hashes and the final slots.
-        let fingerprints = if config.lean_mph {
-            None
-        } else if config.fingerprint_bits == FingerprintBits::Bits16 {
-            fp16.map(Fingerprints::low16)
-        } else {
-            let stride = config.fingerprint_bits.bits() as usize / 8;
-            let mut data = vec![0u8; n * stride + 1];
-            for i in 0..part.len() {
-                let hash = part.original_key(i);
-                let slot = match &backend.storage {
-                    crate::mph_backend::PtrHash25Storage::Mph(m) => m.index_u64(hash),
-                    crate::mph_backend::PtrHash25Storage::Map(m) => m[&hash],
-                } as usize;
-                data[slot * stride..(slot + 1) * stride]
-                    .copy_from_slice(&hash.to_le_bytes()[..stride]);
-            }
-            Some(Fingerprints::packed(data.into(), config.fingerprint_bits, n))
-        };
         if trace {
             eprintln!(
                 "[kira_kv_engine build] n={} parts={} | canonical {:?} | bloom+partition {:?} | mph+fingerprints {:?} | total {:?}",

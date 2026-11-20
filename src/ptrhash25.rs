@@ -1065,6 +1065,22 @@ struct PartJob<'a> {
     /// Outer u16 fingerprints (`original_key & 0xFFFF`) per local position — written
     /// here so `Index` needs neither a slot array nor a second pass.
     fp16: Option<&'a mut [u16]>,
+    packed: Option<PackedPart<'a>>,
+}
+
+/// Disjoint local slots of the packed outer fingerprint table.
+pub(crate) enum PackedPart<'a> {
+    U24(&'a mut [[u8; 3]]),
+    U32(&'a mut [[u8; 4]]),
+}
+
+impl<'a> PackedPart<'a> {
+    fn take(&mut self, count: usize) -> Self {
+        match self {
+            Self::U24(values) => Self::U24(values.split_off_mut(..count).unwrap()),
+            Self::U32(values) => Self::U32(values.split_off_mut(..count).unwrap()),
+        }
+    }
 }
 
 /// Which side tables [`build_partitioned_with`] should fill.
@@ -1504,9 +1520,27 @@ fn build_part(
                 fp[slot] = (keys[i].rotate_right(rot) & 0xFFFF) as u16;
             }
         }
+        if let Some(packed) = &mut job.packed {
+            let rotate = job.prerotate as u32;
+            match packed {
+                PackedPart::U24(values) => fill_packed(values, keys, rotate, pos_of),
+                PackedPart::U32(values) => fill_packed(values, keys, rotate, pos_of),
+            }
+        }
         return Ok(salt);
     }
     Err(PtrHash25Error::Unresolvable)
+}
+
+fn fill_packed<const WIDTH: usize>(
+    output: &mut [[u8; WIDTH]],
+    keys: &[u64],
+    rotate: u32,
+    position: impl Fn(usize) -> (usize, u64),
+) {
+    for (i, &key) in keys.iter().enumerate() {
+        output[position(i).0].copy_from_slice(&key.rotate_right(rotate).to_le_bytes()[..WIDTH]);
+    }
 }
 
 fn run_jobs(jobs: Vec<PartJob<'_>>, cfg: &BuildConfig) -> Result<Vec<u64>, PtrHash25Error> {
@@ -1551,6 +1585,15 @@ pub fn build_partitioned_with(
     part: &Partitioned,
     cfg: &BuildConfig,
     outputs: BuildOutputs,
+) -> Result<(PtrHash25Mphf, Option<Vec<u32>>, Option<Vec<u16>>), PtrHash25Error> {
+    build_partitioned_with_packed(part, cfg, outputs, None)
+}
+
+pub(crate) fn build_partitioned_with_packed(
+    part: &Partitioned,
+    cfg: &BuildConfig,
+    outputs: BuildOutputs,
+    mut packed: Option<PackedPart<'_>>,
 ) -> Result<(PtrHash25Mphf, Option<Vec<u32>>, Option<Vec<u16>>), PtrHash25Error> {
     let n = part.len();
     validate_partitioned(part, cfg)?;
@@ -1643,6 +1686,7 @@ pub fn build_partitioned_with(
                 slots: sl,
                 fp8: f8,
                 fp16: f16,
+                packed: packed.as_mut().map(|table| table.take(m)),
             });
         }
     }

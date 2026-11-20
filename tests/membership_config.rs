@@ -37,3 +37,34 @@ fn all_membership_modes_agree_on_hits_batches_and_roundtrips() {
         }
     }
 }
+
+#[test]
+fn packed_fingerprints_match_canonical_hashes_in_each_final_slot() {
+    use kira_kv_engine::__internal::simd_hash::hash_u64_scalar;
+    use kira_kv_engine::MphConfig;
+    let keys: Vec<_> = (0..513u64).map(u64::to_le_bytes).collect();
+    let input: Vec<_> = (0..513u64).collect();
+    for lambda in [3.0, 10000.0] {
+        let config = MphConfig { lambda, max_rehash: 0, ..MphConfig::default() };
+        let mut canonical = vec![0; input.len()];
+        hash_u64_scalar(&input, config.seed, &mut canonical);
+        for bits in [FingerprintBits::Bits24, FingerprintBits::Bits32] {
+            let stride = bits.bits() as usize / 8;
+            let index = IndexBuilder::new()
+                .with_mph_config(config.clone())
+                .with_fingerprint_bits(bits)
+                .build_index_ref(&keys)
+                .unwrap();
+            let mut expected = vec![0u8; keys.len() * stride];
+            for (key, hash) in keys.iter().zip(&canonical) {
+                let slot = index.lookup(key).unwrap();
+                expected[slot * stride..(slot + 1) * stride]
+                    .copy_from_slice(&hash.to_le_bytes()[..stride]);
+            }
+            // The ordinary format ends with the packed table and its outer checksum.
+            let payload = index.to_bytes().unwrap();
+            assert_eq!(&payload[payload.len() - 8 - expected.len()..payload.len() - 8], &expected);
+            assert_eq!(index.gpu_export().is_some(), lambda == 3.0);
+        }
+    }
+}
