@@ -1,4 +1,4 @@
-use kira_kv_engine::{DynamicConfig, DynamicIndex};
+use kira_kv_engine::{CompactionPolicy, DynamicConfig, DynamicIndex};
 use std::collections::HashMap;
 
 #[test]
@@ -29,56 +29,85 @@ fn default_policy_preserves_full_merge_boundaries() {
 }
 
 #[test]
-fn geometric_merges_preserve_shadowing_deletion_and_revival() {
+fn tiered_merges_preserve_shadowing_deletion_and_revival() {
     for background in [false, true] {
         for lean in [false, true] {
-            let mut idx = DynamicIndex::with_config(DynamicConfig {
-                flush_threshold: 32,
-                max_tiers: 6,
-                lean_tiers: lean,
-                parallel_build: false,
-            });
-            idx.set_background_compaction(background).unwrap();
-            idx.set_compaction_ratio(3).unwrap();
-            let mut model = HashMap::new();
-            let mut random = 42u64;
-            for operation in 0..12000 {
-                random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
-                let key = format!("key-{}", random % 1500).into_bytes();
-                if random.is_multiple_of(5) {
-                    assert_eq!(idx.delete(&key), model.remove(&key));
-                } else {
-                    let id = idx.insert(key.clone());
-                    if let Some(previous) = model.insert(key.clone(), id) {
-                        assert_eq!(id, previous);
-                    }
-                }
-                assert_eq!(idx.lookup(&key), model.get(&key).copied());
-                assert_eq!(idx.len(), model.len());
-                if operation % 257 == 0 {
-                    idx.flush().unwrap();
-                    assert!(idx.tier_count() <= 6);
-                    for (key, &id) in &model {
-                        assert_eq!(idx.lookup(key), Some(id));
-                    }
-                    // Serialization must remain consistent even with a worker in flight.
-                    let restored = DynamicIndex::from_bytes(&idx.to_bytes()).unwrap();
-                    assert_eq!(restored.len(), model.len());
-                    for (key, &id) in &model {
-                        assert_eq!(restored.lookup(key), Some(id));
-                    }
-                }
-            }
-            idx.finish_background_compaction().unwrap();
-            assert!(idx.compaction_stats().0 > 0);
-            idx.compact().unwrap();
-            assert_eq!(idx.tier_count(), 1);
-            assert_eq!(idx.tombstone_count(), 0);
-            for i in 0..1500 {
-                let key = format!("key-{i}").into_bytes();
-                assert_eq!(idx.lookup(&key), model.get(&key).copied());
+            for policy in [CompactionPolicy::SizeTiered, CompactionPolicy::Geometric] {
+                check_tiered_merges(background, lean, policy);
             }
         }
+    }
+}
+
+fn check_tiered_merges(background: bool, lean: bool, policy: CompactionPolicy) {
+    let mut idx = DynamicIndex::with_config(DynamicConfig {
+        flush_threshold: 32,
+        max_tiers: 6,
+        lean_tiers: lean,
+        parallel_build: false,
+    });
+    idx.set_background_compaction(background).unwrap();
+    idx.set_compaction_ratio(3).unwrap();
+    idx.set_compaction_policy(policy).unwrap();
+    assert_eq!(idx.compaction_policy(), policy);
+    let mut model = HashMap::new();
+    let mut deleted = HashMap::new();
+    let mut deletes = 0;
+    let mut revivals = 0;
+    let mut next_id = 0u32;
+    let mut random = 42u64;
+    for operation in 0..12000 {
+        random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let key = format!("key-{}", random % 1500).into_bytes();
+        // Select the operation from different bits than the key.
+        // Otherwise every fifth key would only ever be deleted.
+        if (random >> 32).is_multiple_of(5) {
+            let expected = model.remove(&key);
+            assert_eq!(idx.delete(&key), expected);
+            if let Some(id) = expected {
+                deletes += 1;
+                deleted.insert(key.clone(), id);
+            }
+        } else {
+            let id = *model.entry(key.clone()).or_insert_with(|| {
+                let id = next_id;
+                next_id += 1;
+                id
+            });
+            assert_eq!(idx.insert(key.clone()), id);
+            if let Some(old_id) = deleted.remove(&key) {
+                revivals += 1;
+                assert!(id > old_id);
+            }
+        }
+        assert_eq!(idx.lookup(&key), model.get(&key).copied());
+        assert_eq!(idx.len(), model.len());
+        if operation % 257 == 0 {
+            idx.flush().unwrap();
+            assert!(idx.tier_count() <= idx.tier_limit());
+            if policy == CompactionPolicy::SizeTiered {
+                assert_eq!(idx.tier_limit(), 6);
+            }
+            for (key, &id) in &model {
+                assert_eq!(idx.lookup(key), Some(id));
+            }
+            // Serialization must remain consistent even with a worker in flight.
+            let restored = DynamicIndex::from_bytes(&idx.to_bytes()).unwrap();
+            assert_eq!(restored.len(), model.len());
+            for (key, &id) in &model {
+                assert_eq!(restored.lookup(key), Some(id));
+            }
+        }
+    }
+    assert!(deletes > 0 && revivals > 0);
+    idx.finish_background_compaction().unwrap();
+    assert!(idx.compaction_stats().0 > 0);
+    idx.compact().unwrap();
+    assert_eq!(idx.tier_count(), 1);
+    assert_eq!(idx.tombstone_count(), 0);
+    for i in 0..1500 {
+        let key = format!("key-{i}").into_bytes();
+        assert_eq!(idx.lookup(&key), model.get(&key).copied());
     }
 }
 
