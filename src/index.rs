@@ -608,10 +608,10 @@ impl Index {
         let Some(engine) = self.engine.as_ref() else {
             return false;
         };
-        let canonical = engine.hash_version.hash(key, engine.prehash_seed);
         match &engine.filter {
-            Some(bf) => bf.contains_hash(canonical),
-            // Without Bloom, use the fingerprints. Lean lookups cannot fail.
+            Some(filter) => {
+                filter.contains_hash(engine.hash_version.hash(key, engine.prehash_seed))
+            }
             None => self.lookup_mph(engine, key).is_ok(),
         }
     }
@@ -632,15 +632,24 @@ impl Index {
         let Some(engine) = self.engine.as_ref() else {
             return vec![false; keys.len()];
         };
-        keys.iter()
-            .map(|&key| {
-                let canonical = engine.hash_version.hash(key, engine.prehash_seed);
-                match &engine.filter {
-                    Some(bf) => bf.contains_hash(canonical),
-                    None => self.lookup_mph(engine, key).is_ok(),
-                }
-            })
-            .collect()
+        let Some(filter) = &engine.filter else {
+            return keys.iter().map(|key| self.lookup_mph(engine, key).is_ok()).collect();
+        };
+        let mut result = Vec::with_capacity(keys.len());
+        let mut scratch = [0u64; 64];
+        for input in keys.chunks(scratch.len()) {
+            if input.len() < 8 {
+                result.extend(input.iter().map(|key| self.contains(key)));
+                continue;
+            }
+            let hashes = &mut scratch[..input.len()];
+            engine.hash_version.hash_batch(input, engine.prehash_seed, hashes);
+            for &hash in hashes.iter() {
+                prefetch_read(filter.block_ptr(hash));
+            }
+            result.extend(hashes.iter().map(|&hash| filter.contains_hash(hash)));
+        }
+        result
     }
 
     #[deprecated(since = "0.7.0", note = "alias; use contains_batch")]
