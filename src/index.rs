@@ -1865,18 +1865,70 @@ fn save_atomically<E: From<std::io::Error>>(
     path: &std::path::Path,
     write: impl FnOnce(&mut std::fs::File) -> Result<(), E>,
 ) -> Result<(), E> {
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(".".as_ref());
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    if let Ok(metadata) = std::fs::metadata(path) {
-        temporary.as_file().set_permissions(metadata.permissions())?;
+    use std::io::{Error, ErrorKind};
+    // Follow final-component links, including a relative link to a new file.
+    let mut target = path.to_owned();
+    let mut links = 0;
+    let permissions = loop {
+        match std::fs::symlink_metadata(&target) {
+            Ok(meta) if meta.is_symlink() => {
+                if links == 40 {
+                    return Err(Error::other("too many snapshot symlinks").into());
+                }
+                links += 1;
+                let destination = std::fs::read_link(&target)?;
+                target.pop();
+                target.push(destination);
+            }
+            Ok(meta) if meta.is_file() => {
+                // Enforce the same write-access requirement as a normal save.
+                let existing = std::fs::OpenOptions::new().write(true).open(&target)?;
+                break Some(existing.metadata()?.permissions());
+            }
+            Ok(_) => return Err(Error::other("snapshot destination must be a regular file").into()),
+            Err(error) if error.kind() == ErrorKind::NotFound => break None,
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let parent = target.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(".".as_ref());
+    let builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    let builder = {
+        use std::os::unix::fs::PermissionsExt;
+        let mut builder = builder;
+        builder.permissions(
+            permissions.clone().unwrap_or_else(|| std::fs::Permissions::from_mode(0o666)),
+        );
+        builder
+    };
+    let mut temporary = builder.tempfile_in(parent)?;
+    if let Some(permissions) = permissions {
+        temporary.as_file().set_permissions(permissions)?;
     }
     write(temporary.as_file_mut())?;
-    temporary.persist(path).map_err(|error| error.error)?;
+    temporary.persist(target).map_err(|error| error.error)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod atomic_save_tests {
+    #[cfg(unix)]
+    #[test]
+    fn relative_symlink_and_permissions_survive_replacement() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("data");
+        let link = dir.path().join("latest");
+        symlink("data", &link).unwrap();
+        let index = super::Index::empty();
+        index.save(&link).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        index.save(&link).unwrap();
+        assert!(link.is_symlink());
+        assert_eq!(target.metadata().unwrap().permissions().mode() & 0o777, 0o640);
+        assert!(super::Index::load(target).unwrap().is_empty());
+    }
+
     #[test]
     fn failed_replacement_preserves_the_previous_snapshot() {
         use std::io::{self, Write};
