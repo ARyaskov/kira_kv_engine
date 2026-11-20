@@ -24,6 +24,8 @@ mod checksum;
 mod cpu;
 mod dynamic_index;
 mod elias_fano;
+mod exact_u64;
+pub use exact_u64::ExactU64Index;
 mod fingerprints;
 pub use fingerprints::FingerprintBits;
 mod hot_tier;

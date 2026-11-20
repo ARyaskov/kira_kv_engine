@@ -104,7 +104,7 @@ pub fn unseal_tagged(bytes: &[u8], tag: u8, kind: u8) -> Option<&[u8]> {
 /// Byte view of a numeric slice on little-endian targets.
 #[cfg(target_endian = "little")]
 #[inline(always)]
-fn as_bytes<T: LeNum>(v: &[T]) -> &[u8] {
+pub(crate) fn as_bytes<T: LeNum>(v: &[T]) -> &[u8] {
     // SAFETY: `T` is a plain number without padding; `v` is a valid slice, so its
     // `len * SIZE` bytes are initialized and readable for the returned lifetime.
     unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
