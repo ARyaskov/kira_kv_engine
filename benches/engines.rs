@@ -35,30 +35,35 @@ fn row(
     bytes_per_key: f64,
     lookup: f64,
     batch: Option<f64>,
-    miss: Option<f64>,
+    miss: Option<(f64, f64)>,
 ) {
     let fmt = |v: Option<f64>| v.map(|x| format!("{x:.1}")).unwrap_or_else(|| "—".into());
+    let (miss_ns, false_positive_percent) = miss.unzip();
     println!(
-        "| {engine} | {build_s:.2} | {bytes_per_key:.2} | {lookup:.1} | {} | {} |",
+        "| {engine} | {build_s:.2} | {bytes_per_key:.2} | {lookup:.1} | {} | {} | {} |",
         fmt(batch),
-        fmt(miss)
+        fmt(miss_ns),
+        false_positive_percent.map_or_else(|| "—".into(), |percent| format!("{percent:.4}%"))
     );
 }
 
 fn main() {
     let n: usize =
         std::env::var("KIRA_BENCH_N").ok().and_then(|v| v.parse().ok()).unwrap_or(10_000_000);
+    assert!(n > 0, "KIRA_BENCH_N must be positive");
     let q = 2_000_000usize.min(n);
+    let miss_end = n.checked_add(q).expect("query range overflow");
     let keys_u64: Vec<u64> = (0..n as u64).map(splitmix).collect();
     let keys_bytes: Vec<[u8; 8]> = keys_u64.iter().map(|k| k.to_le_bytes()).collect();
     let hits: Vec<u64> =
         (0..q as u64).map(|i| keys_u64[(splitmix(i ^ 0x77) % n as u64) as usize]).collect();
-    let misses: Vec<u64> = (0..q as u64).map(|i| splitmix(i ^ 0xDEAD_BEEF) | 1 << 63).collect();
+    // splitmix is bijective, so these queries are disjoint from the build input.
+    let misses: Vec<u64> = (n as u64..miss_end as u64).map(splitmix).collect();
     let mut sink = 0usize;
 
     println!("n = {n}, queries = {q}");
-    println!("| Engine | Build s | B/key | Lookup ns | Batch ns | Miss ns |");
-    println!("|---|---:|---:|---:|---:|---:|");
+    println!("| Engine | Build s | B/key | Lookup ns | Batch ns | Miss ns | False positives |");
+    println!("|---|---:|---:|---:|---:|---:|---:|");
 
     for lean in [false, true] {
         let mut cfg = IndexConfig::default();
@@ -92,7 +97,9 @@ fn main() {
         let miss = if lean {
             None
         } else {
-            Some(ns_per(q, || misses.iter().filter(|&&k| idx.lookup_u64(k).is_ok()).count()).0)
+            let (time, accepted) =
+                ns_per(q, || misses.iter().filter(|&&k| idx.lookup_u64(k).is_ok()).count());
+            Some((time, 100.0 * accepted as f64 / q as f64))
         };
         row(
             if lean { "Index (lean)" } else { "Index (default)" },
@@ -129,7 +136,9 @@ fn main() {
         let miss = if lean {
             None
         } else {
-            Some(ns_per(q, || misses.iter().filter(|&&k| idx.lookup_u64(k).is_some()).count()).0)
+            let (time, accepted) =
+                ns_per(q, || misses.iter().filter(|&&k| idx.lookup_u64(k).is_some()).count());
+            Some((time, 100.0 * accepted as f64 / q as f64))
         };
         row(
             if lean { "HybridIndex (lean)" } else { "HybridIndex" },
@@ -156,8 +165,10 @@ fn main() {
             hits.iter().fold(0usize, |a, &k| a.wrapping_add(pgm.index(k).expect("known PGM hit")))
         });
         sink = sink.wrapping_add(s);
-        let (miss, _) = ns_per(q, || misses.iter().filter(|&&k| pgm.index(k).is_ok()).count());
-        row("PgmIndex ε=64", build, bpk, lookup, None, Some(miss));
+        let (miss, accepted) =
+            ns_per(q, || misses.iter().filter(|&&k| pgm.index(k).is_ok()).count());
+        assert_eq!(accepted, 0);
+        row("PgmIndex ε=64", build, bpk, lookup, None, Some((miss, 0.0)));
     }
 
     {
