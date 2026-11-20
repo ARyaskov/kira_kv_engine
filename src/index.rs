@@ -415,13 +415,18 @@ impl Index {
             return;
         };
         crate::simd_hash::hash_u64(keys, engine.prehash_seed, &mut canon[..n]);
-        Self::lookup_canonical_batch(engine, &canon[..n], &mut out[..n]);
+        Self::lookup_canonical_batch(engine, &canon[..n], &mut out[..n], &mut false);
     }
 
     /// Three stages across 64 independent queries: pilot/Bloom prefetch,
     /// slot calculation/fingerprint prefetch, then fingerprint validation.
     /// Every output is overwritten, including misses when scratch is reused.
-    fn lookup_canonical_batch(engine: &MphEngine, hashes: &[u64], out: &mut [Option<usize>]) {
+    fn lookup_canonical_batch(
+        engine: &MphEngine,
+        hashes: &[u64],
+        out: &mut [Option<usize>],
+        bloom_first: &mut bool,
+    ) {
         use crate::mph_backend::PtrHash25Storage;
         let BackendDispatch::PtrHash25(backend) = &engine.backend;
         if hashes.len() < 16 {
@@ -466,16 +471,40 @@ impl Index {
         for (hashes, out) in hashes.chunks(LANES).zip(out.chunks_mut(LANES)) {
             let mut prepared = [crate::ptrhash25::PreparedLookup::default(); LANES];
             let mut slots = [usize::MAX; LANES];
+            let filter = engine.filter.as_ref();
+            let defer_pilots = *bloom_first && filter.is_some();
             for (i, &hash) in hashes.iter().enumerate() {
-                prepared[i] = mph.prepare_lookup(hash);
-                if let Some(bf) = &engine.filter {
+                if !defer_pilots {
+                    prepared[i] = mph.prepare_lookup(hash);
+                }
+                if let Some(bf) = filter {
                     prefetch_read(bf.block_ptr(hash));
                 }
             }
+            let mut survivors = [0u8; LANES];
+            let mut count = 0;
             for (i, &hash) in hashes.iter().enumerate() {
-                if engine.filter.as_ref().is_some_and(|bf| !bf.contains_hash(hash)) {
+                if filter.is_some_and(|bf| !bf.contains_hash(hash)) {
                     continue;
                 }
+                survivors[count] = i as u8;
+                count += 1;
+                if defer_pilots {
+                    prepared[i] = mph.prepare_lookup(hash);
+                }
+                if !defer_pilots {
+                    let slot = mph.finish_lookup(prepared[i]);
+                    slots[i] = slot;
+                    if let Some(fp) = &engine.fingerprints {
+                        fp.prefetch(slot);
+                    }
+                }
+            }
+            // A negative-heavy block predicts that fetching every pilot in the
+            // next block would mostly waste cache lines. Reevaluate each block.
+            *bloom_first = count <= hashes.len() / 4;
+            for &lane in &survivors[..if defer_pilots { count } else { 0 }] {
+                let i = lane as usize;
                 let slot = mph.finish_lookup(prepared[i]);
                 slots[i] = slot;
                 if let Some(fp) = &engine.fingerprints {
@@ -702,8 +731,9 @@ impl Index {
         // large result allocation only to overwrite it in the pipeline.
         let mut out = Vec::with_capacity(keys.len());
         let mut results = [None; 64];
+        let mut bloom_first = false;
         for input in keys.chunks(64) {
-            Self::lookup_byte_chunk(engine, input, &mut results[..input.len()]);
+            Self::lookup_byte_chunk(engine, input, &mut results[..input.len()], &mut bloom_first);
             out.extend_from_slice(&results[..input.len()]);
         }
         out
@@ -721,13 +751,19 @@ impl Index {
             out[..keys.len()].fill(None);
             return;
         };
+        let mut bloom_first = false;
         for (input, result) in keys.chunks(64).zip(out[..keys.len()].chunks_mut(64)) {
-            Self::lookup_byte_chunk(engine, input, result);
+            Self::lookup_byte_chunk(engine, input, result, &mut bloom_first);
         }
     }
 
     #[inline]
-    fn lookup_byte_chunk(engine: &MphEngine, input: &[&[u8]], result: &mut [Option<usize>]) {
+    fn lookup_byte_chunk(
+        engine: &MphEngine,
+        input: &[&[u8]],
+        result: &mut [Option<usize>],
+        bloom_first: &mut bool,
+    ) {
         // A whole block of independent payload addresses is known before any
         // hash is needed. Warm those bytes while prior keys are processed.
         if input.len() == 64 {
@@ -739,7 +775,7 @@ impl Index {
         }
         let mut hashes = [0u64; 64];
         engine.hash_version.hash_batch(input, engine.prehash_seed, &mut hashes[..input.len()]);
-        Self::lookup_canonical_batch(engine, &hashes[..input.len()], result);
+        Self::lookup_canonical_batch(engine, &hashes[..input.len()], result, bloom_first);
     }
 
     pub fn len(&self) -> usize {
