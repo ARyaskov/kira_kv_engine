@@ -1009,6 +1009,23 @@ mod routing_tests {
     use super::{HybridBuilder, HybridError, HybridIndex, SegmentRouter, SegmentStorage};
     use crate::pgm::PgmBuilder;
 
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn oversized_byte_key_input_is_rejected_before_hashing() {
+        #[derive(Clone, Copy)]
+        struct NeverHashed;
+        impl AsRef<[u8]> for NeverHashed {
+            fn as_ref(&self) -> &[u8] {
+                panic!("oversized input must be rejected before hashing");
+            }
+        }
+        let keys = [NeverHashed; u32::MAX as usize + 1];
+        assert!(matches!(
+            HybridBuilder::new().build(&keys),
+            Err(HybridError::Pgm(crate::PgmError::TooManyKeys))
+        ));
+    }
+
     #[test]
     fn loader_rejects_missing_positions_in_each_storage_kind() {
         let keys: Vec<u64> = (0..80).collect();

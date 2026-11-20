@@ -424,7 +424,7 @@ impl PgmIndexU128 {
 }
 
 #[non_exhaustive]
-pub enum PgmU128Error { DuplicateKeys, UnsortedKeys /* deprecated */, EmptyKeys /* deprecated */, KeyNotFound, CorruptData }
+pub enum PgmU128Error { DuplicateKeys, TooManyKeys, UnsortedKeys /* deprecated */, EmptyKeys /* deprecated */, KeyNotFound, CorruptData }
 ```
 
 ---
@@ -434,6 +434,10 @@ pub enum PgmU128Error { DuplicateKeys, UnsortedKeys /* deprecated */, EmptyKeys 
 Universal byte-key engine. PGM segments the hash space (locator only — the
 hashes are not kept twice); each segment is a linear array, a MiniChd, or a full
 PtrHash25 depending on size.
+
+Both Hybrid build paths reject more than `u32::MAX` keys before hashing with
+`HybridError::Pgm(PgmError::TooManyKeys)`. Both PGM-u128 builders enforce this
+same position limit before sorting or converting keys, returning `PgmU128Error::TooManyKeys`.
 
 ```rust
 pub struct HybridBuilder { /* opaque */ }
