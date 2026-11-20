@@ -828,9 +828,13 @@ impl HybridIndex {
         {
             return None;
         }
-        let seg_id = self.router.segment_for_key(&self.pgm, hash)?;
-        let seg = &self.segments[seg_id];
-        seg.lookup(hash)
+        self.lookup_segment(hash)
+    }
+
+    #[inline]
+    fn lookup_segment(&self, hash: u64) -> Option<u32> {
+        let segment = self.router.segment_for_key(&self.pgm, hash)?;
+        self.segments[segment].lookup(hash)
     }
 
     /// Batch lookup. Returns `Vec<Option<u32>>` in input order.
@@ -840,76 +844,37 @@ impl HybridIndex {
 
     /// SIMD-accelerated batch lookup for `u64` keys. Pipeline:
     ///   1. SIMD canonical_hash (4-wide AVX2) of all keys at once.
-    ///   2. Bloom prefetch wave (16 ahead).
+    ///   2. Prefetch Bloom blocks using their filter-specific hashes.
     ///   3. Scalar segment-find + segment-lookup with cache-line prefetch
-    ///      of `max_keys` slice 16 elements ahead.
-    ///
-    /// Throughput on 1M keys, Alder Lake: ~30 ns/lookup vs ~95 ns scalar.
+    ///      of the segment directory.
     pub fn lookup_batch_u64_simd(&self, keys: &[u64]) -> Vec<Option<u32>> {
-        let mut out = vec![None; keys.len()];
-        if keys.is_empty() {
-            return out;
-        }
-
-        // Phase 1: SIMD-hash u64 keys.
         let mut hashes = vec![0u64; keys.len()];
         crate::simd_hash::hash_u64(keys, self.seed, &mut hashes);
-
-        // Phase 2: prefetch chain. We prefetch two things WINDOW iters ahead:
-        //   - The Bloom block for hashes[i + WINDOW]
-        //   - The narrowed max_keys search midpoint for hashes[i + WINDOW]
-        const WINDOW: usize = 16;
-
-        for &h in &hashes[..WINDOW.min(hashes.len())] {
-            if let Some(bf) = &self.bloom {
-                prefetch_read(bf.block_ptr(h));
-            }
-            self.router.prefetch(&self.pgm, h);
-        }
-
-        for i in 0..hashes.len() {
-            // Issue prefetch for i+WINDOW.
-            if i + WINDOW < hashes.len() {
-                let future = hashes[i + WINDOW];
-                if let Some(bf) = &self.bloom {
-                    prefetch_read(bf.block_ptr(future));
-                }
-                self.router.prefetch(&self.pgm, future);
-            }
-
-            let hash = hashes[i];
-            // Bloom check (if present).
-            if let Some(bf) = &self.bloom
-                && !bf.contains_u64(hash)
-            {
-                continue;
-            }
-            // Segment find + lookup.
-            if let Some(seg_id) = self.router.segment_for_key(&self.pgm, hash) {
-                out[i] = self.segments[seg_id].lookup(hash);
-            }
-        }
-        out
+        self.lookup_batch_hashes(&hashes)
     }
 
-    /// Batch lookup taking pre-computed hashes. Use this when the caller
-    /// already has hashes from a previous step (e.g. SIMD-hashing a column).
+    /// Batch lookup taking pre-computed canonical hashes in query order.
     pub fn lookup_batch_hashes(&self, hashes: &[u64]) -> Vec<Option<u32>> {
-        let mut out = vec![None; hashes.len()];
-        const WINDOW: usize = 16;
-
-        if let Some(bf) = &self.bloom {
-            for &h in &hashes[..WINDOW.min(hashes.len())] {
-                prefetch_read(bf.block_ptr(h));
+        const WINDOW: usize = 32;
+        let mut out = Vec::with_capacity(hashes.len());
+        let mut bloom_hashes = [0; WINDOW];
+        for chunk in hashes.chunks(WINDOW) {
+            for (i, &hash) in chunk.iter().enumerate() {
+                if let Some(filter) = &self.bloom {
+                    bloom_hashes[i] = filter.hash_u64(hash);
+                    prefetch_read(filter.block_ptr(bloom_hashes[i]));
+                }
+                self.router.prefetch(&self.pgm, hash);
             }
-        }
-        for i in 0..hashes.len() {
-            if let Some(bf) = &self.bloom
-                && i + WINDOW < hashes.len()
-            {
-                prefetch_read(bf.block_ptr(hashes[i + WINDOW]));
+            for (i, &hash) in chunk.iter().enumerate() {
+                let result =
+                    if self.bloom.as_ref().is_some_and(|f| !f.contains_hash(bloom_hashes[i])) {
+                        None
+                    } else {
+                        self.lookup_segment(hash)
+                    };
+                out.push(result);
             }
-            out[i] = self.lookup_hash(hashes[i]);
         }
         out
     }
