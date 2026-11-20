@@ -1066,6 +1066,7 @@ struct PartJob<'a> {
     /// here so `Index` needs neither a slot array nor a second pass.
     fp16: Option<&'a mut [u16]>,
     packed: Option<PackedPart<'a>>,
+    exact_u64_slots: Option<(&'a mut [u64], u64)>,
 }
 
 /// Disjoint local slots of the packed outer fingerprint table.
@@ -1527,6 +1528,12 @@ fn build_part(
                 PackedPart::U32(values) => fill_packed(values, keys, rotate, pos_of),
             }
         }
+        if let Some((slots, seed)) = &mut job.exact_u64_slots {
+            for (i, &key) in keys.iter().enumerate() {
+                let canonical = key.rotate_right(job.prerotate as u32);
+                slots[pos_of(i).0] = crate::simd_hash::scalar::invert_hash_u64(canonical, *seed);
+            }
+        }
         return Ok(salt);
     }
     Err(PtrHash25Error::Unresolvable)
@@ -1586,7 +1593,7 @@ pub fn build_partitioned_with(
     cfg: &BuildConfig,
     outputs: BuildOutputs,
 ) -> Result<(PtrHash25Mphf, Option<Vec<u32>>, Option<Vec<u16>>), PtrHash25Error> {
-    build_partitioned_with_packed(part, cfg, outputs, None)
+    build_partitioned_with_packed(part, cfg, outputs, None, None)
 }
 
 pub(crate) fn build_partitioned_with_packed(
@@ -1594,6 +1601,7 @@ pub(crate) fn build_partitioned_with_packed(
     cfg: &BuildConfig,
     outputs: BuildOutputs,
     mut packed: Option<PackedPart<'_>>,
+    mut exact_u64_slots: Option<(&mut [u64], u64)>,
 ) -> Result<(PtrHash25Mphf, Option<Vec<u32>>, Option<Vec<u16>>), PtrHash25Error> {
     let n = part.len();
     validate_partitioned(part, cfg)?;
@@ -1687,6 +1695,9 @@ pub(crate) fn build_partitioned_with_packed(
                 fp8: f8,
                 fp16: f16,
                 packed: packed.as_mut().map(|table| table.take(m)),
+                exact_u64_slots: exact_u64_slots
+                    .as_mut()
+                    .map(|(slots, seed)| (slots.split_off_mut(..m).unwrap(), *seed)),
             });
         }
     }

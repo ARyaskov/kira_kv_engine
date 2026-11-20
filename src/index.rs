@@ -293,12 +293,24 @@ impl Index {
     where
         K: AsRef<[u8]> + Sync,
     {
+        Self::build_index_ref_with_slots(keys, config, None)
+    }
+
+    fn build_index_ref_with_slots<K>(
+        keys: &[K],
+        config: IndexConfig,
+        exact_u64_slots: Option<&mut [u64]>,
+    ) -> Result<Self, IndexError>
+    where
+        K: AsRef<[u8]> + Sync,
+    {
         config.mph_config.validate_for_len(keys.len())?;
         if keys.is_empty() {
             return Ok(Self::empty());
         }
-        let engine =
-            run_in_build_pool(config.enable_parallel_build, || build_engine(keys, &config))?;
+        let engine = run_in_build_pool(config.enable_parallel_build, || {
+            build_engine(keys, &config, exact_u64_slots)
+        })?;
         Ok(Index { engine: Some(engine), key_count: keys.len() })
     }
 
@@ -1498,7 +1510,11 @@ fn run_in_build_pool<T: Send>(parallel: bool, f: impl FnOnce() -> T + Send) -> T
 ///
 /// There is no byte arena and no key copy: the only per-key allocations are the
 /// canonical hash array and the partitioned hash array (8 B/key each).
-fn build_engine<K>(keys: &[K], config: &IndexConfig) -> Result<MphEngine, IndexError>
+fn build_engine<K>(
+    keys: &[K],
+    config: &IndexConfig,
+    mut exact_u64_slots: Option<&mut [u64]>,
+) -> Result<MphEngine, IndexError>
 where
     K: AsRef<[u8]> + Sync,
 {
@@ -1539,6 +1555,7 @@ where
             &part,
             &mph_cfg,
             (!config.lean_mph).then_some(config.fingerprint_bits),
+            exact_u64_slots.as_deref_mut().map(|slots| (slots, prehash_seed)),
         ) {
             Ok(v) => v,
             Err(MphError::DuplicateKey) => {
@@ -1777,6 +1794,14 @@ impl IndexBuilder {
 
     /// Build from borrowed keys — no clone, no deallocation inside the build. See
     /// [`Index::build_index_ref`].
+    pub(crate) fn build_u64_with_slots(
+        self,
+        keys: &[[u8; 8]],
+        slots: &mut [u64],
+    ) -> Result<Index, IndexError> {
+        Index::build_index_ref_with_slots(keys, self.config, Some(slots))
+    }
+
     pub fn build_index_ref<K>(self, keys: &[K]) -> Result<Index, IndexError>
     where
         K: AsRef<[u8]> + Sync,
