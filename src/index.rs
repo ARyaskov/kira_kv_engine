@@ -1,10 +1,7 @@
 use crate::block_bloom::BlockBloom;
 use crate::canonical_hash::CanonicalHashVersion;
 use crate::fingerprints::{FingerprintBits, Fingerprints};
-#[allow(deprecated)]
-use crate::mph_backend::{
-    BackendDispatch, BackendKind, BuildConfig as BackendConfig, BuildProfile, PtrHash25Backend,
-};
+use crate::mph_backend::{BackendDispatch, BackendKind, PtrHash25Backend};
 use crate::pgm::PgmError;
 use crate::ptrhash25::{BuildConfig as MphConfig, PtrHash25Error as MphError};
 use thiserror::Error;
@@ -118,6 +115,9 @@ impl From<PgmError> for IndexError {
 /// numeric range indexes.
 #[derive(Debug, Clone)]
 pub struct IndexConfig {
+    /// MPH geometry, seed, hash choice and retry limit. The low-level
+    /// `with_fingerprints` option applies to raw u64 MPH builders only;
+    /// this index controls membership using `fingerprint_bits` and `lean_mph`.
     pub mph_config: MphConfig,
     #[deprecated(since = "0.7.0", note = "no effect; use PgmBuilder::with_epsilon")]
     pub pgm_epsilon: u32,
@@ -296,10 +296,6 @@ impl Index {
         config.mph_config.validate_for_len(keys.len())?;
         if keys.is_empty() {
             return Ok(Self::empty());
-        }
-        let mut config = config;
-        if config.lean_mph {
-            config.mph_config.with_fingerprints = false;
         }
         let engine =
             run_in_build_pool(config.enable_parallel_build, || build_engine(keys, &config))?;
@@ -1477,24 +1473,6 @@ impl Index {
     }
 }
 
-#[inline(always)]
-#[allow(deprecated)]
-fn make_backend_cfg(config: &IndexConfig) -> BackendConfig {
-    BackendConfig {
-        backend: config.backend,
-        enable_parallel_build: config.enable_parallel_build,
-        seed: config.mph_config.seed,
-        lambda: config.mph_config.lambda,
-        alpha: config.mph_config.alpha,
-        rehash_limit: config.mph_config.max_rehash,
-        build_profile: if config.build_fast_profile {
-            BuildProfile::Fast
-        } else {
-            BuildProfile::Balanced
-        },
-    }
-}
-
 /// First byte of indexes written by this version (tags 0, 2, 3 are legacy).
 const TAG_V3: u8 = 4;
 const FORMAT_MAGIC: &[u8; 4] = b"KIRA";
@@ -1525,8 +1503,8 @@ fn build_engine<K>(keys: &[K], config: &IndexConfig) -> Result<MphEngine, IndexE
 where
     K: AsRef<[u8]> + Sync,
 {
-    let backend_cfg = make_backend_cfg(config);
-    let mph_cfg = backend_cfg.mph_config();
+    // Index verifies its own fingerprint table; only the raw u64 builder needs fp8.
+    let mph_cfg = MphConfig { with_fingerprints: false, ..config.mph_config.clone() };
     let base_seed = config.mph_config.seed;
     // `KIRA_BUILD_TRACE=1` prints per-phase timings to stderr.
     let trace = std::env::var_os("KIRA_BUILD_TRACE").is_some();
@@ -1560,7 +1538,7 @@ where
         crate::ptrhash25::validate_partitioned(&part, &mph_cfg)?;
         let (backend, fp16) = match PtrHash25Backend::build_from_partitioned(
             &part,
-            &backend_cfg,
+            &mph_cfg,
             !config.lean_mph && config.fingerprint_bits == FingerprintBits::Bits16,
         ) {
             Ok(v) => v,

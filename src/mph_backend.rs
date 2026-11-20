@@ -117,7 +117,7 @@ impl MphBackend for PtrHash25Backend {
                 return Self { storage: PtrHash25Storage::Map(build_fallback_map_original(keys)) };
             }
             let part = ptrhash25::partition_keys(keys, &cfg);
-            match Self::build_from_partitioned(&part, config, false) {
+            match Self::build_from_partitioned(&part, &cfg, false) {
                 Ok((backend, _)) => backend,
                 // Keep the historical map behavior for duplicate keys in this API.
                 Err(_) => {
@@ -155,12 +155,11 @@ impl PtrHash25Backend {
     /// rare) falls back to a hash map keyed by the original u64 keys.
     pub(crate) fn build_from_partitioned(
         part: &Partitioned,
-        config: &BuildConfig,
+        cfg: &ptrhash25::BuildConfig,
         outer_fp16: bool,
     ) -> Result<(Self, Option<Vec<u16>>), PtrHash25Error> {
-        let cfg = config.mph_config();
         let outputs = ptrhash25::BuildOutputs { slots: false, fp16: outer_fp16 };
-        match ptrhash25::build_partitioned_with(part, &cfg, outputs) {
+        match ptrhash25::build_partitioned_with(part, cfg, outputs) {
             Ok((mph, _, fp16)) => Ok((Self { storage: PtrHash25Storage::Mph(mph) }, fp16)),
             Err(PtrHash25Error::DuplicateKey) => Err(PtrHash25Error::DuplicateKey),
             Err(PtrHash25Error::Unresolvable) => {

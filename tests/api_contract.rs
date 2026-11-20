@@ -184,3 +184,48 @@ fn low_level_result_builder_rejects_invalid_geometry_without_panicking() {
         ));
     }
 }
+
+#[test]
+fn static_builder_forwards_hash_choice_and_retry_limit() {
+    use kira_kv_engine::__internal::{Builder, simd_hash::hash_u64_scalar};
+    let input: Vec<_> = (0..64u64).collect();
+    let keys: Vec<_> = input.iter().map(|k| k.to_le_bytes()).collect();
+    for use_aes_hash in [false, true] {
+        let config = MphConfig { use_aes_hash, max_rehash: 0, ..MphConfig::default() };
+        let mut canonical = vec![0; keys.len()];
+        hash_u64_scalar(&input, config.seed, &mut canonical);
+        let raw = Builder::new().with_config(config.clone()).build(&canonical).unwrap();
+        let index = IndexBuilder::new().with_mph_config(config).build_index_ref(&keys).unwrap();
+        assert_eq!(index.gpu_export().is_some(), !use_aes_hash);
+        let restored = Index::from_bytes(&index.to_bytes().unwrap()).unwrap();
+        for (key, hash) in keys.iter().zip(canonical) {
+            assert_eq!(index.lookup(key).unwrap(), raw.index_u64(hash) as usize);
+            assert_eq!(restored.lookup(key).unwrap(), raw.index_u64(hash) as usize);
+        }
+    }
+    // Pick a deterministic set whose first salt fails and whose later salt works.
+    // A hard-coded minimum retry count would incorrectly yield a GPU-exportable MPH.
+    let keys: Vec<_> = (0..9u64).map(u64::to_le_bytes).collect();
+    let input: Vec<_> = (0..9u64).collect();
+    let config = (0..256u64)
+        .find_map(|seed| {
+            let cfg = MphConfig { seed, lambda: 100.0, max_rehash: 0, ..MphConfig::default() };
+            let mut hashes = [0; 9];
+            hash_u64_scalar(&input, seed, &mut hashes);
+            let raw = |cfg| Builder::new().with_config(cfg).build(&hashes);
+            if raw(cfg.clone()).is_err() && raw(MphConfig { max_rehash: 8, ..cfg.clone() }).is_ok()
+            {
+                Some(cfg)
+            } else {
+                None
+            }
+        })
+        .expect("a set requiring a retry");
+    for (retries, exportable) in [(0, false), (8, true)] {
+        let index = IndexBuilder::new()
+            .with_mph_config(MphConfig { max_rehash: retries, ..config.clone() })
+            .build_index_ref(&keys)
+            .unwrap();
+        assert_eq!(index.gpu_export().is_some(), exportable);
+    }
+}
