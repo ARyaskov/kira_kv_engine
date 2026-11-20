@@ -234,7 +234,8 @@ impl SegmentStorage {
                 if unsafe { *slot_hashes.get_unchecked(slot) } != hash {
                     return None;
                 }
-                Some(unsafe { *positions.get_unchecked(slot) })
+                let pos = positions[slot];
+                (pos != u32::MAX).then_some(pos)
             }
             SegmentStorage::MiniMph { mph, positions } => {
                 let slot = mph.lookup_u64(hash)?;
@@ -717,9 +718,24 @@ impl HybridIndex {
         {
             return Err(bad());
         }
-        let pos_ok = |p: &[u32]| p.iter().all(|&v| v == u32::MAX || (v as usize) < n);
         let mut segments = Vec::with_capacity(seg_count);
-        for _ in 0..seg_count {
+        for (seg_id, bounds) in seg_offsets.windows(2).enumerate() {
+            if pgm.segment_bounds(seg_id) != Some((bounds[0], bounds[1])) {
+                return Err(bad());
+            }
+            let segment_len = (bounds[1] - bounds[0]) as usize;
+            let occupied_positions_valid = |positions: &[u32]| {
+                let mut occupied = 0usize;
+                for &position in positions {
+                    if position != u32::MAX {
+                        if position as usize >= n {
+                            return false;
+                        }
+                        occupied += 1;
+                    }
+                }
+                occupied == segment_len
+            };
             let seg = match rd_u8(&mut pos)? {
                 SEG_LINEAR => {
                     let len = rd_u32(&mut pos)? as usize;
@@ -727,7 +743,9 @@ impl HybridIndex {
                         crate::wire::read_le_at(body, &mut pos, len).ok_or_else(bad)?;
                     let positions: Vec<u32> =
                         crate::wire::read_le_at(body, &mut pos, len).ok_or_else(bad)?;
-                    if !pos_ok(&positions) {
+                    if len != segment_len
+                        || positions.iter().any(|&position| position as usize >= n)
+                    {
                         return Err(bad());
                     }
                     SegmentStorage::Linear { hashes, positions }
@@ -746,7 +764,7 @@ impl HybridIndex {
                         crate::wire::read_le_at(body, &mut pos, cn as usize).ok_or_else(bad)?;
                     let positions: Vec<u32> =
                         crate::wire::read_le_at(body, &mut pos, cn as usize).ok_or_else(bad)?;
-                    if !pos_ok(&positions) {
+                    if !occupied_positions_valid(&positions) {
                         return Err(bad());
                     }
                     let chd = crate::mini_chd::MiniChd {
@@ -762,7 +780,7 @@ impl HybridIndex {
                     let positions: Vec<u32> =
                         crate::wire::read_le_at(body, &mut pos, mph.slot_capacity())
                             .ok_or_else(bad)?;
-                    if !pos_ok(&positions) {
+                    if !occupied_positions_valid(&positions) {
                         return Err(bad());
                     }
                     SegmentStorage::MiniMph { mph, positions }
@@ -983,8 +1001,40 @@ impl HybridStorageStats {
 
 #[cfg(test)]
 mod routing_tests {
-    use super::{HybridBuilder, HybridIndex, SegmentRouter};
+    use super::{HybridBuilder, HybridError, HybridIndex, SegmentRouter, SegmentStorage};
     use crate::pgm::PgmBuilder;
+
+    #[test]
+    fn loader_rejects_missing_positions_in_each_storage_kind() {
+        let keys: Vec<u64> = (0..80).collect();
+        for (linear, chd) in [(80, 80), (0, 80), (0, 0)] {
+            let mut index = HybridBuilder::new()
+                .with_parallel(false)
+                .with_linear_threshold(linear)
+                .with_chd_threshold(chd)
+                .build_from_u64(&keys)
+                .unwrap();
+            assert_eq!(index.num_segments(), 1);
+            let valid = HybridIndex::from_bytes(&index.to_bytes()).unwrap();
+            for &key in &keys {
+                assert_eq!(valid.lookup_u64(key), Some(key as u32));
+            }
+            let positions = match &mut index.segments[0] {
+                SegmentStorage::Linear { positions, .. } if linear > 0 => positions,
+                SegmentStorage::MiniChd { positions, .. } if chd > 0 => {
+                    assert!(positions.contains(&u32::MAX));
+                    positions
+                }
+                SegmentStorage::MiniMph { positions, .. } if chd == 0 => positions,
+                _ => panic!("expected the requested storage kind"),
+            };
+            *positions.iter_mut().find(|p| **p != u32::MAX).unwrap() = u32::MAX;
+            assert!(matches!(
+                HybridIndex::from_bytes(&index.to_bytes()),
+                Err(HybridError::CorruptData)
+            ));
+        }
+    }
 
     #[test]
     fn radix_candidates_cover_prefix_boundaries_and_full_u64_extremes() {
