@@ -25,6 +25,18 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
 
+  msrv:
+    name: Rust 1.96 compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --lib
+      - run: cargo check --lib --no-default-features
+
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
