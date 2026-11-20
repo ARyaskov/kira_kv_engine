@@ -197,3 +197,30 @@ fn legacy_map_batches_honor_the_same_bloom_rejection_as_scalar_lookup() {
         assert_eq!(output[length], Some(17));
     }
 }
+
+#[test]
+fn a_failed_part_cannot_hide_a_duplicate_in_a_later_part() {
+    use kira_kv_engine::__internal::{
+        PART_TARGET_KEYS, partition_keys, simd_hash::hash_u64_scalar,
+    };
+    let config = MphConfig { lambda: 1_000_000.0, max_rehash: 0, ..MphConfig::default() };
+    let mut input: Vec<u64> = (0..(PART_TARGET_KEYS + 1024) as u64).collect();
+    let mut hashes = vec![0; input.len()];
+    hash_u64_scalar(&input, config.seed, &mut hashes);
+    let parts = partition_keys(&hashes, &config);
+    // The last element is outside the prerotation sample. Replacing it preserves the
+    // partitioner, leaving the unrelated, unplaceable first part entirely unique.
+    let duplicate_hash = parts.original_key(parts.part_range(1).start);
+    let duplicate = hashes.iter().position(|&h| h == duplicate_hash).unwrap();
+    assert!(duplicate < input.len() - 1);
+    *input.last_mut().unwrap() = duplicate as u64;
+    let keys: Vec<_> = input.into_iter().map(u64::to_le_bytes).collect();
+    assert!(matches!(
+        IndexBuilder::new()
+            .with_parallel_build(false)
+            .with_bloom_filter(false)
+            .with_mph_config(config)
+            .build_index_ref(&keys),
+        Err(kira_kv_engine::IndexError::DuplicateKey)
+    ));
+}

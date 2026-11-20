@@ -169,7 +169,9 @@ impl PtrHash25Backend {
                 let mut fp16 = if outer_fp16 { Some(vec![0u16; n]) } else { None };
                 for i in 0..n {
                     let key = part.original_key(i);
-                    map.insert(key, i as u32);
+                    if map.insert(key, i as u32).is_some() {
+                        return Err(PtrHash25Error::DuplicateKey);
+                    }
                     if let Some(fp) = fp16.as_mut() {
                         fp[i] = (key & 0xFFFF) as u16;
                     }
