@@ -30,16 +30,21 @@ pub enum MiniChdError {
 #[derive(Debug, Clone)]
 pub struct MiniChd {
     /// Slot space (= ceil(1.10 · N) by default).
-    pub n: u32,
+    pub(crate) n: u32,
     /// Per-instance hash salt.
-    pub salt: u64,
+    pub(crate) salt: u64,
     /// Pilot per bucket. `pilots.len()` == `num_buckets`.
-    pub pilots: Box<[u8]>,
+    pub(crate) pilots: Box<[u8]>,
     /// Number of buckets (target ~ 2× keys for low collision rate per bucket).
-    pub num_buckets: u32,
+    pub(crate) num_buckets: u32,
 }
 
 impl MiniChd {
+    /// Exclusive upper bound on lookup results.
+    pub fn slot_capacity(&self) -> usize {
+        self.n as usize
+    }
+
     /// Build a MiniChd over the given u64 keys. Returns `None` if all 16 salt
     /// retries fail (extremely rare for clean inputs).
     pub fn build(keys: &[u64], base_seed: u64) -> Result<Self, MiniChdError> {

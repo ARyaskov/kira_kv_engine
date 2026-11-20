@@ -112,8 +112,8 @@ fn build_with_slots_matches_lookup() {
     assert_eq!(part.len(), n);
     assert_eq!(slots.len(), n);
     for p in 0..part.num_parts() {
-        let off = mph.parts[p].slot_off as usize;
-        for i in part.part_offsets[p]..part.part_offsets[p + 1] {
+        let off = mph.parts()[p].slot_off as usize;
+        for i in part.part_range(p) {
             let key = part.original_key(i);
             assert_eq!(mph.index_u64(key) as usize, off + slots[i] as usize);
         }
@@ -133,8 +133,8 @@ fn build_partitioned_with_fp16_matches_keys() {
     let fp16 = fp16.expect("fp16");
     assert_eq!(fp16.len(), mph.slot_capacity());
     for p in 0..part.num_parts() {
-        let off = mph.parts[p].slot_off as usize;
-        for i in part.part_offsets[p]..part.part_offsets[p + 1] {
+        let off = mph.parts()[p].slot_off as usize;
+        for i in part.part_range(p) {
             let key = part.original_key(i);
             let slot = off + slots[i] as usize;
             assert_eq!(mph.index_u64(key) as usize, slot);
@@ -170,7 +170,7 @@ fn multi_part_with_inner_fingerprints_rejects_foreign() {
     let cfg = BuildConfig { with_fingerprints: true, ..BuildConfig::default() };
     let mph = Builder::new().with_config(cfg).build(&keys).expect("build failed");
     assert!(mph.num_parts() > 1);
-    assert_eq!(mph.fingerprints.len(), mph.slot_capacity());
+    assert_eq!(mph.fingerprints().len(), mph.slot_capacity());
     for &k in &keys {
         assert!(mph.lookup_u64(k).is_some());
     }

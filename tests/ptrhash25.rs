@@ -4,7 +4,7 @@ use kira_kv_engine::__internal::{Builder, read_ptrhash25, write_ptrhash25};
 fn round_trip_small() {
     let keys: Vec<u64> = (0..1000u64).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15)).collect();
     let mph = Builder::new().build(&keys).expect("build failed");
-    let slot_space = mph.n as usize;
+    let slot_space = mph.slot_capacity();
     let mut seen = vec![false; slot_space];
     for &k in &keys {
         let slot = mph.index_u64(k) as usize;
@@ -22,7 +22,7 @@ fn round_trip_100k() {
     let n = 100_000usize;
     let keys: Vec<u64> = (0..n as u64).map(|i| i.wrapping_mul(0xBF58_476D_1CE4_E5B9)).collect();
     let mph = Builder::new().build(&keys).expect("build failed");
-    let slot_space = mph.n as usize;
+    let slot_space = mph.slot_capacity();
     let mut seen = vec![false; slot_space];
     for &k in &keys {
         let slot = mph.index_u64(k) as usize;

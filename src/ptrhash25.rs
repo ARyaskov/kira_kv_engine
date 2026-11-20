@@ -317,32 +317,39 @@ impl PartInfo {
 #[derive(Debug, Clone)]
 pub struct PtrHash25Mphf {
     /// Number of keys = size of the output range: `index_u64` returns values in `[0, n)`.
-    pub n: u64,
+    pub(crate) n: u64,
     /// Total number of buckets across all parts.
-    pub num_buckets: u32,
+    pub(crate) num_buckets: u32,
     /// Multi-part: salt of the global base hash (`h1 = remix(base_hash(key, salt),
     /// parts[p].salt)`). Single part: the hash salt itself (`parts[0].salt`, legacy).
-    pub salt: u64,
+    pub(crate) salt: u64,
     /// One pilot byte per bucket. Hugepage-backed when ≥ 1 MB.
-    pub pilots: crate::hugepage::HugeVec<u8>,
+    pub(crate) pilots: crate::hugepage::HugeVec<u8>,
     /// Tail redirection: for part `p`, local slot `s ≥ num_keys` maps to
     /// `remap[p.remap_off + s - num_keys]`, a free slot `< num_keys`.
-    pub remap: crate::hugepage::HugeVec<u32>,
+    pub(crate) remap: crate::hugepage::HugeVec<u32>,
     /// Optional fingerprint table (u8 per output position) for negative-query rejection.
     /// Empty if the index doesn't need negative-query support.
-    pub fingerprints: Vec<u8>,
+    pub(crate) fingerprints: Vec<u8>,
     /// True iff this MPHF was built with the AES hash. Lookups must use the same path.
-    pub use_aes_hash: bool,
+    pub(crate) use_aes_hash: bool,
     /// Data-driven bit rotation applied to keys before hashing (0..63). Learned
     /// during build to flatten bucket-size variance for the specific key distribution.
-    pub prerotate: u8,
+    pub(crate) prerotate: u8,
     /// Salt of the part-selector hash. Unused when `parts.len() == 1`.
-    pub part_salt: u64,
+    pub(crate) part_salt: u64,
     /// Per-part geometry. Always at least one entry.
-    pub parts: Box<[PartInfo]>,
+    pub(crate) parts: Box<[PartInfo]>,
 }
 
 impl PtrHash25Mphf {
+    pub fn parts(&self) -> &[PartInfo] {
+        &self.parts
+    }
+    pub fn fingerprints(&self) -> &[u8] {
+        &self.fingerprints
+    }
+
     /// First pipeline stage: compute and prefetch the pilot address without loading it.
     #[inline(always)]
     pub(crate) fn prepare_lookup(&self, key: u64) -> PreparedLookup {
@@ -708,13 +715,17 @@ impl Builder {
 #[derive(Debug, Clone)]
 pub struct Partitioned {
     /// Hugepage-backed when available (≥ 1 MB): 800 MB at 100M keys.
-    pub keys: crate::hugepage::HugeVec<u64>,
-    pub part_offsets: Vec<usize>,
-    pub part_salt: u64,
-    pub prerotate: u8,
+    pub(crate) keys: crate::hugepage::HugeVec<u64>,
+    pub(crate) part_offsets: Vec<usize>,
+    pub(crate) part_salt: u64,
+    pub(crate) prerotate: u8,
 }
 
 impl Partitioned {
+    pub fn part_range(&self, p: usize) -> std::ops::Range<usize> {
+        self.part_offsets[p]..self.part_offsets[p + 1]
+    }
+
     #[inline]
     pub fn len(&self) -> usize {
         self.keys.len()
@@ -2011,5 +2022,107 @@ mod large_bucket_tests {
         let _ = place_free(&keys, 0, owners.len(), &owners, &mut trial, &mut marks);
         assert!(marks.words.is_empty());
         assert_eq!(marks.words.capacity(), 0);
+    }
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+    fn part(
+        slot_off: u64,
+        num_keys: u32,
+        num_slots: u32,
+        bucket_off: u32,
+        remap_off: u32,
+    ) -> PartInfo {
+        PartInfo {
+            slot_off,
+            salt: 0,
+            bucket_off,
+            num_keys,
+            num_slots,
+            num_buckets: 1,
+            large_buckets: 0,
+            remap_off,
+        }
+    }
+
+    fn mph(n: u64, parts: Vec<PartInfo>, remap: Vec<u32>) -> PtrHash25Mphf {
+        PtrHash25Mphf {
+            n,
+            num_buckets: parts.len() as u32,
+            salt: 0,
+            pilots: vec![0; parts.len()].into(),
+            remap: remap.into(),
+            fingerprints: Vec::new(),
+            use_aes_hash: false,
+            prerotate: 0,
+            part_salt: 0,
+            parts: parts.into_boxed_slice(),
+        }
+    }
+
+    fn assert_geometry_rejected(mph: PtrHash25Mphf) {
+        assert!(!mph.validate());
+        let mut bytes = Vec::new();
+        write_ptrhash25(&mph, &mut bytes);
+        assert!(read_ptrhash25(&bytes, &mut 0).is_none());
+    }
+
+    #[test]
+    fn ptrhash_rejects_overlapping_or_uncovered_tables_and_output_ranges() {
+        assert_geometry_rejected(mph(
+            2,
+            vec![part(0, 1, 3, 0, 0), part(1, 1, 3, 1, 0)],
+            vec![0, 0],
+        ));
+        assert_geometry_rejected(mph(
+            2,
+            vec![part(0, 1, 2, 0, 0), part(0, 1, 2, 1, 1)],
+            vec![0, 0],
+        ));
+        assert_geometry_rejected(mph(
+            2,
+            vec![part(0, 1, 2, 0, 0), part(1, 1, 2, 0, 1)],
+            vec![0, 0],
+        ));
+        assert_geometry_rejected(mph(
+            3,
+            vec![part(0, 1, 1, 0, 0), part(2, 1, 1, 1, 0)],
+            Vec::new(),
+        ));
+        assert_geometry_rejected(mph(2, vec![part(0, 1, 1, 0, 0)], Vec::new()));
+        assert_geometry_rejected(mph(1, vec![part(0, 1, 2, 0, 0)], vec![0, 0]));
+    }
+
+    #[test]
+    fn ptrhash_rejects_many_parts_sharing_one_large_remap_range() {
+        let parts = (0..512).map(|_| part(0, 1, 4097, 0, 0)).collect();
+        assert_geometry_rejected(mph(1, parts, vec![0; 4096]));
+    }
+
+    #[test]
+    fn ptrhash_preserves_contiguous_geometry_with_empty_parts() {
+        let original = mph(
+            3,
+            vec![
+                part(0, 0, 1, 0, 0),
+                part(0, 1, 2, 1, 1),
+                part(0, 0, 1, 2, 2),
+                part(1, 2, 3, 3, 3),
+            ],
+            vec![0, 0, 0, 1],
+        );
+        assert!(original.validate());
+        let mut bytes = Vec::new();
+        write_ptrhash25(&original, &mut bytes);
+        let mut pos = 0;
+        let restored = read_ptrhash25(&bytes, &mut pos).unwrap();
+        assert_eq!(pos, bytes.len());
+        assert_eq!(restored.slot_capacity(), 3);
+        assert_eq!(restored.num_parts(), 4);
+        for key in [0, 1, 2, u64::MAX] {
+            assert!(restored.index_u64(key) < 3);
+        }
     }
 }

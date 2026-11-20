@@ -253,10 +253,6 @@ impl<T: Copy + Default + 'static> HugeVec<T> {
         self.len() == 0
     }
 
-    pub fn is_hugepage_backed(&self) -> bool {
-        matches!(self, HugeVec::Huge { .. })
-    }
-
     pub(crate) fn is_memory_mapped(&self) -> bool {
         matches!(self,Self::Mapped(view) if view.owner.is_mapped())
     }

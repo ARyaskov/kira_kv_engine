@@ -37,7 +37,7 @@ fn legacy_inner_mph_fingerprints_do_not_claim_negative_lookup_support() {
         .with_config(BuildConfig { with_fingerprints: true, ..BuildConfig::default() })
         .build(&[0])
         .unwrap();
-    assert_eq!(mph.fingerprints.len(), 1);
+    assert_eq!(mph.fingerprints().len(), 1);
     let mut backend = vec![0, 0];
     write_ptrhash25(&mph, &mut backend);
     let index = legacy_tag2_without_outer_membership(&backend);
