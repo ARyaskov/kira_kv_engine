@@ -208,7 +208,8 @@ mod linux {
         if !base.exists() {
             return None;
         }
-        let mut entries: Vec<(usize, u64, usize)> = Vec::new(); // (cpu_id, weight, core_id)
+        let allowed = core_affinity::get_core_ids()?;
+        let mut entries = Vec::new();
         for ent in fs::read_dir(base).ok()? {
             let ent = match ent {
                 Ok(e) => e,
@@ -225,6 +226,10 @@ mod linux {
                 Err(_) => continue,
             };
 
+            if !allowed.iter().any(|core| core.id == cpu_id) {
+                continue;
+            }
+
             // Prefer cpu_capacity (kernel ≥ 5.7 exposes this for hybrid SoCs); fall back to
             // cpuinfo_max_freq for older kernels and Intel.
             let cap_path = ent.path().join("cpu_capacity");
@@ -232,9 +237,10 @@ mod linux {
             let weight = read_u64(&cap_path).or_else(|| read_u64(&freq_path))?;
             // Physical core id (so we can drop SMT siblings later).
             let core_path = ent.path().join("topology/core_id");
-            let core_id = read_u64(&core_path).map(|v| v as usize).unwrap_or(cpu_id);
+            let package_path = ent.path().join("topology/physical_package_id");
+            let physical_core = read_u64(&package_path).zip(read_u64(&core_path));
 
-            entries.push((cpu_id, weight, core_id));
+            entries.push((cpu_id, weight, physical_core));
         }
         if entries.is_empty() {
             return None;
@@ -245,10 +251,14 @@ mod linux {
         let is_hybrid = max != min;
 
         // First SMT sibling per physical core of the top tier.
-        let mut perf_by_core: BTreeMap<usize, usize> = BTreeMap::new();
-        for &(cpu_id, w, core_id) in &entries {
+        let mut perf_by_core: BTreeMap<_, usize> = BTreeMap::new();
+        for &(cpu_id, w, physical_core) in &entries {
             if w == max {
-                perf_by_core.entry(core_id).or_insert(cpu_id);
+                let identity = physical_core.ok_or(cpu_id);
+                perf_by_core
+                    .entry(identity)
+                    .and_modify(|id| *id = (*id).min(cpu_id))
+                    .or_insert(cpu_id);
             }
         }
         let mut perf: Vec<usize> = perf_by_core.into_values().collect();

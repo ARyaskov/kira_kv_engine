@@ -90,7 +90,10 @@ fn pick_thread_count() -> usize {
     }
     let topo = crate::hybrid_topology::Topology::detect();
     if topo.is_hybrid && !topo.performance_cores.is_empty() {
-        return topo.performance_cores.len();
+        return topo
+            .performance_cores
+            .len()
+            .min(std::thread::available_parallelism().map_or(1, |n| n.get()));
     }
     std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
 }
