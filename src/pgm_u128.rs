@@ -272,7 +272,11 @@ impl PgmIndexU128 {
     /// Serialize into a self-contained, checksummed byte vector.
     pub fn to_bytes(&self) -> Vec<u8> {
         let s = &self.segments;
-        let mut body = Vec::with_capacity(self.memory_usage() + 64);
+        let mut body = crate::wire::begin_container(
+            crate::wire::CONTAINER_TAG,
+            crate::wire::KIND_PGM_U128,
+            self.memory_usage() + 64,
+        );
         body.extend_from_slice(&self.epsilon.to_le_bytes());
         body.extend_from_slice(&(self.keys.len() as u64).to_le_bytes());
         crate::wire::extend_le(&mut body, &self.keys);
@@ -288,7 +292,7 @@ impl PgmIndexU128 {
         }
         crate::wire::extend_le(&mut body, &s.starts);
         crate::wire::extend_le(&mut body, &s.ends);
-        crate::wire::seal(crate::wire::KIND_PGM_U128, &body)
+        crate::wire::finish_container(body)
     }
 
     /// Deserialize [`PgmIndexU128::to_bytes`] output; checksum and structure are verified.

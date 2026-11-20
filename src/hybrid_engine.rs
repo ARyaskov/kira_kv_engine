@@ -620,8 +620,15 @@ impl HybridIndex {
 
     /// Serialize into a self-contained, checksummed byte vector.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut body =
-            Vec::with_capacity(self.memory_usage().saturating_sub(self.router.memory_usage()) + 64);
+        let kind = match self.hash_version {
+            CanonicalHashVersion::Legacy => crate::wire::KIND_HYBRID,
+            CanonicalHashVersion::Current => crate::wire::KIND_HYBRID_V2,
+        };
+        let mut body = crate::wire::begin_container(
+            crate::wire::CONTAINER_TAG,
+            kind,
+            self.memory_usage().saturating_sub(self.router.memory_usage()) + 64,
+        );
         body.extend_from_slice(&self.seed.to_le_bytes());
         body.extend_from_slice(&(self.n as u64).to_le_bytes());
         body.extend_from_slice(&(self.seg_offsets.len() as u64).to_le_bytes());
@@ -659,11 +666,7 @@ impl HybridIndex {
                 }
             }
         }
-        let kind = match self.hash_version {
-            CanonicalHashVersion::Legacy => crate::wire::KIND_HYBRID,
-            CanonicalHashVersion::Current => crate::wire::KIND_HYBRID_V2,
-        };
-        crate::wire::seal(kind, &body)
+        crate::wire::finish_container(body)
     }
 
     /// Deserialize [`HybridIndex::to_bytes`] output. Checksum and every structural

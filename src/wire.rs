@@ -60,19 +60,19 @@ pub const KIND_INDEX_V2: u8 = 6;
 pub const KIND_HYBRID_V2: u8 = 7;
 pub const HEADER_LEN: usize = 9;
 
-/// Wrap `body` into the sealed container of the given `kind`.
-pub fn seal(kind: u8, body: &[u8]) -> Vec<u8> {
-    seal_tagged(CONTAINER_TAG, kind, body)
-}
-
-pub fn seal_tagged(tag: u8, kind: u8, body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(HEADER_LEN + body.len() + 8);
+/// Start the output buffer for a container, reserving room for its body and checksum.
+pub(crate) fn begin_container(tag: u8, kind: u8, body_capacity: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(HEADER_LEN + body_capacity + 8);
     out.push(tag);
     out.extend_from_slice(CONTAINER_MAGIC);
     out.extend_from_slice(&CONTAINER_FORMAT.to_le_bytes());
     out.push(kind);
     out.push(0);
-    out.extend_from_slice(body);
+    out
+}
+
+/// Append the checksum to the same buffer used for the header and body.
+pub(crate) fn finish_container(mut out: Vec<u8>) -> Vec<u8> {
     let sum = crate::checksum::checksum(&out);
     out.extend_from_slice(&sum.to_le_bytes());
     out
@@ -217,6 +217,22 @@ impl<W: Write> Write for ChecksumWriter<W> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn finishing_a_reserved_container_preserves_its_payload_allocation() {
+        let payload = b"immutable payload";
+        let mut out =
+            super::begin_container(super::PGM_CONTAINER_TAG, super::KIND_PGM, payload.len());
+        out.extend_from_slice(payload);
+        let original = out.as_ptr();
+        let frame = super::finish_container(out);
+        assert_eq!(frame.as_ptr(), original);
+        assert_eq!(&frame[..super::HEADER_LEN], b"\x05KIRA\x01\x00\x05\x00");
+        assert_eq!(
+            super::unseal_tagged(&frame, super::PGM_CONTAINER_TAG, super::KIND_PGM),
+            Some(payload.as_slice())
+        );
+    }
+
     #[test]
     fn converted_u128_encoding_uses_all_sixteen_bytes() {
         let values = [u128::from_le_bytes(core::array::from_fn(|i| i as u8)), u128::MAX];

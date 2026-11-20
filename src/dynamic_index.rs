@@ -149,6 +149,8 @@ pub struct DynamicIndex {
     next_id: StableId,
     /// Exact number of live keys.
     live: usize,
+    /// Sum of live key widths, excluding stale versions and tombstones.
+    live_key_bytes: usize,
     cfg: DynamicConfig,
     maintenance_error: Option<String>,
     #[cfg(test)]
@@ -216,6 +218,7 @@ impl DynamicIndex {
             rebuilt_keys: 0,
             next_id: 0,
             live: 0,
+            live_key_bytes: 0,
             cfg,
             maintenance_error: None,
             #[cfg(test)]
@@ -255,6 +258,7 @@ impl DynamicIndex {
             self.tombstone_bytes -= key.len() + std::mem::size_of::<Entry>();
         }
         self.next_id = next_id;
+        self.live_key_bytes += key.len();
         self.buffer.insert(key, id);
         self.live += 1;
         if self.buffer.len() >= self.cfg.flush_threshold {
@@ -286,6 +290,7 @@ impl DynamicIndex {
         let prior = in_buffer.or(in_tiers);
         if prior.is_some() {
             self.live -= 1;
+            self.live_key_bytes -= key.len();
             // A tombstone is only needed while some tier still holds the key.
             if in_tiers.is_some() && self.tombstones.insert(key.to_vec()) {
                 self.tombstone_bytes += key.len() + std::mem::size_of::<Entry>();
@@ -682,7 +687,13 @@ impl DynamicIndex {
     /// a self-contained, checksummed byte vector. Tiers are not stored; they are
     /// rebuilt on load (one compacted tier).
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut body = Vec::with_capacity(self.memory_usage() / 2 + 64);
+        // The body stores 30 configuration/counter bytes and two u32 fields
+        // per live key. Stale tier versions do not contribute to this size.
+        let mut body = crate::wire::begin_container(
+            crate::wire::CONTAINER_TAG,
+            crate::wire::KIND_DYNAMIC,
+            30 + self.live * 8 + self.live_key_bytes,
+        );
         body.extend_from_slice(&(self.cfg.flush_threshold as u64).to_le_bytes());
         body.extend_from_slice(&(self.cfg.max_tiers as u64).to_le_bytes());
         body.push(self.cfg.lean_tiers as u8);
@@ -708,7 +719,7 @@ impl DynamicIndex {
                 write(k, id);
             }
         }
-        crate::wire::seal(crate::wire::KIND_DYNAMIC, &body)
+        crate::wire::finish_container(body)
     }
 
     /// Restore an index written by [`DynamicIndex::to_bytes`]. The entries are
@@ -758,6 +769,7 @@ impl DynamicIndex {
         );
         idx.next_id = next_id;
         idx.live = live;
+        idx.live_key_bytes = entries.iter().map(|(key, _)| key.len()).sum();
         if !entries.is_empty() {
             let tier = idx.build_tier(entries)?;
             idx.tiers.push(Arc::new(tier));

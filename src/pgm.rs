@@ -504,9 +504,13 @@ impl PgmIndex {
     /// Serialize into a self-contained, checksummed container. New models use a
     /// relative v6 payload; loaded legacy models retain their absolute v4 layout.
     pub fn to_bytes(&self) -> Result<Vec<u8>, PgmError> {
-        let mut out = Vec::with_capacity(self.stats().memory_usage);
+        let mut out = crate::wire::begin_container(
+            crate::wire::PGM_CONTAINER_TAG,
+            crate::wire::KIND_PGM,
+            self.stats().memory_usage,
+        );
         self.write_to(&mut out);
-        Ok(crate::wire::seal_tagged(crate::wire::PGM_CONTAINER_TAG, crate::wire::KIND_PGM, &out))
+        Ok(crate::wire::finish_container(out))
     }
 
     /// Read a standalone checksummed container or a raw v2/v3/v4/v6 payload.
